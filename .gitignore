@@ -103,3 +103,6 @@ pytorch-sphinx-theme/
 # HSTU kernels
 fbgemm_gpu/experimental/hstu/src/hstu_ampere/instantiations/*.cu
 fbgemm_gpu/experimental/hstu/src/hstu_hopper/instantiations/*.cu
+fbgemm_gpu/experimental/hstu/src/hstu_blackwell_sm120/instantiations/*.cu
+
+*.log

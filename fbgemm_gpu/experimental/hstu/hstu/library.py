@@ -12,10 +12,15 @@
 import logging
 import os
 
+no_fbgemm_gpu: bool = False
 try:
     import fbgemm_gpu  # noqa: F401
+    # Namespace packages (created as a side-effect of editable install path hooks)
+    # have __file__ == None and should not be treated as a real fbgemm_gpu install.
+    if getattr(fbgemm_gpu, "__file__", None) is None:
+        no_fbgemm_gpu = True
 except ImportError:
-    no_fbgemm_gpu: bool = True
+    no_fbgemm_gpu = True
 
 import torch
 

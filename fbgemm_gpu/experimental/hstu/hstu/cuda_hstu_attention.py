@@ -9,10 +9,41 @@
 
 # pyre-strict
 
+import os
 from typing import Any, Optional, Tuple
 from .library import *  # noqa: F401, F403
 import torch
 import torch.nn as nn
+
+def _hstu_debug_enabled() -> bool:
+    return os.getenv("HSTU_DEBUG_SCALE_LOG", "0") == "1"
+
+def _round_descale_to_e8m0(scale: torch.Tensor, min_scale: float = 1e-6) -> torch.Tensor:
+    """
+    Round positive descale to E8M0-dequantized values (power-of-two).
+    This keeps python-side quantization consistent with kernel-side ue8m0 scale use.
+    """
+    s = torch.clamp(scale.to(torch.float32), min=min_scale)
+    # E8M0 has no mantissa: keep only exponent. Use ceil(log2(.)) to match
+    # cudaRoundPosInf behavior used in kernel float->e8m0 conversion.
+    return torch.exp2(torch.ceil(torch.log2(s)))
+
+def _debug_tensor_sample(name: str, t: Optional[torch.Tensor], max_elems: int = 8) -> None:
+    if t is None:
+        print(f"[HSTU_DEBUG] {name}: None")
+        return
+    flat = t.detach().reshape(-1)
+    show_n = min(max_elems, flat.numel())
+    sample = flat[:show_n]
+    if t.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        sample = sample.float()
+    else:
+        sample = sample.to(torch.float32)
+    sample_list = [float(x) for x in sample.cpu().tolist()]
+    print(
+        f"[HSTU_DEBUG] {name}: shape={tuple(t.shape)} dtype={t.dtype} "
+        f"sample={sample_list}"
+    )
 
 def quantize_for_two_directions(x, seq_offsets, fp8_type=torch.float8_e4m3fn):
     B = seq_offsets.size(0) - 1
@@ -23,7 +54,7 @@ def quantize_for_two_directions(x, seq_offsets, fp8_type=torch.float8_e4m3fn):
 
     with torch.no_grad():
         x_descale = torch.amax(x.abs(), dim=-1, keepdim=True).to(torch.float32) / fp8_max
-        x_descale = torch.max(x_descale, torch.tensor([1e-6], dtype=torch.float32, device='cuda'))
+        x_descale = _round_descale_to_e8m0(x_descale)
         x_quantized = (x / x_descale).to(fp8_type)
         x_descale = x_descale.squeeze(-1)
         x_descale = nn.functional.pad(x_descale, (0, 0, 0, 128)).to(torch.float32)
@@ -40,21 +71,77 @@ def quantize_for_two_directions(x, seq_offsets, fp8_type=torch.float8_e4m3fn):
         for i in range(B):
             xt_descale_len = cu_seqlens_xt_descale[i + 1] - cu_seqlens_xt_descale[i]
             for j in range(xt_descale_len - 1):
-                xt_descale[cu_seqlens_xt_descale[i] + j] = torch.amax(x[seq_offsets[i] + j * 128 : seq_offsets[i] + (j + 1) * 128].abs(), dim=0, keepdim=True) / fp8_max
-                xt_descale[cu_seqlens_xt_descale[i] + j] = torch.max(xt_descale[cu_seqlens_xt_descale[i] + j], torch.tensor([1e-6], dtype=torch.float32, device='cuda'))
+                xt_descale[cu_seqlens_xt_descale[i] + j] = _round_descale_to_e8m0(
+                    torch.amax(
+                        x[seq_offsets[i] + j * 128 : seq_offsets[i] + (j + 1) * 128].abs(),
+                        dim=0,
+                        keepdim=True,
+                    ) / fp8_max
+                )
                 xt_quantized[seq_offsets[i] + j * 128 : seq_offsets[i] + (j + 1) * 128] = (x[seq_offsets[i] + j * 128 : seq_offsets[i] + (j + 1) * 128] / xt_descale[cu_seqlens_xt_descale[i] + j]).to(fp8_type)
 
-            xt_descale[cu_seqlens_xt_descale[i] + xt_descale_len - 1] = torch.amax(x[seq_offsets[i] + (xt_descale_len - 1) * 128 : seq_offsets[i+1]].abs(), dim=0, keepdim=True) / fp8_max
-            xt_descale[cu_seqlens_xt_descale[i] + xt_descale_len - 1] = torch.max(xt_descale[cu_seqlens_xt_descale[i] + xt_descale_len - 1], torch.tensor([1e-6], dtype=torch.float32, device='cuda'))
+            xt_descale[cu_seqlens_xt_descale[i] + xt_descale_len - 1] = _round_descale_to_e8m0(
+                torch.amax(
+                    x[seq_offsets[i] + (xt_descale_len - 1) * 128 : seq_offsets[i+1]].abs(),
+                    dim=0,
+                    keepdim=True,
+                ) / fp8_max
+            )
             xt_quantized[seq_offsets[i] + (xt_descale_len - 1) * 128 : seq_offsets[i+1]] = (x[seq_offsets[i] + (xt_descale_len - 1) * 128 : seq_offsets[i+1]] / xt_descale[cu_seqlens_xt_descale[i] + xt_descale_len - 1]).to(fp8_type)
 
     return x_quantized, x_descale, xt_quantized, xt_descale, cu_seqlens_xt_descale
 
-def quantize_for_block_scale(x, seq_offsets, block_size=128, fp8_type=torch.float8_e4m3fn):
-    # x: (total_seq, head, dim)
-    # q and kv might have diffrent block_size
+def quantize_for_block_scale_qk_along_d(x, seq_offsets, fp8_type=torch.float8_e4m3fn):
+    """
+    Quantize Q/K with 1x128 granularity along D (K-dimension for QK GEMM).
+    For each token/head and each 128-wide D chunk, compute one descale.
+    """
     if x.dim() != 3:
-        raise ValueError("AssertError: x in quantize_for_block_scale should be three dimensions")
+        raise ValueError("AssertError: x in quantize_for_block_scale_qk_along_d should be three dimensions")
+    B = seq_offsets.size(0) - 1
+    head = x.size(1)
+    dim = x.size(2)
+    if dim % 128 != 0:
+        raise ValueError(f"AssertError: D must be divisible by 128 for q/k K-dim block scale, got D={dim}")
+    d_chunks = dim // 128
+    fp8_max = 448.0 if fp8_type == torch.float8_e4m3fn else 57344.0
+
+    cu_seqlens_x_descale = torch.zeros(B + 1, dtype=torch.int32, device='cuda')
+    x_quantized = torch.empty_like(x, dtype=fp8_type, device='cuda')
+    x_descale_list = []
+
+    with torch.no_grad():
+        for i in range(B):
+            start = int(seq_offsets[i].item())
+            end = int(seq_offsets[i + 1].item())
+            actual_len = end - start
+
+            # User-requested constraint for current debug path.
+            if actual_len % 128 != 0:
+                raise ValueError(
+                    f"AssertError: quant_mode=2 requires N divisible by 128, got N={actual_len} in batch {i}"
+                )
+
+            cur = x[start:end].view(actual_len, head, d_chunks, 128)
+            cur_scale = torch.amax(cur.abs(), dim=3, keepdim=False).to(torch.float32) / fp8_max
+            cur_scale = _round_descale_to_e8m0(cur_scale)
+            cur_quant = (cur / cur_scale.unsqueeze(-1)).to(fp8_type).view(actual_len, head, dim)
+            x_quantized[start:end] = cur_quant
+
+            # Layout for kernel side: [head, total_scale_rows], with one scale-row per (token, d_chunk)
+            cur_scale_flat = cur_scale.permute(0, 2, 1).reshape(actual_len * d_chunks, head)  # [N*Dblk, H]
+            x_descale_list.append(cur_scale_flat)
+            cu_seqlens_x_descale[i + 1] = cu_seqlens_x_descale[i] + actual_len * d_chunks
+
+    x_descale = torch.cat(x_descale_list, dim=0).transpose(1, 0).contiguous()  # [H, total]
+    return x_quantized, x_descale, cu_seqlens_x_descale
+
+
+def quantize_for_block_scale_v_along_n(x, seq_offsets, block_size=128, fp8_type=torch.float8_e4m3fn):
+    # x: (total_seq, head, dim)
+    # V quantization along N with 1x128 granularity.
+    if x.dim() != 3:
+        raise ValueError("AssertError: x in quantize_for_block_scale_v_along_n should be three dimensions")
     B = seq_offsets.size(0) - 1
     head = x.size(1)
     dim = x.size(2)
@@ -67,6 +154,10 @@ def quantize_for_block_scale(x, seq_offsets, block_size=128, fp8_type=torch.floa
     with torch.no_grad():
         for i in range(B):
             actual_len = seq_offsets[i + 1] - seq_offsets[i]
+            if int(actual_len.item()) % 128 != 0:
+                raise ValueError(
+                    f"AssertError: quant_mode=2 requires N divisible by 128, got N={int(actual_len.item())} in batch {i}"
+                )
             cur_bs_tensor = x[seq_offsets[i]:(seq_offsets[i] + actual_len)]
             actual_len_padding_block_num = (actual_len + block_size - 1) // block_size
             cu_seqlens_x_descale[i + 1] = cu_seqlens_x_descale[i] + actual_len_padding_block_num
@@ -79,7 +170,7 @@ def quantize_for_block_scale(x, seq_offsets, block_size=128, fp8_type=torch.floa
                 cur_bs_tensor = cur_bs_tensor
             cur_bs_tensor = cur_bs_tensor.view(actual_len_padding_block_num, block_size, head, dim)
             cur_bs_scale_tensor = torch.amax(cur_bs_tensor.abs(), dim=(1, 3), keepdim=True).to(torch.float32) / fp8_max
-            cur_bs_scale_tensor = torch.max(cur_bs_scale_tensor, torch.tensor([1e-6], dtype=torch.float32, device='cuda'))
+            cur_bs_scale_tensor = _round_descale_to_e8m0(cur_bs_scale_tensor)
             x_descale_list.append(cur_bs_scale_tensor)
             cur_bs_tensor_quantized = (cur_bs_tensor / cur_bs_scale_tensor).to(fp8_type).view(actual_len_padding_block_num * block_size, head, dim)[0:actual_len] #[actual_len_padding_block_num * cur_block_size, head, dim] - > [actual_len, head, dim]
             x_quantized_list.append(cur_bs_tensor_quantized)
@@ -90,6 +181,20 @@ def quantize_for_block_scale(x, seq_offsets, block_size=128, fp8_type=torch.floa
     assert x_quantized.shape == x.shape, "assert x_quantized shape must equal to x shape"
     return x_quantized, x_descale.squeeze(1).squeeze(-1).transpose(1, 0).contiguous(), cu_seqlens_x_descale #For x_descale, the original layout is ([sum(cur_bs_len/bm), head]: (head, 1)), and we transform into ([head, sum(cur_bs_len/bm): (sum(cur_bs_len/bm), 1)])
 
+
+def pack_descale_to_e8m0x4_int32(descale: torch.Tensor) -> torch.Tensor:
+    # Convert float descale tensor (already e8m0-rounded in this path) into int32 packed e8m0x4.
+    s = torch.clamp(descale.to(torch.float32), min=1e-10)
+    exp_unbiased = torch.ceil(torch.log2(s))
+    exp_biased = torch.clamp(exp_unbiased + 127.0, 0.0, 255.0).to(torch.uint8)
+    word = exp_biased.to(torch.int32)
+    return (word | (word << 8) | (word << 16) | (word << 24)).contiguous()
+
+
+# Backward compatibility for older call sites.
+def quantize_for_block_scale(x, seq_offsets, block_size=128, fp8_type=torch.float8_e4m3fn):
+    return quantize_for_block_scale_v_along_n(x, seq_offsets, block_size=block_size, fp8_type=fp8_type)
+
 def get_bm_and_bn_block_size_fwd(rab, dim):
     """
     Design for fp8, Returns the block size for BM and BN. Need to be the same as the "get_tile_size_fwd" function.
@@ -98,9 +203,11 @@ def get_bm_and_bn_block_size_fwd(rab, dim):
     """
     if rab is not None:
         if dim == 64:
-            return 128, 128
+            return 128, 64   # kBlockM=128, kBlockN=64 (utils.h: {128, 64, 4} for FP8+rab+hdim64)
+        elif dim == 128:
+            return 128, 128  # kBlockM=128, kBlockN=128 (utils.h: {128, 128, 8} for FP8+rab+hdim128)
         else:
-            return 128, 64
+            return 128, 128  # kBlockM=64, kBlockN=128 (utils.h: {64, 128, 8} for FP8+rab+hdim>128)
     else:
         if dim == 64:
             return 128, 128
@@ -132,8 +239,13 @@ def quantize_for_head_batch_tensor(x, seq_offsets, quant_mode=3, fp8_type=torch.
             x_descale = torch.zeros(B, head, dtype=torch.float32, device='cuda')
             x_quantized = torch.zeros_like(x, dtype=fp8_type, device='cuda')
             for i in range(B):
-                x_descale[i, :] = torch.amax(x[seq_offsets[i]:seq_offsets[i+1], :, :].abs(), dim=(0, 2), keepdim=True).squeeze(0).squeeze(-1) / fp8_max
-                x_descale[i, :] = torch.max(x_descale[i, :], torch.tensor([1e-6], dtype=torch.float32, device='cuda'))
+                x_descale[i, :] = _round_descale_to_e8m0(
+                    torch.amax(
+                        x[seq_offsets[i]:seq_offsets[i+1], :, :].abs(),
+                        dim=(0, 2),
+                        keepdim=True,
+                    ).squeeze(0).squeeze(-1) / fp8_max
+                )
                 x_quantized[seq_offsets[i]:seq_offsets[i+1], :, :] = (x[seq_offsets[i]:seq_offsets[i+1], :, :] / x_descale[i, :].unsqueeze(0).unsqueeze(-1)).to(fp8_type)
         return x_quantized, x_descale
     elif quant_mode == 4:
@@ -141,14 +253,16 @@ def quantize_for_head_batch_tensor(x, seq_offsets, quant_mode=3, fp8_type=torch.
             x_descale = torch.zeros(B, dtype=torch.float32, device='cuda')
             x_quantized = torch.zeros_like(x, dtype=fp8_type, device='cuda')
             for i in range(B):
-                x_descale[i] = torch.amax(x[seq_offsets[i]:seq_offsets[i+1], :, :].abs(), keepdim=True) / fp8_max
-                x_descale[i] = torch.max(x_descale[i], torch.tensor([1e-6], dtype=torch.float32, device='cuda'))
+                x_descale[i] = _round_descale_to_e8m0(
+                    torch.amax(x[seq_offsets[i]:seq_offsets[i+1], :, :].abs(), keepdim=True) / fp8_max
+                )
                 x_quantized[seq_offsets[i]:seq_offsets[i+1], :, :] = (x[seq_offsets[i]:seq_offsets[i+1], :, :] / x_descale[i]).to(fp8_type)
         return x_quantized, x_descale
     else:
         with torch.no_grad():
-            x_descale = torch.amax(x.abs(), keepdim=True).squeeze(0).squeeze(-1) / fp8_max
-            x_descale = torch.max(x_descale, torch.tensor([1e-6], dtype=torch.float32, device='cuda'))
+            x_descale = _round_descale_to_e8m0(
+                torch.amax(x.abs(), keepdim=True).squeeze(0).squeeze(-1) / fp8_max
+            )
             x_quantized = (x / x_descale).to(fp8_type)
         return x_quantized, x_descale
 
@@ -186,8 +300,98 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
         assert v.dim() == 3, "v shape should be (L, num_heads, hidden_dim)"
 
         major_version = torch.cuda.get_device_capability()[0]
-        assert major_version == 8 or major_version == 9 or major_version == 10, "Only support sm80 and sm90 and sm100"
-        if major_version == 8:
+        assert major_version == 8 or major_version == 9 or major_version == 10 or major_version >= 12, \
+            f"Only support sm80, sm90, sm100, and sm120+, got sm{major_version}0"
+        if major_version >= 12:
+            # SM120+ (Blackwell): dispatch to hstu_varlen_fwd_120
+            q_descale = None
+            k_descale = None
+            v_descale = None
+            sf_q_packed = None
+            sf_k_packed = None
+            sf_v_packed = None
+            cu_seqlens_q_block_descale = None
+            cu_seqlens_kv_block_descale = None
+            cu_seqlens_v_block_descale = None
+            if quant_mode == 0:
+                # Per-tensor FP8 quantization
+                fp8_max = 448.0
+                q_scale = _round_descale_to_e8m0(q.float().abs().max() / fp8_max)
+                k_scale = _round_descale_to_e8m0(k.float().abs().max() / fp8_max)
+                v_scale = _round_descale_to_e8m0(v.float().abs().max() / fp8_max)
+                q = (q / q_scale).to(torch.float8_e4m3fn)
+                k = (k / k_scale).to(torch.float8_e4m3fn)
+                v = (v / v_scale).to(torch.float8_e4m3fn)
+                q_descale = q_scale.reshape(1).to(torch.float32)
+                k_descale = k_scale.reshape(1).to(torch.float32)
+                v_descale = v_scale.reshape(1).to(torch.float32)
+            elif quant_mode == 2:
+                # Blockwise FP8 quantization
+                dim = q.shape[-1]
+                bm, bn = get_bm_and_bn_block_size_fwd(rab, dim)
+                q_raw, k_raw, v_raw = q, k, v
+                q, q_descale, cu_seqlens_q_block_descale = quantize_for_block_scale_qk_along_d(
+                    q, cu_seqlens_q, fp8_type=torch.float8_e4m3fn)
+                k, k_descale, cu_seqlens_kv_block_descale = quantize_for_block_scale_qk_along_d(
+                    k, cu_seqlens_k, fp8_type=torch.float8_e4m3fn)
+                v, v_descale, cu_seqlens_v_block_descale = quantize_for_block_scale_v_along_n(
+                    v, cu_seqlens_k, block_size=bn, fp8_type=torch.float8_e4m3fn)
+                sf_q_packed = pack_descale_to_e8m0x4_int32(q_descale)
+                sf_k_packed = pack_descale_to_e8m0x4_int32(k_descale)
+                sf_v_packed = pack_descale_to_e8m0x4_int32(v_descale)
+                if _hstu_debug_enabled():
+                    print(
+                        f"[HSTU_DEBUG] quant_mode=2 bm={bm} bn={bn} "
+                        f"q_head_stride={q_descale.stride(0) if q_descale is not None else 'None'} "
+                        f"kv_head_stride={k_descale.stride(0) if k_descale is not None else 'None'}"
+                    )
+                    _debug_tensor_sample("q_raw", q_raw)
+                    _debug_tensor_sample("k_raw", k_raw)
+                    _debug_tensor_sample("v_raw", v_raw)
+                    _debug_tensor_sample("q_fp8", q)
+                    _debug_tensor_sample("k_fp8", k)
+                    _debug_tensor_sample("v_fp8", v)
+                    _debug_tensor_sample("q_descale", q_descale)
+                    _debug_tensor_sample("k_descale", k_descale)
+                    _debug_tensor_sample("v_descale", v_descale)
+                    _debug_tensor_sample("sf_q_packed", sf_q_packed)
+                    _debug_tensor_sample("sf_k_packed", sf_k_packed)
+                    _debug_tensor_sample("sf_v_packed", sf_v_packed)
+                    _debug_tensor_sample("cu_seqlens_q_block_descale", cu_seqlens_q_block_descale)
+                    _debug_tensor_sample("cu_seqlens_kv_block_descale", cu_seqlens_kv_block_descale)
+            # SM120 kernel always reads RAB as BF16; convert float16 RAB if needed.
+            rab_kernel = rab.to(torch.bfloat16) if rab is not None and rab.dtype == torch.float16 else rab
+            out, rab_padded = torch.ops.fbgemm.hstu_varlen_fwd_120(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                seqused_q,
+                seqused_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                scaling_seqlen,
+                num_contexts,
+                num_targets,
+                target_group_size,
+                window_size[0],
+                window_size[1],
+                alpha,
+                rab_kernel,
+                func,
+                quant_mode if quant_mode is not None else -1,
+                q_descale,
+                k_descale,
+                v_descale,
+                sf_q_packed,
+                sf_k_packed,
+                sf_v_packed,
+                cu_seqlens_q_block_descale,
+                cu_seqlens_kv_block_descale,
+                cu_seqlens_v_block_descale,
+            )
+        elif major_version == 8:
             out, rab_padded = torch.ops.fbgemm.hstu_varlen_fwd_80(
                 q,
                 k,
@@ -240,9 +444,12 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
             elif quant_mode == 2: #block_scale
                 dim = q.shape[-1]
                 bm, bn = get_bm_and_bn_block_size_fwd(rab, dim)
-                q, q_descale, cu_seqlens_q_block_descale = quantize_for_block_scale(q, cu_seqlens_q, block_size=bm, fp8_type=torch.float8_e4m3fn)
-                k, k_descale, cu_seqlens_kv_block_descale = quantize_for_block_scale(k, cu_seqlens_k, block_size=bn, fp8_type=torch.float8_e4m3fn)
-                v, v_descale, _ = quantize_for_block_scale(v, cu_seqlens_k, block_size=bn, fp8_type=torch.float8_e4m3fn)
+                q, q_descale, cu_seqlens_q_block_descale = quantize_for_block_scale_qk_along_d(
+                    q, cu_seqlens_q, fp8_type=torch.float8_e4m3fn)
+                k, k_descale, cu_seqlens_kv_block_descale = quantize_for_block_scale_qk_along_d(
+                    k, cu_seqlens_k, fp8_type=torch.float8_e4m3fn)
+                v, v_descale, _ = quantize_for_block_scale_v_along_n(
+                    v, cu_seqlens_k, block_size=bn, fp8_type=torch.float8_e4m3fn)
             elif quant_mode == 3 or quant_mode == 4 or quant_mode == 5:
                 q, q_descale = quantize_for_head_batch_tensor(q, cu_seqlens_q, quant_mode=quant_mode, fp8_type=torch.float8_e4m3fn)
                 k, k_descale = quantize_for_head_batch_tensor(k, cu_seqlens_k, quant_mode=quant_mode, fp8_type=torch.float8_e4m3fn)
@@ -445,10 +652,14 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
             elif quant_mode == 2:
                 dim = q.shape[-1]
                 bm, bn = get_bm_and_bn_block_size_bwd()
-                q, q_descale, cu_seqlens_q_block_descale = quantize_for_block_scale(ctx.q_fp16, cu_seqlens_q, block_size=bm, fp8_type=bwd_fp8_type)
-                k, k_descale, cu_seqlens_kv_block_descale = quantize_for_block_scale(ctx.k_fp16, cu_seqlens_k, block_size=bn, fp8_type=bwd_fp8_type)
-                v, v_descale, _ = quantize_for_block_scale(ctx.v_fp16, cu_seqlens_k, block_size=bn, fp8_type=bwd_fp8_type)
-                dout, do_descale, _ = quantize_for_block_scale(dout, cu_seqlens_q, block_size=bm, fp8_type=bwd_fp8_type)
+                q, q_descale, cu_seqlens_q_block_descale = quantize_for_block_scale_qk_along_d(
+                    ctx.q_fp16, cu_seqlens_q, fp8_type=bwd_fp8_type)
+                k, k_descale, cu_seqlens_kv_block_descale = quantize_for_block_scale_qk_along_d(
+                    ctx.k_fp16, cu_seqlens_k, fp8_type=bwd_fp8_type)
+                v, v_descale, _ = quantize_for_block_scale_v_along_n(
+                    ctx.v_fp16, cu_seqlens_k, block_size=bn, fp8_type=bwd_fp8_type)
+                dout, do_descale, _ = quantize_for_block_scale_qk_along_d(
+                    dout, cu_seqlens_q, fp8_type=bwd_fp8_type)
             elif quant_mode == 3 or quant_mode == 4 or quant_mode == 5:
                 q, q_descale = quantize_for_head_batch_tensor(ctx.q_fp16, cu_seqlens_q, quant_mode=ctx.quant_mode, fp8_type=bwd_fp8_type)
                 k, k_descale = quantize_for_head_batch_tensor(ctx.k_fp16, cu_seqlens_k, quant_mode=ctx.quant_mode, fp8_type=bwd_fp8_type)
@@ -680,8 +891,23 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
         k = qkv[:, 1, :, :].detach()
         v = qkv[:, 2, :, :].detach()
         major_version = torch.cuda.get_device_capability()[0]
-        assert major_version == 8 or major_version == 9 or major_version == 10, "Only support sm8x and sm90 and sm100"
-        if major_version == 8:
+        assert major_version == 8 or major_version == 9 or major_version == 10 or major_version >= 12, "Only support sm8x, sm90, sm100, and sm120+"
+        if major_version >= 12:
+            out, rab_padded = torch.ops.fbgemm.hstu_varlen_fwd_120(
+                q, k, v,
+                cu_seqlens_q, cu_seqlens_k,
+                seqused_q, seqused_k,
+                max_seqlen_q, max_seqlen_k,
+                scaling_seqlen,
+                num_contexts, num_targets, target_group_size,
+                window_size[0], window_size[1],
+                alpha, rab, func,
+                -1,   # quant_mode = BF16
+                None, None, None,  # descale_q/k/v
+                None, None, None,  # sf_q/k/v_packed
+                None, None, None,  # cu_seqlens_q/kv/v_block_descale
+            )
+        elif major_version == 8:
             out, rab_padded = torch.ops.fbgemm.hstu_varlen_fwd_80(
                 q,
                 k,

@@ -21,7 +21,7 @@ try:
 except ImportError:
     from fbgemm_gpu.experimental.hstu import hstu_attn_varlen_func, hstu_attn_qkvpacked_func, quantize_for_two_directions, quantize_for_block_scale, get_bm_and_bn_block_size_fwd, get_bm_and_bn_block_size_bwd, quantize_for_head_batch_tensor
 
-from hypothesis import given, settings, strategies as st, Verbosity
+from hypothesis import given, settings, strategies as st, Verbosity, example
 
 running_on_github: bool = os.getenv("GITHUB_ENV") is not None
 
@@ -29,7 +29,7 @@ logger: logging.Logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 _MAX_SAMPLES: int = 200
-example = False
+_show_example = False
 e4m3_max = 448.0
 
 def pad_input(unpadded_input, cu_seqlen, batch, seqlen):
@@ -357,27 +357,33 @@ def generate_input(
         dtype_init = dtype
 
     # Generate q, k, v for context + history + target
-    q = (
-        torch.empty(
-            (L_q, heads, attn_dim), dtype=dtype_init, device=torch.device("cuda")
+    _use_ones = os.getenv("HSTU_USE_ONES", "0") == "1"
+    if _use_ones:
+        q = torch.ones((L_q, heads, attn_dim), dtype=dtype_init, device=torch.device("cuda")).requires_grad_()
+        k = torch.ones((L_k, heads, attn_dim), dtype=dtype_init, device=torch.device("cuda")).requires_grad_()
+        v = torch.ones((L_k, heads, hidden_dim), dtype=dtype_init, device=torch.device("cuda")).requires_grad_()
+    else:
+        q = (
+            torch.empty(
+                (L_q, heads, attn_dim), dtype=dtype_init, device=torch.device("cuda")
+            )
+            .uniform_(-1, 1)
+            .requires_grad_()
         )
-        .uniform_(-1, 1)
-        .requires_grad_()
-    )
-    k = (
-        torch.empty(
-            (L_k, heads, attn_dim), dtype=dtype_init, device=torch.device("cuda")
+        k = (
+            torch.empty(
+                (L_k, heads, attn_dim), dtype=dtype_init, device=torch.device("cuda")
+            )
+            .uniform_(-1, 1)
+            .requires_grad_()
         )
-        .uniform_(-1, 1)
-        .requires_grad_()
-    )
-    v = (
-        torch.empty(
-            (L_k, heads, hidden_dim), dtype=dtype_init, device=torch.device("cuda")
+        v = (
+            torch.empty(
+                (L_k, heads, hidden_dim), dtype=dtype_init, device=torch.device("cuda")
+            )
+            .uniform_(-1, 1)
+            .requires_grad_()
         )
-        .uniform_(-1, 1)
-        .requires_grad_()
-    )
 
     if is_delta_q is False and dtype != torch.float8_e4m3fn:
         qkv = torch.empty((L_q, 3, heads, attn_dim), dtype=dtype, device=torch.device("cuda")).uniform_(-1, 1).requires_grad_()
@@ -408,7 +414,7 @@ def generate_input(
         for i in range(n_func):
             func[:, :, i, :] = torch.randint(i * max_seq_split, int((i+coef) * max_seq_split), size=(batch_func, head_func, max_seq_len_q), device=torch.device("cuda"))
 
-        if example:
+        if _show_example:
             # emulate casual mask
             n_func = 1  # export HSTU_ARBITRARY_NFUNC=1;
             func = torch.empty((batch_func, head_func, n_func, max_seq_len_q), dtype=torch.int32, device=torch.device("cuda"))
@@ -476,7 +482,7 @@ def generate_input(
 
             # heart example
             func = make_heart_func(batch_func, L_q, L_k)
-        if example:
+        if _show_example:
             print("func", func)
     else:
         func = None
@@ -529,7 +535,7 @@ def generate_input(
             .cuda()
             .to(torch.float32)
         )
-    if example and attn_mask is not None:
+    if _show_example and attn_mask is not None:
         print(attn_mask.to(torch.int32).squeeze().cpu().numpy())
     return (
         L_q,
@@ -693,6 +699,26 @@ class HSTU16Test(unittest.TestCase):
         dtype=st.sampled_from([torch.bfloat16]), #, torch.float16]),
         full_batch=st.sampled_from([True, False]),
     )
+    # SM120 BF16 targeted examples: guarantee coverage of all mask/feature combos.
+    # Hypothesis always runs @example cases before random sampling.
+    @example(batch_size=4, heads=1, seq_len_params=(256, 256), max_context_len=0,
+             target_params=(0, (-1, 0), 1, False), attn_hidden_dims=(128, 128), alpha=1.0,
+             rab_params=(True, False, None), dtype=torch.bfloat16, full_batch=True)   # causal + rab
+    @example(batch_size=4, heads=1, seq_len_params=(256, 256), max_context_len=0,
+             target_params=(0, (-1, 0), 1, False), attn_hidden_dims=(128, 128), alpha=1.0,
+             rab_params=(True, True, None), dtype=torch.bfloat16, full_batch=True)    # causal + drab
+    @example(batch_size=4, heads=1, seq_len_params=(256, 256), max_context_len=0,
+             target_params=(0, (64, 16), 1, False), attn_hidden_dims=(128, 128), alpha=1.0,
+             rab_params=(False, False, None), dtype=torch.bfloat16, full_batch=False) # local mask
+    @example(batch_size=4, heads=1, seq_len_params=(99, 99), max_context_len=64,
+             target_params=(0, (-1, 0), 1, False), attn_hidden_dims=(128, 128), alpha=1.0,
+             rab_params=(False, False, None), dtype=torch.bfloat16, full_batch=True)  # context + causal
+    @example(batch_size=4, heads=1, seq_len_params=(99, 99), max_context_len=0,
+             target_params=(64, (-1, 0), 1, False), attn_hidden_dims=(128, 128), alpha=1.0,
+             rab_params=(False, False, None), dtype=torch.bfloat16, full_batch=True)  # target + causal
+    @example(batch_size=4, heads=1, seq_len_params=(64, 64), max_context_len=0,
+             target_params=(0, (-1, -1), 1, True), attn_hidden_dims=(128, 128), alpha=1.0,
+             rab_params=(False, False, None), dtype=torch.bfloat16, full_batch=True)  # arbitrary
     @settings(verbosity=Verbosity.verbose, max_examples=_MAX_SAMPLES, deadline=None)
     def test_hstu_attn(
         self,
@@ -711,6 +737,12 @@ class HSTU16Test(unittest.TestCase):
         max_target_len, window_size, target_group_size, is_arbitrary = target_params
         attn_dim, hidden_dim = attn_hidden_dims
         has_rab, has_drab, heads_rab = rab_params
+
+        # SM120 supports all configurations except backward.
+        if torch.cuda.get_device_capability()[0] >= 12:
+            if attn_dim not in (64, 128):
+                logger.info(f"Skipping test for SM120: unsupported attn_dim={attn_dim}")
+                return
 
         has_context = max_context_len > 0
         has_target = max_target_len > 0
@@ -857,12 +889,21 @@ class HSTU16Test(unittest.TestCase):
                 out_ref[seqlen_offset + seqlen_actual:seqlen_offset + seqlen_padded, :, :] = 0
                 torch_out[seqlen_offset + seqlen_actual:seqlen_offset + seqlen_padded, :, :] = 0
 
-        # print(f"Output max diff: {(hstu_out - out_ref).abs().max().item()}")
-        # print(f"Pytorch max diff: {(torch_out - out_ref).abs().max().item()}")
-        # print(f"Output mean diff: {(hstu_out - out_ref).abs().mean().item()}")
-        # print(f"Pytorch mean diff: {(torch_out - out_ref).abs().mean().item()}")
+        print(f"hstu_out dtype={hstu_out.dtype} out_ref dtype={out_ref.dtype} torch_out dtype={torch_out.dtype}")
+        print(f"hstu_out[256:260,0,:2]= {hstu_out.float()[256:260,0,:2].tolist() if hstu_out.shape[0]>256 else 'N/A'}")
+        print(f"out_ref[256:260,0,:2] = {out_ref.float()[256:260,0,:2].tolist() if out_ref.shape[0]>256 else 'N/A'}")
+        print(f"torch_out[256:260,0,:2]= {torch_out.float()[256:260,0,:2].tolist() if torch_out.shape[0]>256 else 'N/A'}")
+        print(f"Output max diff: {(hstu_out - out_ref).abs().max().item()}")
+        print(f"Pytorch max diff: {(torch_out - out_ref).abs().max().item()}")
+        print(f"Output mean diff: {(hstu_out - out_ref).abs().mean().item()}")
+        print(f"Pytorch mean diff: {(torch_out - out_ref).abs().mean().item()}")
 
         assert (hstu_out - out_ref).abs().max().item() <= 2 * (torch_out - out_ref).abs().max().item()
+
+        # SM120 backward not yet implemented — skip gradient tests
+        if torch.cuda.get_device_capability()[0] >= 12:
+            torch.cuda.synchronize()
+            return
 
         g = torch.rand_like(torch_out)
         if not has_drab:
@@ -1203,10 +1244,14 @@ class HSTUPagedKVTest(unittest.TestCase):
             func=None
         )
 
-        # print(f"Output max diff: {(hstu_out - out_ref).abs().max().item()}")
-        # print(f"Pytorch max diff: {(torch_out - out_ref).abs().max().item()}")
-        # print(f"Output mean diff: {(hstu_out - out_ref).abs().mean().item()}")
-        # print(f"Pytorch mean diff: {(torch_out - out_ref).abs().mean().item()}")
+        print(f"hstu_out dtype={hstu_out.dtype} out_ref dtype={out_ref.dtype} torch_out dtype={torch_out.dtype}")
+        print(f"hstu_out[256:260,0,:2]= {hstu_out.float()[256:260,0,:2].tolist() if hstu_out.shape[0]>256 else 'N/A'}")
+        print(f"out_ref[256:260,0,:2] = {out_ref.float()[256:260,0,:2].tolist() if out_ref.shape[0]>256 else 'N/A'}")
+        print(f"torch_out[256:260,0,:2]= {torch_out.float()[256:260,0,:2].tolist() if torch_out.shape[0]>256 else 'N/A'}")
+        print(f"Output max diff: {(hstu_out - out_ref).abs().max().item()}")
+        print(f"Pytorch max diff: {(torch_out - out_ref).abs().max().item()}")
+        print(f"Output mean diff: {(hstu_out - out_ref).abs().mean().item()}")
+        print(f"Pytorch mean diff: {(torch_out - out_ref).abs().mean().item()}")
 
         assert (hstu_out - out_ref).abs().max().item() <= 2 * (torch_out - out_ref).abs().max().item()
         torch.cuda.synchronize()
@@ -1740,6 +1785,11 @@ class HSTU8Test(unittest.TestCase):
                 (51, 256),
                 (531, 777),
                 (160, 800),
+                # SM120 FP8 block-scale friendly: seq_k % 128 == 0, seq_q % 16 == 0
+                (128, 128),
+                (256, 256),
+                (128, 256),
+                (256, 512),
             ]
         ),
         max_context_len=st.sampled_from([0, 99, 160, 333]),
@@ -1782,6 +1832,67 @@ class HSTU8Test(unittest.TestCase):
             (5, True),
         ]),
     )
+    # SM120 FP8 block-scale (quant_mode=2) targeted examples.
+    # Constraints: attn_dim=128, max_seq_len_k%128==0, full_batch=True.
+    # These guarantee all mask/feature combos are always tested on SM120.
+    # --- seq=128 ---
+    @example(batch_size=4, heads=1, seq_len_params=(128, 128), max_context_len=0,
+             target_params=(0, (-1, 0), 1, False), attn_hidden_dims=(128, 128), alpha=1.0,
+             rab_params=(False, False, None), dtype=torch.float8_e4m3fn,
+             quant_mode_full_batch=(2, True))   # causal baseline
+    @example(batch_size=4, heads=1, seq_len_params=(128, 128), max_context_len=0,
+             target_params=(0, (-1, 0), 1, False), attn_hidden_dims=(128, 128), alpha=1.0,
+             rab_params=(True, False, None), dtype=torch.float8_e4m3fn,
+             quant_mode_full_batch=(2, True))   # causal + rab
+    @example(batch_size=4, heads=1, seq_len_params=(128, 128), max_context_len=0,
+             target_params=(0, (-1, 0), 1, False), attn_hidden_dims=(128, 128), alpha=1.0,
+             rab_params=(True, True, None), dtype=torch.float8_e4m3fn,
+             quant_mode_full_batch=(2, True))   # causal + drab (SM120 ignores drab; tests no-crash)
+    @example(batch_size=4, heads=1, seq_len_params=(128, 128), max_context_len=0,
+             target_params=(0, (64, 16), 1, False), attn_hidden_dims=(128, 128), alpha=1.0,
+             rab_params=(False, False, None), dtype=torch.float8_e4m3fn,
+             quant_mode_full_batch=(2, True))   # local mask
+    @example(batch_size=4, heads=1, seq_len_params=(128, 128), max_context_len=128,
+             target_params=(0, (-1, 0), 1, False), attn_hidden_dims=(128, 128), alpha=1.0,
+             rab_params=(False, False, None), dtype=torch.float8_e4m3fn,
+             quant_mode_full_batch=(2, True))   # context + causal (total_k=256)
+    @example(batch_size=4, heads=1, seq_len_params=(128, 128), max_context_len=0,
+             target_params=(128, (-1, 0), 1, False), attn_hidden_dims=(128, 128), alpha=1.0,
+             rab_params=(False, False, None), dtype=torch.float8_e4m3fn,
+             quant_mode_full_batch=(2, True))   # target + causal (total_k=256)
+    @example(batch_size=4, heads=1, seq_len_params=(128, 128), max_context_len=0,
+             target_params=(0, (-1, -1), 1, True), attn_hidden_dims=(128, 128), alpha=1.0,
+             rab_params=(False, False, None), dtype=torch.float8_e4m3fn,
+             quant_mode_full_batch=(2, True))   # arbitrary masking
+    # --- seq=256 ---
+    @example(batch_size=4, heads=1, seq_len_params=(256, 256), max_context_len=0,
+             target_params=(0, (-1, 0), 1, False), attn_hidden_dims=(128, 128), alpha=1.0,
+             rab_params=(False, False, None), dtype=torch.float8_e4m3fn,
+             quant_mode_full_batch=(2, True))   # causal baseline
+    @example(batch_size=4, heads=1, seq_len_params=(256, 256), max_context_len=0,
+             target_params=(0, (-1, 0), 1, False), attn_hidden_dims=(128, 128), alpha=1.0,
+             rab_params=(True, False, None), dtype=torch.float8_e4m3fn,
+             quant_mode_full_batch=(2, True))   # causal + rab
+    @example(batch_size=4, heads=1, seq_len_params=(256, 256), max_context_len=0,
+             target_params=(0, (-1, 0), 1, False), attn_hidden_dims=(128, 128), alpha=1.0,
+             rab_params=(True, True, None), dtype=torch.float8_e4m3fn,
+             quant_mode_full_batch=(2, True))   # causal + drab
+    @example(batch_size=4, heads=1, seq_len_params=(256, 256), max_context_len=0,
+             target_params=(0, (128, 16), 1, False), attn_hidden_dims=(128, 128), alpha=1.0,
+             rab_params=(False, False, None), dtype=torch.float8_e4m3fn,
+             quant_mode_full_batch=(2, True))   # local mask
+    @example(batch_size=4, heads=1, seq_len_params=(256, 256), max_context_len=256,
+             target_params=(0, (-1, 0), 1, False), attn_hidden_dims=(128, 128), alpha=1.0,
+             rab_params=(False, False, None), dtype=torch.float8_e4m3fn,
+             quant_mode_full_batch=(2, True))   # context + causal (total_k=512)
+    @example(batch_size=4, heads=1, seq_len_params=(256, 256), max_context_len=0,
+             target_params=(256, (-1, 0), 1, False), attn_hidden_dims=(128, 128), alpha=1.0,
+             rab_params=(False, False, None), dtype=torch.float8_e4m3fn,
+             quant_mode_full_batch=(2, True))   # target + causal (total_k=512)
+    @example(batch_size=4, heads=1, seq_len_params=(256, 256), max_context_len=0,
+             target_params=(0, (-1, -1), 1, True), attn_hidden_dims=(128, 128), alpha=1.0,
+             rab_params=(False, False, None), dtype=torch.float8_e4m3fn,
+             quant_mode_full_batch=(2, True))   # arbitrary masking
     @settings(verbosity=Verbosity.verbose, max_examples=_MAX_SAMPLES, deadline=None)
     def test_hstu_attn_fp8(
         self,
@@ -1801,6 +1912,24 @@ class HSTU8Test(unittest.TestCase):
         attn_dim, hidden_dim = attn_hidden_dims
         has_rab, has_drab, heads_rab = rab_params
         quant_mode, full_batch = quant_mode_full_batch
+
+        # SM120 only supports quant_mode -1 and 2, head_size 64 and 128
+        if torch.cuda.get_device_capability()[0] >= 12:
+            if quant_mode not in (-1, 2):
+                logger.info(f"Skipping test for SM120: unsupported quant_mode={quant_mode}")
+                return
+            if attn_dim not in (64, 128):
+                logger.info(f"Skipping test for SM120: unsupported attn_dim={attn_dim}")
+                return
+            if quant_mode == 2 and max_seq_len_k % 128 != 0:
+                logger.info(f"Skipping test for SM120 quant_mode=2: seq_k={max_seq_len_k} not divisible by 128")
+                return
+            if quant_mode == 2 and attn_dim % 128 != 0:
+                logger.info(f"Skipping test for SM120 quant_mode=2: attn_dim={attn_dim} not divisible by 128")
+                return
+            # SM120 supports all configurations except backward.
+            # quant_mode=2 + has_rab: RAB implemented in FP8 block-scale path.
+            # quant_mode=-1 (BF16) + has_rab: fully supported.
 
         total_q = max_context_len + max_seq_len_q + max_target_len
         total_k = max_context_len + max_seq_len_k + max_target_len
@@ -1924,12 +2053,21 @@ class HSTU8Test(unittest.TestCase):
                 out_ref[seqlen_offset + seqlen_actual:seqlen_offset + seqlen_padded, :, :] = 0
                 torch_out[seqlen_offset + seqlen_actual:seqlen_offset + seqlen_padded, :, :] = 0
 
-        # print(f"Output max diff: {(hstu_out - out_ref).abs().max().item()}")
-        # print(f"Pytorch max diff: {(torch_out - out_ref).abs().max().item()}")
-        # print(f"Output mean diff: {(hstu_out - out_ref).abs().mean().item()}")
-        # print(f"Pytorch mean diff: {(torch_out - out_ref).abs().mean().item()}")
+        print(f"hstu_out dtype={hstu_out.dtype} out_ref dtype={out_ref.dtype} torch_out dtype={torch_out.dtype}")
+        print(f"hstu_out[256:260,0,:2]= {hstu_out.float()[256:260,0,:2].tolist() if hstu_out.shape[0]>256 else 'N/A'}")
+        print(f"out_ref[256:260,0,:2] = {out_ref.float()[256:260,0,:2].tolist() if out_ref.shape[0]>256 else 'N/A'}")
+        print(f"torch_out[256:260,0,:2]= {torch_out.float()[256:260,0,:2].tolist() if torch_out.shape[0]>256 else 'N/A'}")
+        print(f"Output max diff: {(hstu_out - out_ref).abs().max().item()}")
+        print(f"Pytorch max diff: {(torch_out - out_ref).abs().max().item()}")
+        print(f"Output mean diff: {(hstu_out - out_ref).abs().mean().item()}")
+        print(f"Pytorch mean diff: {(torch_out - out_ref).abs().mean().item()}")
 
         assert (hstu_out - out_ref).abs().max().item() <= 2 * (torch_out - out_ref).abs().max().item()
+
+        # SM120 backward not yet implemented — skip gradient tests
+        if torch.cuda.get_device_capability()[0] >= 12:
+            torch.cuda.synchronize()
+            return
 
         g = torch.rand_like(torch_out)
         if not has_drab:

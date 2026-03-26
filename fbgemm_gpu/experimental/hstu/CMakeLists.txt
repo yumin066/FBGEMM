@@ -112,6 +112,15 @@ file(GLOB hstu_hopper_cpp_source_files
 file(GLOB hstu_hopper_cuda_source_files
   src/hstu_hopper/instantiations/*.cu)
 
+# Collect HSTU Blackwell source files
+file(GLOB hstu_blackwell_sm120_cpp_source_files
+  src/hstu_blackwell_sm120/*.cpp
+  src/hstu_blackwell_sm120/*.h)
+
+# Collect HSTU Blackwell GPU source files
+file(GLOB hstu_blackwell_sm120_cuda_source_files
+  src/hstu_blackwell_sm120/instantiations/*.cu)
+
 # Initialize the combined source file lists
 set(hstu_cpp_source_files "")
 set(hstu_cpp_source_files_gpu "")
@@ -133,9 +142,17 @@ if("9.0" IN_LIST TORCH_CUDA_ARCH_LIST OR "9.0a" IN_LIST TORCH_CUDA_ARCH_LIST)
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_90a,code=sm_90a")
 endif()
 
+# Conditionally add Blackwell sources if arch 12.0 is requested
+if("12.0" IN_LIST TORCH_CUDA_ARCH_LIST)
+  message(STATUS "HSTU: Selecting Blackwell sources for arch 12.0")
+  list(APPEND hstu_cpp_source_files ${hstu_blackwell_sm120_cpp_source_files})
+  list(APPEND hstu_cuda_source_files ${hstu_blackwell_sm120_cuda_source_files})
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_120,code=[sm_120,compute_120]")
+endif()
+
 # Check if any sources were selected
 if(NOT hstu_cpp_source_files AND NOT hstu_cpp_source_files_gpu AND NOT "10.0" IN_LIST TORCH_CUDA_ARCH_LIST)
-  message(WARNING "HSTU: Neither Ampere (8.0) nor Hopper (9.0) architectures found in TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST}, would compile both")
+  message(WARNING "HSTU: No recognized architectures found in TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST}, would compile Ampere+Hopper")
   list(APPEND hstu_cpp_source_files ${hstu_ampere_cpp_source_files} ${hstu_hopper_cpp_source_files})
   list(APPEND hstu_cuda_source_files ${hstu_ampere_cuda_source_files} ${hstu_hopper_cuda_source_files})
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_80,code=sm_80 -gencode arch=compute_90a,code=sm_90a")
@@ -159,6 +176,7 @@ if(hstu_cpp_source_files OR hstu_cpp_source_files_gpu)
       ${fbgemm_sources_include_directories}
       ${CMAKE_CURRENT_SOURCE_DIR}/src/hstu_ampere
       ${CMAKE_CURRENT_SOURCE_DIR}/src/hstu_hopper
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/hstu_blackwell_sm120
     CPU_SRCS
       ${hstu_cpp_source_files}
     GPU_SRCS

@@ -21,7 +21,7 @@ import subprocess
 import urllib.request
 import urllib.error
 from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
-from src.generate_kernels import generate_kernels_ampere, generate_kernels_hopper
+from src.generate_kernels import generate_kernels_ampere, generate_kernels_hopper, generate_kernels_blackwell
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
@@ -182,11 +182,11 @@ if not SKIP_CUDA_BUILD:
     if bare_metal_version < Version("12.3"):
         raise RuntimeError("HSTU is only supported on CUDA 12.3 and above")
 
-    if "8.0" not in arch_list and "9.0" not in arch_list and "10.0" not in arch_list:
-        raise ValueError("At least one of 8.0, 9.0, or 10.0 must be in arch_list")
+    if "8.0" not in arch_list and "9.0" not in arch_list and "10.0" not in arch_list and "12.0" not in arch_list:
+        raise ValueError("At least one of 8.0, 9.0, 10.0, or 12.0 must be in arch_list")
 
-    # sm100 (Blackwell) is pure Python/Triton, only sm80/sm90 need CUDA compilation
-    if "8.0" in arch_list or "9.0" in arch_list:
+    # sm100 (Blackwell) is pure Python/Triton; sm80/sm90/sm120 need CUDA compilation
+    if "8.0" in arch_list or "9.0" in arch_list or "12.0" in arch_list:
         cc_flag = []
         if "9.0" in arch_list:
             cc_flag.append("-gencode")
@@ -194,6 +194,9 @@ if not SKIP_CUDA_BUILD:
         if "8.0" in arch_list:
             cc_flag.append("-gencode")
             cc_flag.append("arch=compute_80,code=sm_80")
+        if "12.0" in arch_list:
+            cc_flag.append("-gencode")
+            cc_flag.append("arch=compute_120a,code=sm_120a")
 
         # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
         # torch._C._GLIBCXX_USE_CXX11_ABI
@@ -203,8 +206,12 @@ if not SKIP_CUDA_BUILD:
         repo_dir = Path(this_dir).parent.parent.parent
         cutlass_dir = repo_dir / "external" / "cutlass"
 
+        DEBUG_KERNEL = os.getenv("HSTU_DEBUG_KERNEL", "FALSE") == "TRUE"
+        EXP_A_SYNC_K = os.getenv("HSTU_EXP_A_SYNC_K_NO_PREFETCH", "FALSE") == "TRUE"
         feature_args = (
             []
+            + (["-DHSTU_DEBUG_KERNEL"] if DEBUG_KERNEL else [])
+            + (["-DHSTU_EXP_A_SYNC_K_NO_PREFETCH"] if EXP_A_SYNC_K else [])
             + (["-DHSTU_DISABLE_BACKWARD"] if DISABLE_BACKWARD else [])
             + (["-DHSTU_DISABLE_DETERMINISTIC"] if DISABLE_DETERMINISTIC else [])
             + (["-DHSTU_DISABLE_LOCAL"] if DISABLE_LOCAL else [])
@@ -246,13 +253,21 @@ if not SKIP_CUDA_BUILD:
         torch_cpp_sources = []
         subprocess.run(["rm", "-rf", "src/hstu_ampere/instantiations/*"])
         subprocess.run(["rm", "-rf", "src/hstu_hopper/instantiations/*"])
+        subprocess.run(["rm", "-rf", "src/hstu_blackwell_sm120/instantiations/*"])
         if "8.0" in arch_list:
             torch_cpp_sources.append("src/hstu_ampere/hstu_ops_gpu.cpp")
             generate_kernels_ampere("src/hstu_ampere/instantiations")
         if "9.0" in arch_list:
             torch_cpp_sources.append("src/hstu_hopper/hstu_ops_gpu.cpp")
             generate_kernels_hopper("src/hstu_hopper/instantiations")
-        cuda_sources = (glob.glob("src/hstu_ampere/instantiations/*.cu") if "8.0" in arch_list else []) + (glob.glob("src/hstu_hopper/instantiations/*.cu") if "9.0" in arch_list else [])
+        if "12.0" in arch_list:
+            torch_cpp_sources.append("src/hstu_blackwell_sm120/hstu_ops_gpu.cpp")
+            generate_kernels_blackwell("src/hstu_blackwell_sm120/instantiations")
+        cuda_sources = (
+            (glob.glob("src/hstu_ampere/instantiations/*.cu") if "8.0" in arch_list else [])
+            + (glob.glob("src/hstu_hopper/instantiations/*.cu") if "9.0" in arch_list else [])
+            + (glob.glob("src/hstu_blackwell_sm120/instantiations/*.cu") if "12.0" in arch_list else [])
+        )
 
         nvcc_flags = [
             "-O3",
@@ -286,6 +301,8 @@ if not SKIP_CUDA_BUILD:
             include_dirs.append(Path(this_dir) / "src" / "hstu_ampere")
         if "9.0" in arch_list:
             include_dirs.append(Path(this_dir) / "src" / "hstu_hopper")
+        if "12.0" in arch_list:
+            include_dirs.append(Path(this_dir) / "src" / "hstu_blackwell_sm120")
 
         sources = None
         if ONLY_COMPILE_SO:
