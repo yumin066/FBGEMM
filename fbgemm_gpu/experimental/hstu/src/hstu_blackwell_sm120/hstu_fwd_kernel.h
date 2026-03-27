@@ -921,10 +921,13 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
       }
     };
 
-    // Phase 3 preamble: prefetch K[n0] (and RAB[n0] if Has_rab).
-    // V is loaded inside fwd_step_fp8bs (single-buffer, no pipeline).
+    // Phase 4 preamble: prefetch K[n0] AND V[n0] together (and RAB[n0] if Has_rab).
+    // Pre-loading V eliminates the mid-iteration blocking cp_async_wait for V.
     flash::copy<false, true>(gmem_tiled_copy_sw128,
         tKgK(_,_,_, n_block), tKsK, tKVcKV,
+        actual_seqlen_k - n_block * kBlockN);
+    flash::copy<false, true>(gmem_tiled_copy_sw128,
+        tVgV(_,_,_, n_block), tVsV, tKVcKV,
         actual_seqlen_k - n_block * kBlockN);
     if constexpr (Has_rab) {
       copy_g2s_rab(n_block, 0);
@@ -1021,6 +1024,10 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
           flash::copy<false, true>(gmem_tiled_copy_sw128,
               tKgK(_,_,_, nb_next), tKsK, tKVcKV,
               actual_seqlen_k - nb_next * kBlockN);
+          // Phase 4: also prefetch V[nb_next] even in debug mode to keep pipeline state consistent.
+          flash::copy<false, true>(gmem_tiled_copy_sw128,
+              tVgV(_,_,_, nb_next), tVsV, tKVcKV,
+              actual_seqlen_k - nb_next * kBlockN);
           cute::cp_async_fence();
         }
         return;
@@ -1102,17 +1109,14 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
           smem_sfb_ptr[i] = 0x7f7f7f7f;
       }
 
-      // Phase 3: Load V[nb] from GMEM into sV_sw128 (single buffer at kSmemQSize offset).
-      // V load starts here; SFP/SFV fills below happen concurrently during the DMA.
-      flash::copy<false, true>(gmem_tiled_copy_sw128,
-          tVgV(_,_,_, nb), tVsV, tKVcKV,
-          actual_seqlen_k - nb * kBlockN);
-      cute::cp_async_fence();
-
+      // Phase 4: V[nb] was pre-loaded alongside K[nb] before this iteration started.
+      // cp_async_wait<0>+sync at the top of this function guarantees V is in SMEM.
+      // Need a sync here to protect smem_q[0..kSmemQSize) between:
+      //   (a) s2r P reads (above) and (b) Vt transpose writes (below).
+      // Without this barrier, a warp finishing s2r P early could corrupt Vt writes.
       // V^T transpose into sPbuf region (sQ/sK SMEM, offset 0, free since P is in regs).
       // sVt_buf uses SmemLayoutVt_SW128 = tile_to_shape(SmemLayoutAtomB, [kHeadDim, kBlockN])
       // so ldmatrix can load it as B[N=kHeadDim, K=kBlockN] for GEMM2.
-      flash::cp_async_wait<0>();
       __syncthreads();
       Tensor sVt_buf = make_tensor(
           make_smem_ptr(reinterpret_cast<FP8Elem*>(smem_q)),
@@ -1137,12 +1141,16 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
         cute::copy(s2r_copy_B2, tXsVt, tXrV);
       }
 
-      // Phase 3: prefetch K[nb_next] (and RAB[nb_next] if Has_rab) for next iteration.
+      // Phase 4: prefetch K[nb_next] AND V[nb_next] together for the next iteration.
       // Vt is now in registers; sVt_buf (= smem_q[0:kSmemQSize]) can be overwritten by K.
-      // V[nb_next] will be loaded inside fwd_step_fp8bs when it runs.
+      // sV_sw128 (smem_q[kSmemQSize:]) is also free since V[nb] was fully transposed.
+      // Pre-loading V alongside K eliminates the blocking mid-iteration V wait.
       if (nb_next >= 0) {
         flash::copy<false, true>(gmem_tiled_copy_sw128,
             tKgK(_,_,_, nb_next), tKsK, tKVcKV,
+            actual_seqlen_k - nb_next * kBlockN);
+        flash::copy<false, true>(gmem_tiled_copy_sw128,
+            tVgV(_,_,_, nb_next), tVsV, tKVcKV,
             actual_seqlen_k - nb_next * kBlockN);
         if constexpr (Has_rab) {
           copy_g2s_rab(nb_next, 0);  // Load RAB[nb_next] into sRab stage 0 (single stage)

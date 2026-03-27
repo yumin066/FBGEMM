@@ -145,9 +145,26 @@ cute::copy(s2r_copy_SFA, tXsSFA(_,_,_,_0{}), s2r_thr_copy_SFA.retile_D(tCrSFA));
 
 ## Phase 4 任务：性能优化（Phase 3 通过后执行）
 
-- 双缓冲 pipeline（K/V prefetch）
-- SF prefetch 与 MMA overlap
-- 参考 `sm120_blockscaled_gemm_impl.cuh` 的 producer/consumer 模式
+**目标**：在 `/home/minyu/project/shopee/fbgemm-hstu/fbgemm_gpu/experimental/hstu/src/hstu_blackwell_sm120/hstu_fwd_kernel.h` 中实现 TMA + producer/consumer pipeline，参考 SM100 CuTe-DSL 实现的流程。
+
+### 参考文件（必读）
+- **SM100 CuTe-DSL 参考**：`/home/minyu/project/shopee/fbgemm-hstu/fbgemm_gpu/experimental/hstu/src/hstu_blackwell/hstu_fwd.py`
+  - 实现了 TMA load（`tma_atom_Q/K/V`）+ WGMMA producer/consumer pipeline
+  - 关键结构：load warp（`load_warp_id=9`）负责 TMA issue，math warps（silu0/silu1/mma）负责 compute
+  - 多 stage pipeline：`kv_stage=4`（FP8）/ `kv_stage=3`（BF16），`q_stage=2`
+  - barrier 机制：`mbar_ptr`（NamedBarrier）管理 producer/consumer 同步
+  - SharedStorage 布局：`sQ`、`sK`（复用 sV）、`sO`、validity barriers
+- **SM120 block-scale GEMM 参考**：`6KD_fp8_block_scale/kernels/include/sm120_blockscaled_gemm/sm120_blockscaled_gemm_impl.cuh` — producer/consumer 模式与 SF prefetch
+
+### 实现目标文件
+- `src/hstu_blackwell_sm120/hstu_fwd_kernel.h`（新目录，对应 SM120 原生 TMA 版本）
+
+### Phase 4 核心任务
+1. **TMA 搬运**：将 Q/K/V GMEM→SMEM 从 cp.async 改为 TMA（`make_tma_copy` + `ClusterTransactionBarrier`），参考 `hstu_fwd.py` 的 `tma_atom_Q/K/V` 初始化及 `tma_tensor_Q/K/V` 用法
+2. **Producer/Consumer 分离**：load warp 专职 TMA issue（类似 `hstu_fwd.py` 的 `load_warp_id=9`），math warps 专职 MMA+silu（类似 `silu0_warp_ids`/`mma_warp_id`）
+3. **多 stage pipeline**：K/V 多 stage 双缓冲 prefetch（对应 `hstu_fwd.py` 的 `kv_stage=4`）
+4. **SF prefetch 与 MMA overlap**：SFA/SFB/SFV scale factor 与 GEMM 计算重叠
+5. **barrier 同步**：使用 `cutlass::arch::ClusterTransactionBarrier` 或 Named Barrier 管理 producer/consumer 同步（对应 `hstu_fwd.py` 的 `mbar_ptr` + `NamedBarrierFwd`）
 
 ---
 

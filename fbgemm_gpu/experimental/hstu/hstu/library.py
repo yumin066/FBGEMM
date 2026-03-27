@@ -32,13 +32,19 @@ try:
 except Exception:
     open_source: bool = False
 
+def _should_load_hstu_lib() -> bool:
+    cap = torch.cuda.get_device_capability()
+    # Load for SM < 10 (SM80/SM89/SM90) OR SM >= 12 (SM120 Blackwell consumer).
+    # SM10x (GB200 etc.) is excluded until kernels are added.
+    return cap < (10, 0) or cap[0] >= 12
+
 if (
     torch.cuda.is_available()
     and torch.version.cuda is not None
     and torch.version.cuda >= "12.4"
 ):
     if open_source or no_fbgemm_gpu:
-        if torch.cuda.get_device_capability() < (10, 0):
+        if _should_load_hstu_lib():
             torch.ops.load_library(
                 os.path.join(os.path.dirname(__file__), "fbgemm_gpu_experimental_hstu.so")
             )
@@ -46,7 +52,7 @@ if (
                 os.path.join(os.path.dirname(__file__), "fbgemm_gpu_experimental_hstu.so")
             )
     else:
-        if torch.cuda.get_device_capability() < (10, 0):
+        if _should_load_hstu_lib():
             torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:sparse_ops_gpu")
 
             torch.ops.load_library(
