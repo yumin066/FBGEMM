@@ -13,7 +13,7 @@ docker run -p 9527:22 --rm \
         --ipc=host \
         --gpus all \
         --shm-size=512m \
-        --entrypoint /bin/bash -it \
+        -it \
         --name trtllm_minyu \
         -v /home/scratch.minyu_gpu/:/home/scratch.minyu_gpu/ \
         -v /home/scratch.trt_llm_data/:/home/scratch.trt_llm_data/ \

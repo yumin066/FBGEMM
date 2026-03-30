@@ -44,5 +44,8 @@ RUN git config --global user.email "minyu@nvidia.com"
 ENV CCACHE_DIR=/workspace/.ccache
 RUN export PATH=$PATH:/home/minyu/.local/bin
 
-#RUN sudo umount -l /proc 
-#RUN sudo mount -t proc proc /proc
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN sudo chmod +x /usr/local/bin/docker-entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["/bin/bash"]
