@@ -13,7 +13,8 @@
 - [x] **Phase 2**：cp.async 升级为 TMA（已合并入 Phase 3 调试过程中完成）
 - [x] **Phase 3**：数值验证通过（fp8_gt_cos ≈ 0.9996，远超 0.95 阈值）
 - [x] **Phase 4**：性能优化（K+V double-prefetch pipeline，消除迭代中途 blocking V wait）
-- [ ] **Phase 5**：Warp-specialized kernel（load warp 专职 TMA，math warps 专职 MMA，producer/consumer pipeline）
+- [x] **Phase 5**：TMA K+V^T（消除 kernel-side 逐元素 V 转置，K 从 cp.async 升级为 TMA）
+- [ ] **Phase 6**：Warp-specialized kernel（load warp 专职 TMA，math warps 专职 MMA，producer/consumer pipeline）
 
 ### Phase 4 最终性能结果（RTX PRO 6000 Blackwell SM120，2026-03-27）
 
@@ -29,16 +30,56 @@ FP8 仍比 BF16 慢的原因：SM120 QMMA block-scale 指令有 scale factor 加
 
 ---
 
-## Phase 5 任务：前向 Warp-Specialized Kernel（当前目标）
+## Phase 5 完成：TMA K+V^T（2026-03-30）
 
-**目标**：将 `hstu_blackwell_sm120/hstu_fwd_kernel.h` 改造为 warp-specialized 前向设计，通过 TMA + producer/consumer pipeline 进一步提升吞吐量。**暂不实现后向。**
+**目标**：用 TMA 直接加载转置后的 V^T，消除 kernel 内逐元素 V 转置循环；同时将 K 加载从 cp.async 升级为 TMA。
+
+### 实现内容
+
+- **V^T TMA**：V 以转置视图 `[d, total_v, h_k]`、strides `[1, v_row_stride, v_head_stride]` 描述给 TMA，直接将 `[kHeadDim, kBlockN]` tile 加载到 `SmemLayoutVt_TMA`（SW128），消除原来的逐元素转置循环（Phase 4 中约 64 SMEM ops/thread/tile）
+- **K TMA**：K 加载从 cp.async 升级为 TMA，使用同一 `uint64_t` mbarrier 与 V^T 共同管理
+- **新模板参数** `bool Use_TMA_KV`：FP8 路径走 TMA，BF16 路径维持 cp.async
+- **新参数结构** `Hstu_fwd_params_fp8_tma<TMA_K_t, TMA_Vt_t>`：携带 TMA 描述符
+- **新内核** `hstu_fwd_kernel_sm120_fp8_tma`
+
+### 关键技术要点
+
+- `with()` 需要 `uint64_t&`（不是 `ClusterTransactionBarrier`），mbarrier 操作全部用 PTX inline
+- `local_tile` 须用 `make_coord(_, _)` 取全部 tile，在 `copy` 时以 `nb_abs` 索引（避免 ArithmeticTuple 错误）
+
+### 性能结果（RTX PRO 6000 Blackwell SM120，2026-03-30）
+
+kernel-only（bs=4, h=16, d=128, full attention）：
+
+| seq  | BF16    | FP8 (qm=2) | 差距   |
+|------|---------|------------|--------|
+| 512  | 0.044ms | 0.053ms    | -20.5% |
+| 1024 | 0.119ms | 0.144ms    | -21.0% |
+| 2048 | 0.447ms | 0.544ms    | -21.7% |
+| 4096 | 1.551ms | 1.912ms    | -23.3% |
+
+注：Phase 5 与 Phase 4 相比绝对延迟下降 ~6-7%，但 BF16 路径未改动也有相近降幅，判断该差异在测量噪声范围内，**实质性能收益待 warp-specialized（Phase 6）验证**。
+
+---
+
+## Phase 6 任务：前向 Warp-Specialized Kernel（当前目标）
+
+**目标**：将 `hstu_blackwell_sm120/hstu_fwd_kernel.h` 改造为 warp-specialized 前向设计，通过 producer/consumer pipeline 实现 TMA 搬运与 MMA 计算真正重叠。**暂不实现后向。**
+
+### Phase 5 现状 vs Phase 6 目标
+
+**Phase 5 现状**：所有线程 spin-wait mbarrier → 全部线程一起做 MMA。TMA 与 MMA **串行**，无真正 overlap。
+
+**Phase 6 目标**：
+- **warp 0（load warp）**：专职发 TMA（K[nb]+V^T[nb]+SF[nb]），等 math warps 消费完毕后发下一个
+- **warp 1-7（math warps）**：等待 load warp 完成 TMA，执行 GEMM1+silu+GEMM2，通知 load warp 可以发下一个
+- TMA 搬运与 MMA 计算**真正 overlap**
 
 ### 参考文件（必读）
 - **SM100 前向参考**：`src/hstu_blackwell/hstu_fwd.py`
-  - 前向 warp 分工：`load_warp_id=9`（TMA issue）、`mma_warp_id=8`（tcgen05 MMA）、`silu0_warp_ids=(0-3)`、`silu1_warp_ids=(4-7)`、`empty_warp_ids=(10,11)`，共 12 warps
+  - 前向 warp 分工：`load_warp_id=9`（TMA issue）、`mma_warp_id=8`（tcgen05 MMA）、`silu0_warp_ids=(0-3)`、`silu1_warp_ids=(4-7)`，共 12 warps
   - pipeline barrier：`load_mma_Q/K/V_mbar_ptr` 管理 TMA→MMA 同步；`mma_compute_S_mbar_ptr` 管理 MMA→silu 同步
   - 多 stage pipeline：`kv_stage=4`（FP8）/`kv_stage=3`（BF16），`q_stage=2`
-  - TMA 操作：`cpasync.CopyBulkTensorTileG2SOp` + `make_tiled_tma_atom_A/B`
 
 ### SM120 与 SM100 的关键差异
 
@@ -48,77 +89,56 @@ FP8 仍比 BF16 慢的原因：SM120 QMMA block-scale 指令有 scale factor 加
 | MMA 调用 | 单 mma_warp 代理全 CTA | 所有 math warps 各自执行 QMMA |
 | TMA API | 相同（SM90+） | 相同 |
 | SF 处理 | 无（非 block-scale） | SFA/SFB/SFV 需随 K/V tile 预取 |
-| V transpose | TMA 预转置 GMEM layout | Phase 4 用逐元素循环，Phase 5 同样用 TMA 预转置 |
+| V transpose | TMA 预转置 GMEM layout | Phase 5 已完成 TMA 预转置 ✅ |
 
-### Phase 5 Warp 分工方案（SM120 适配）
+### Phase 6 Warp 分工方案（SM120 适配）
 
-SM120 无 TMEM，mma.sync 是 per-warp 的，因此所有 math warps 都要执行 MMA（不能单独指定一个 mma_warp）：
+SM120 无 TMEM，mma.sync 是 per-warp 的，因此所有 math warps 都要执行 MMA：
 
 ```
-warp 0      : load warp（专职 TMA issue：Q/K/V + SF）
+warp 0      : load warp（专职 TMA issue：K/V^T + SF）
 warp 1-7    : math warps（QMMA block-scale + silu + softmax）
 warp 8-X    : 可选 epilogue / empty warps
 ```
 
 **线程数**：FP8 路径维持 `BS1::kNumMathThreads=256`（8 warps），load warp 额外 +1 → 共 9 warps = 288 threads（待确认与 `SM120BlockScaledBuilder` 的兼容性）。
 
-### Phase 5 V Transpose 解决方案（关键优化）
+### Phase 6 核心实现步骤
 
-**Phase 4 现状**：V 以 `[kBlockN, kHeadDim]` 加载到 SMEM，再用逐元素循环 `sVt_buf(d, k) = sV_curr(k, d)` 手动转置，引入额外 SMEM 读写延迟（`hstu_fwd_kernel.h` 第 1131 行）。
+1. **双 barrier 设计**：
+   - `load_mbar`（load→math）：load warp 发完 TMA 后 arrive，math warps wait
+   - `math_mbar`（math→load）：math warps 消费完 SMEM 后 arrive，load warp wait
 
-**SM100 的做法**（`hstu_fwd.py` 第 212-213 行）：在创建 TMA 描述符之前，直接对 GMEM 张量做 layout 变换，交换 seq 维和 head 维的步长：
-```python
-V_layout_transpose = [1, 0, 2]   # 先 KV_layout_transpose 后再交换 dim0/dim1
-mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=V_layout_transpose))
-# mV 现在是 [headdim, seqlen, batch]，MN-major
-tma_atom_V, tma_tensor_V = make_tiled_tma_atom_B(tma_load_op, mV, sV_layout, ...)
-```
-TMA 直接将 V 的一个 `[kHeadDim, kBlockN]` tile 搬到 SMEM，到达 SMEM 时已是转置后的形状，内核中无需任何额外操作。
-
-**SM120 Phase 5 对应实现**（C++）：
-```cpp
-// 在 run_hstu_fwd_sm120_impl 中，创建 tma_V 之前：
-// tensor_V 原始 shape: [seqlen, headdim]，stride: [headdim, 1]
-// 交换 dim0/dim1 的 stride，让 TMA 看到 [headdim, seqlen]
-auto tensor_Vt = make_tensor(tensor_V.data(),
-    make_layout(make_shape(get<1>(tensor_V.shape()), get<0>(tensor_V.shape())),
-                make_stride(get<1>(tensor_V.stride()), get<0>(tensor_V.stride()))));
-// sV_smem 布局改为 [kHeadDim, kBlockN]（已转置）
-auto tma_V = make_tma_copy(SM90_TMA_LOAD{}, tensor_Vt, smem_layout_Vt, tile_shape_Vt, Int<1>{});
-```
-GEMM2 的 B operand 直接从 SMEM 读 `[kHeadDim, kBlockN]`，不再需要转置步骤。
-
-### Phase 5 核心实现步骤
-
-1. **TMA 对象创建**（在 `run_hstu_fwd_sm120_impl` 中）：
-   - Q、K：标准 `[kBlockM/N, kHeadDim]` layout
-   - V：**预转置** GMEM layout（交换 stride dim0/dim1），SMEM 目标 layout 为 `[kHeadDim, kBlockN]`
-
-2. **SharedStorage 扩展**：加入 TMA transaction barrier（`cutlass::arch::ClusterTransactionBarrier`）或 `cutlass::pipeline::NamedBarrier`，阶段数与 K/V stage 对应。
-
-3. **Load warp 职责**：
+2. **Load warp 职责**：
    ```cpp
-   if (warp_idx == load_warp_id) {
-       // preamble: 发出 K[0] + V[0] 的 TMA（V 已预转置，直接落 [kHeadDim, kBlockN] SMEM）
-       // 主循环: 等待 math warps 消费完毕后，发出下一 tile 的 TMA
+   if (warp_idx == 0) {
+       // preamble: 发出 K[0]+V^T[0]+SF[0] TMA
+       for (nb = n_block_max-1; nb >= 0; nb--) {
+           math_mbar.wait(phase);          // 等 math warps 消费完上一 tile
+           issue_tma_kv(nb);               // 发 K[nb]+V^T[nb] TMA
+           load_mbar.arrive_and_expect_tx(...); // 通知 math warps
+       }
    }
    ```
 
-4. **Math warp 职责**：
+3. **Math warp 职责**：
    ```cpp
    else {
-       // 等待 load warp 完成当前 tile 的 TMA
-       // GEMM1: QMMA block-scale Q×K → acc_s
-       // silu + softmax
-       // GEMM2: QMMA block-scale P×Vt（Vt 已在 SMEM，无需转置）
+       for (nb = n_block_max-1; nb >= 0; nb--) {
+           load_mbar.wait(phase);          // 等 TMA 完成
+           // GEMM1: Q×K → acc_s
+           // silu + softmax
+           // GEMM2: P×V^T → acc_o
+           math_mbar.arrive();             // 通知 load warp 可发下一个
+       }
    }
    ```
 
-5. **SF prefetch 与 MMA overlap**：SFA/SFB/SFV 在上一轮 MMA 执行期间由 load warp 预取到 SMEM。
+4. **SF prefetch 与 MMA overlap**：SFA/SFB/SFV 在上一轮 MMA 执行期间由 load warp 预取到 SMEM。
 
 ### 验证目标
 - 编译通过，`sweep_accuracy.py` fp8_gt_cos > 0.95
-- bench 性能优于 Phase 4（预期：消除逐元素 V transpose + GMEM 读延迟气泡）
+- bench 性能显著优于 Phase 5（预期：TMA 与 MMA 真正 overlap，消除 GMEM 读延迟气泡）
 
 ---
 
