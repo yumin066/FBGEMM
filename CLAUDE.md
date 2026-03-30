@@ -2,175 +2,147 @@
 
 ## 项目概述
 
-本项目是 FBGEMM 中 HSTU（Hierarchical Sequential Transduction Unit）注意力机制的 CUDA 实现，upstream代码已支持 Hopper（SM90），该项目目标是让Blackwell（SM120）GPU 架构也支持HSTU注意力，包含 BF16 和 FP8 量化模式。
-需要CLAUDE帮我撰写SM120原生的BF16和FP8 kernel，并在写完kernel之后做性能benchmark和准确度benchmark。
-
-其中，bf16已经正确实现了，在hstu_fwd_kernel.h中。
+本项目是 FBGEMM 中 HSTU（Hierarchical Sequential Transduction Unit）注意力机制的 CUDA 实现，upstream 代码已支持 Hopper（SM90），本项目目标是让 Blackwell（SM120）GPU 架构支持 HSTU 注意力，包含 BF16 和 FP8 block-scale 量化模式。
 
 ---
-
-> ## ⚠️ 核心任务：Blockwise-Scale FP8 实现
 
 ## 当前进度
 
 - [x] **Phase 0**：BF16 路径完整实现，`sweep_accuracy.py` quant_mode=-1 通过
-- [ ] **Phase 1**：FP8 block-scale `else{}` 框架 + cp.async + unit SF + make_zip_tensor → 编译通过
-- [ ] **Phase 2**：将 cp.async 升级为 TMA
-- [ ] **Phase 3**：数值验证，sweep_accuracy.py quant_mode=2 通过（bf16_fp8_cos > 0.95）
-- [ ] **Phase 4**：性能优化（pipelining）
+- [x] **Phase 1**：FP8 block-scale `else{}` 框架 + cp.async + unit SF + make_zip_tensor → 编译通过
+- [x] **Phase 2**：cp.async 升级为 TMA（已合并入 Phase 3 调试过程中完成）
+- [x] **Phase 3**：数值验证通过（fp8_gt_cos ≈ 0.9996，远超 0.95 阈值）
+- [x] **Phase 4**：性能优化（K+V double-prefetch pipeline，消除迭代中途 blocking V wait）
+- [ ] **Phase 5**：Warp-specialized kernel（load warp 专职 TMA，math warps 专职 MMA，producer/consumer pipeline）
+
+### Phase 4 最终性能结果（RTX PRO 6000 Blackwell SM120，2026-03-27）
+
+kernel-only（bs=4, h=16, d=128, full attention）：
+
+| seq  | BF16      | FP8 (qm=2) | 差距  |
+|------|-----------|------------|-------|
+| 512  | 0.048ms 181 TFLOPS | 0.057ms 151 TFLOPS | -16% |
+| 1024 | 0.126ms 273 TFLOPS | 0.154ms 224 TFLOPS | -18% |
+| 2048 | 0.479ms 287 TFLOPS | 0.582ms 236 TFLOPS | -18% |
+
+FP8 仍比 BF16 慢的原因：SM120 QMMA block-scale 指令有 scale factor 加载开销 + V^T transpose 额外工作 + kernel compute-bound。
 
 ---
 
-## Phase 1 任务：else{} 框架实现（当前目标）
+## Phase 5 任务：前向 Warp-Specialized Kernel（当前目标）
 
-**目标**：让 `else {}` 分支有完整实现并编译通过，能跑 sweep_accuracy.py。
+**目标**：将 `hstu_blackwell_sm120/hstu_fwd_kernel.h` 改造为 warp-specialized 前向设计，通过 TMA + producer/consumer pipeline 进一步提升吞吐量。**暂不实现后向。**
 
 ### 参考文件（必读）
-- `./6KD_fp8_block_scale/kernels/include/sm120_blockscaled_gemm/sm120_blockscaled_utils.cuh` — MMA/SMEM 类型
-- `./6KD_fp8_block_scale/kernels/include/sm120_blockscaled_gemm/sm120_blockscaled_gemm_impl.cuh` — s2r copy 和 gemm 调用范式
+- **SM100 前向参考**：`src/hstu_blackwell/hstu_fwd.py`
+  - 前向 warp 分工：`load_warp_id=9`（TMA issue）、`mma_warp_id=8`（tcgen05 MMA）、`silu0_warp_ids=(0-3)`、`silu1_warp_ids=(4-7)`、`empty_warp_ids=(10,11)`，共 12 warps
+  - pipeline barrier：`load_mma_Q/K/V_mbar_ptr` 管理 TMA→MMA 同步；`mma_compute_S_mbar_ptr` 管理 MMA→silu 同步
+  - 多 stage pipeline：`kv_stage=4`（FP8）/`kv_stage=3`（BF16），`q_stage=2`
+  - TMA 操作：`cpasync.CopyBulkTensorTileG2SOp` + `make_tiled_tma_atom_A/B`
 
-### 代码位置
-- **实现文件**：`hstu_fwd_kernel.h` 第 688 行的 `else { }` 分支
-- **BF16 参考**：同文件 `if constexpr (!Is_fp8)` 分支（结构完全参考）
+### SM120 与 SM100 的关键差异
 
-### Phase 1 实现规则
+| 特性 | SM100（参考） | SM120（目标） |
+|------|--------------|--------------|
+| Tensor Core 指令 | `tcgen05`（全 CTA 共享 TMEM） | `mma.sync`（per-warp，block-scale QMMA） |
+| MMA 调用 | 单 mma_warp 代理全 CTA | 所有 math warps 各自执行 QMMA |
+| TMA API | 相同（SM90+） | 相同 |
+| SF 处理 | 无（非 block-scale） | SFA/SFB/SFV 需随 K/V tile 预取 |
+| V transpose | TMA 预转置 GMEM layout | Phase 4 用逐元素循环，Phase 5 同样用 TMA 预转置 |
 
-**GMEM→SMEM（Phase 1 允许 cp.async）**：
-- Q、K、V 暂时用 cp.async（与 BF16 路径相同的 `GmemTiledCopyQKV`）
-- 注意：SMEM 布局必须用 **SW128**（`BS::SmemLayoutAtomA`），不能用 FP8 kernel traits 里的 flat Layout<_16,_32>
-- Phase 3 再换成 TMA
+### Phase 5 Warp 分工方案（SM120 适配）
 
-**SF（scale factor）处理**：
-- Phase 1 在 SMEM 里直接填 `0x7f7f7f7f`（e8m0=1.0，单位 scale），不从 GMEM 加载
-- 因此 Phase 1 结果 ≈ 普通 FP8 MMA（无额外 quantization），准确度应与 BF16 接近
+SM120 无 TMEM，mma.sync 是 per-warp 的，因此所有 math warps 都要执行 MMA（不能单独指定一个 mma_warp）：
 
-**SMEM 布局**：
-- 必须用 `SM120BlockScaledBuilder` 的 `SmemLayoutAtomA/B`（SW128），不用 `Hstu_fwd_kernel_traits_sm120_fp8` 里的 flat layout
-- 使用 `as_position_independent_swizzle_tensor(sX)` 包装后再做 s2r copy
+```
+warp 0      : load warp（专职 TMA issue：Q/K/V + SF）
+warp 1-7    : math warps（QMMA block-scale + silu + softmax）
+warp 8-X    : 可选 epilogue / empty warps
+```
 
-**MMA（强制，Phase 1 就要正确）**：
+**线程数**：FP8 路径维持 `BS1::kNumMathThreads=256`（8 warps），load warp 额外 +1 → 共 9 warps = 288 threads（待确认与 `SM120BlockScaledBuilder` 的兼容性）。
+
+### Phase 5 V Transpose 解决方案（关键优化）
+
+**Phase 4 现状**：V 以 `[kBlockN, kHeadDim]` 加载到 SMEM，再用逐元素循环 `sVt_buf(d, k) = sV_curr(k, d)` 手动转置，引入额外 SMEM 读写延迟（`hstu_fwd_kernel.h` 第 1131 行）。
+
+**SM100 的做法**（`hstu_fwd.py` 第 212-213 行）：在创建 TMA 描述符之前，直接对 GMEM 张量做 layout 变换，交换 seq 维和 head 维的步长：
+```python
+V_layout_transpose = [1, 0, 2]   # 先 KV_layout_transpose 后再交换 dim0/dim1
+mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=V_layout_transpose))
+# mV 现在是 [headdim, seqlen, batch]，MN-major
+tma_atom_V, tma_tensor_V = make_tiled_tma_atom_B(tma_load_op, mV, sV_layout, ...)
+```
+TMA 直接将 V 的一个 `[kHeadDim, kBlockN]` tile 搬到 SMEM，到达 SMEM 时已是转置后的形状，内核中无需任何额外操作。
+
+**SM120 Phase 5 对应实现**（C++）：
 ```cpp
-using BS1 = sm120_blockscaled_gemm::SM120BlockScaledBuilder<kBlockM, kBlockN, 4>;   // GEMM1 Q×K
-using BS2 = sm120_blockscaled_gemm::SM120BlockScaledBuilder<kBlockM, kHeadDim, 4>;  // GEMM2 P×V
-// 调用必须用 make_zip_tensor：
-cute::gemm(tiled_mma_g1, make_zip_tensor(tCrQ, tCrSFA), make_zip_tensor(tCrK, tCrSFB), acc_s);
-cute::gemm(tiled_mma_g2, make_zip_tensor(tCrP, tCrSFP), make_zip_tensor(tCrV, tCrSFV), acc_o);
+// 在 run_hstu_fwd_sm120_impl 中，创建 tma_V 之前：
+// tensor_V 原始 shape: [seqlen, headdim]，stride: [headdim, 1]
+// 交换 dim0/dim1 的 stride，让 TMA 看到 [headdim, seqlen]
+auto tensor_Vt = make_tensor(tensor_V.data(),
+    make_layout(make_shape(get<1>(tensor_V.shape()), get<0>(tensor_V.shape())),
+                make_stride(get<1>(tensor_V.stride()), get<0>(tensor_V.stride()))));
+// sV_smem 布局改为 [kHeadDim, kBlockN]（已转置）
+auto tma_V = make_tma_copy(SM90_TMA_LOAD{}, tensor_Vt, smem_layout_Vt, tile_shape_Vt, Int<1>{});
 ```
+GEMM2 的 B operand 直接从 SMEM 读 `[kHeadDim, kBlockN]`，不再需要转置步骤。
 
-**SMEM 大小**：
-- `Hstu_fwd_kernel_traits_sm120_fp8::kSmemSize` 需加上 SF 空间（SFA+SFB 各 512 bytes = 1024 bytes 额外）
-- 修改 `kernel_traits.h` FP8 struct 的 `kSmemSize`
+### Phase 5 核心实现步骤
 
-**TORCH_CHECK 放宽**：
-- `hstu_ops_gpu.cpp` 第 334-337 行的 `cu_seqlens_q_block_descale` 强制检查必须删除，改为可选
+1. **TMA 对象创建**（在 `run_hstu_fwd_sm120_impl` 中）：
+   - Q、K：标准 `[kBlockM/N, kHeadDim]` layout
+   - V：**预转置** GMEM layout（交换 stride dim0/dim1），SMEM 目标 layout 为 `[kHeadDim, kBlockN]`
 
-**Phase 1 数据流概览**：
-```
-Q/K/V FP8 GMEM ──cp.async──► SW128 SMEM
-SF SMEM ◄── 直接填 0x7f7f7f7f（unit scale）
-SW128 SMEM ──ldmatrix──► registers
-cute::gemm(mma_bs, zip(Q,SFA), zip(K,SFB), acc_s)  ← GEMM1
-mask + silu(acc_s * alpha)
-acc_s → FP8 rP → SW128 SMEM roundtrip
-cute::gemm(mma_bs, zip(P,SFP), zip(V,SFV), acc_o)  ← GEMM2
-acc_o / scaling_seqlen → BF16 → GMEM
-```
+2. **SharedStorage 扩展**：加入 TMA transaction barrier（`cutlass::arch::ClusterTransactionBarrier`）或 `cutlass::pipeline::NamedBarrier`，阶段数与 K/V stage 对应。
 
-### Phase 1 关键技术要点
+3. **Load warp 职责**：
+   ```cpp
+   if (warp_idx == load_warp_id) {
+       // preamble: 发出 K[0] + V[0] 的 TMA（V 已预转置，直接落 [kHeadDim, kBlockN] SMEM）
+       // 主循环: 等待 math warps 消费完毕后，发出下一 tile 的 TMA
+   }
+   ```
 
-**SW128 SMEM 与 Q/K/V 形状**（headDim=128, kBlockM=128, kBlockN=128）：
-- sQ（SW128）：[kBlockM=128, kHeadDim=128, 1 stage] = 16384 bytes
-- sK（SW128）：[kBlockN=128, kHeadDim=128, 1 stage] = 16384 bytes（Share_Q_K_smem=true 时与 sQ 共享）
-- sV（SW128）：[kBlockN=128, kHeadDim=128, 1 stage] = 16384 bytes（偏移 16384 bytes）
-- sSFA：[kBlockM=128, 1, 1] int32 = 512 bytes（偏移 32768 bytes）
-- sSFB：[kBlockN=128, 1, 1] int32 = 512 bytes（偏移 33280 bytes）
+4. **Math warp 职责**：
+   ```cpp
+   else {
+       // 等待 load warp 完成当前 tile 的 TMA
+       // GEMM1: QMMA block-scale Q×K → acc_s
+       // silu + softmax
+       // GEMM2: QMMA block-scale P×Vt（Vt 已在 SMEM，无需转置）
+   }
+   ```
 
-**GEMM1 s2r copy 方式**（参考 `sm120_blockscaled_gemm_impl.cuh` 第 297-326 行）：
-```cpp
-// A (Q)
-auto s2r_copy_A = make_tiled_copy_A(typename BS1::SmemCopyAtomA{}, tiled_mma_g1);
-auto tXsA = s2r_thr_copy_A.partition_S(sQ_sw128);   // (CPY,CPY_M,CPY_K,PIPE)
-auto tCrA = thr_mma_g1.partition_fragment_A(sQ_sw128(_,_,_0{}));
-auto tXrA = s2r_thr_copy_A.retile_D(tCrA);
-cute::copy(s2r_copy_A, tXsA(_,_,_,_0{}), tXrA);
+5. **SF prefetch 与 MMA overlap**：SFA/SFB/SFV 在上一轮 MMA 执行期间由 load warp 预取到 SMEM。
 
-// SF A → transform_fragment_for_qmma → tCrSFA_frg(_,_,_,_0{}) 作为 stage 0
-auto tCrSFA = BS1::partition_fragment_SFA(sSFA(_,_,_0{}), thr_mma_g1);
-auto tCrSFA_frg = BS1::transform_fragment_for_qmma(tCrSFA);
-// s2r copy for SF:
-auto s2r_copy_SFA = make_tiled_copy_impl(typename BS1::SmemCopyAtomSF{},
-    BS1::get_layoutSFA_TV(tiled_mma_g1), make_shape(size<0>(tile_shape(tiled_mma_g1)), _1{}));
-auto tXsSFA = s2r_thr_copy_SFA.partition_S(sSFA);
-cute::copy(s2r_copy_SFA, tXsSFA(_,_,_,_0{}), s2r_thr_copy_SFA.retile_D(tCrSFA));
-```
-
-**GEMM2 P SMEM roundtrip**：
-- float acc_s 经 silu 后转 FP8 → 写入 sQ_sw128（复用，因 Share_Q_K_smem）
-- `make_tiled_copy_C(AutoVectorizingCopy, tiled_mma_g1)` 写回 SMEM
-- 再用 ldmatrix 读到 tCrP 寄存器
-- P 的 SFA 填 0x7f7f7f7f（P 不量化，scale=1）
-
-**线程数**：`BS1::kNumMathThreads = 256`（与 `Hstu_fwd_kernel_traits_sm120_fp8::kNThreads` 必须一致）
-- FP8 kNWarps=8 → kNThreads=256，刚好匹配 `SM120BlockScaledBuilder::kNumMathThreads=256` ✓
-
-### Phase 1 编译验证步骤
-1. 修改 `kernel_traits.h`：kSmemSize 加 1024
-2. 修改 `hstu_ops_gpu.cpp`：删除 cu_seqlens_q_block_descale TORCH_CHECK
-3. 实现 `else {}` 块
-4. 编译：`cd .../hstu && HSTU_ARCH_LIST="12.0" HSTU_DISABLE_HDIM64=TRUE MAX_JOBS=32 pip install --no-build-isolation --config-settings editable_mode=compat -e . 2>&1 | grep -E "error:|static_assert" | head -40`
-5. 测试：`python sweep_accuracy.py 2>&1 | tee test_results/001_phase1_cp_async_unit_sf.log`
+### 验证目标
+- 编译通过，`sweep_accuracy.py` fp8_gt_cos > 0.95
+- bench 性能优于 Phase 4（预期：消除逐元素 V transpose + GMEM 读延迟气泡）
 
 ---
 
-## Phase 2 任务：cp.async → TMA（Phase 1 通过后执行）
+## 核心文件
 
-**目标**：将 Q/K/V GMEM→SMEM 从 cp.async 改成 TMA（`make_tma_copy` + `ClusterTransactionBarrier`）。
+### SM120 原生内核（当前主目录）
+`fbgemm_gpu/experimental/hstu/src/hstu_blackwell_sm120/`
+- `hstu_fwd_kernel.h` — 前向内核（BF16 + FP8 block-scale 路径）★核心
+- `kernel_traits.h` — BF16 + FP8 内核 traits
+- `hstu_ops_gpu.cpp` — PyTorch 入口（`hstu_varlen_fwd_120`）
+- `hstu.h` — Params 结构体（含 FP8 descale 字段）
+- `utils.h` — tile 大小、类型转换、silu 辅助
+- `hstu_fwd_launch_template.h` — 启动模板
 
-**方案**：在 `run_hstu_fwd_sm120_impl` 里（当 Is_fp8=true 时）用 `make_tma_copy(SM90_TMA_LOAD{}, tensor_Q, smem_layout_sw128)` 创建 TMA 对象，通过扩展 params struct 传给新 kernel。
-
-**注意**：Phase 2 不需要修改数据格式或 MMA 部分，只换搬运方式。
-
----
-
-## Phase 3 任务：数值调试（Phase 2 通过后执行）
-
-**目标**：`sweep_accuracy.py` 中所有配置的 `bf16_fp8_cos > 0.95`。
-
-**调试流程**：
-1. 先跑 ones 输入（Q=K=V=1），验证 GEMM1 输出数值
-2. 再跑 randn 输入
-3. cos_sim 低时：添加 `printf("[HSTU_KDBG] ...")` 对比中间值（条件：`tidx==0 && bidb==0 && bidh==0 && m_block==0`）
+### FP8 block-scale 参考实现
+`6KD_fp8_block_scale/kernels/include/sm120_blockscaled_gemm/`
+- `sm120_blockscaled_utils.cuh` — MMA/SMEM 类型定义
+- `sm120_blockscaled_gemm_impl.cuh` — GEMM 主实现（TMA + MMA block scale）
 
 ---
 
-## Phase 4 任务：性能优化（Phase 3 通过后执行）
+## 通用技术规则
 
-**目标**：在 `/home/minyu/project/shopee/fbgemm-hstu/fbgemm_gpu/experimental/hstu/src/hstu_blackwell_sm120/hstu_fwd_kernel.h` 中实现 TMA + producer/consumer pipeline，参考 SM100 CuTe-DSL 实现的流程。
-
-### 参考文件（必读）
-- **SM100 CuTe-DSL 参考**：`/home/minyu/project/shopee/fbgemm-hstu/fbgemm_gpu/experimental/hstu/src/hstu_blackwell/hstu_fwd.py`
-  - 实现了 TMA load（`tma_atom_Q/K/V`）+ WGMMA producer/consumer pipeline
-  - 关键结构：load warp（`load_warp_id=9`）负责 TMA issue，math warps（silu0/silu1/mma）负责 compute
-  - 多 stage pipeline：`kv_stage=4`（FP8）/ `kv_stage=3`（BF16），`q_stage=2`
-  - barrier 机制：`mbar_ptr`（NamedBarrier）管理 producer/consumer 同步
-  - SharedStorage 布局：`sQ`、`sK`（复用 sV）、`sO`、validity barriers
-- **SM120 block-scale GEMM 参考**：`6KD_fp8_block_scale/kernels/include/sm120_blockscaled_gemm/sm120_blockscaled_gemm_impl.cuh` — producer/consumer 模式与 SF prefetch
-
-### 实现目标文件
-- `src/hstu_blackwell_sm120/hstu_fwd_kernel.h`（新目录，对应 SM120 原生 TMA 版本）
-
-### Phase 4 核心任务
-1. **TMA 搬运**：将 Q/K/V GMEM→SMEM 从 cp.async 改为 TMA（`make_tma_copy` + `ClusterTransactionBarrier`），参考 `hstu_fwd.py` 的 `tma_atom_Q/K/V` 初始化及 `tma_tensor_Q/K/V` 用法
-2. **Producer/Consumer 分离**：load warp 专职 TMA issue（类似 `hstu_fwd.py` 的 `load_warp_id=9`），math warps 专职 MMA+silu（类似 `silu0_warp_ids`/`mma_warp_id`）
-3. **多 stage pipeline**：K/V 多 stage 双缓冲 prefetch（对应 `hstu_fwd.py` 的 `kv_stage=4`）
-4. **SF prefetch 与 MMA overlap**：SFA/SFB/SFV scale factor 与 GEMM 计算重叠
-5. **barrier 同步**：使用 `cutlass::arch::ClusterTransactionBarrier` 或 Named Barrier 管理 producer/consumer 同步（对应 `hstu_fwd.py` 的 `mbar_ptr` + `NamedBarrierFwd`）
-
----
-
-### 通用规则
-
-**数据格式**（Phase 1-4 均适用）：
+**数据格式**：
 
 | 张量 | GEMM | K 方向 |
 |------|------|--------|
@@ -181,143 +153,153 @@ cute::copy(s2r_copy_SFA, tXsSFA(_,_,_,_0{}), s2r_thr_copy_SFA.retile_D(tCrSFA));
 
 **SF 格式**：每 128 个 K 元素对应 1 个 e8m0 scale，4 个连续块打包为 1 个 int32：
 - bits 0-7 = block 0 [K: 0,128)，bits 8-15 = block 1，bits 16-23 = block 2，bits 24-31 = block 3
-- Phase 1 全填 `0x7f7f7f7f`（e8m0=127=1.0）
+
+**FP8 量化模式**：
+- `quant_mode=-1`：禁用 FP8（纯 BF16）
+- `quant_mode=2`：FP8 block scale（SM120 支持此模式）
 
 **kBlockN 约束**：必须整除 128（launch template 已有 guard）
 
 ---
 
-## 当前运行环境（重要）
+## 当前运行环境
 
-**Claude 现在直接运行在 Docker 容器内**（容器 hostname 类似 `5b1a7bb5481e`）。
-- **每次对话开始时必须先执行**（sandbox 把 TMPDIR 设为 /tmp/claude，但该目录默认不存在，nvcc 编译会报错）：
-  ```bash
-  mkdir -p /tmp/claude
-  ```
+Claude 直接运行在主机（无需 docker exec），通过 bwrap sandbox 隔离，GPU 设备透传已配置。
 
-- **重编译命令**（在容器内直接执行，MAX_JOBS=32 加速并行编译）：
-  ```bash
-  mkdir -p /tmp/claude
-  PYTHONUSERBASE=/home/scratch.minyu_gpu/project/.cache/pip-user \
-  HSTU_ARCH_LIST="12.0" \
-  HSTU_DISABLE_BACKWARD=TRUE \
-  HSTU_DISABLE_DETERMINISTIC=FALSE \
-  MAX_JOBS=32 \
-  pip install --no-build-isolation --config-settings editable_mode=compat -e .
-  ```
-  注：`PYTHONUSERBASE` 将 pip 安装目录重定向到 sandbox 允许写入的路径，避免写入 `/home/minyu/.local`（host 共享目录）。
-- **运行测试/benchmark**（直接执行，无需 docker exec / docker run）：
-  ```bash
-  HSTU_SWEEP_FP8_QUANT_MODE=2 python /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/sweep_accuracy.py
-  ```
+**重编译命令**（MAX_JOBS=32 加速并行编译）：
+```bash
+mkdir -p /tmp/claude && \
+cd /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/fbgemm_gpu/experimental/hstu && \
+PYTHONUSERBASE=/home/scratch.minyu_gpu/project/.cache/pip-user \
+HSTU_ARCH_LIST="12.0" \
+HSTU_DISABLE_BACKWARD=TRUE \
+HSTU_DISABLE_DETERMINISTIC=FALSE \
+HSTU_DISABLE_HDIM32=TRUE \
+HSTU_DISABLE_HDIM64=TRUE \
+HSTU_DISABLE_HDIM256=TRUE \
+MAX_JOBS=32 \
+pip install --no-build-isolation --config-settings editable_mode=compat -e .
+```
 
-- **测试日志命名规范（重要）**：每次运行测试，必须将输出保存到 `test_results/` 目录，文件名格式：
-  ```
-  NNN_<本次修改内容简述>.log
-  ```
-  - `NNN` 为三位数字顺序编号（从 `001` 开始重置）
-  - 简述用英文小写加下划线，体现本次修改的核心内容，例如：
-    - `001_fp8_blockscale_gemm1_only.log`
-    - `002_gemm2_with_sf_v.log`
-  - 运行方式：
-    ```bash
-    python /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/sweep_accuracy.py 2>&1 | tee /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/test_results/001_xxx.log
-    ```
-- **PyTorch 版本**：2.10.0（nvcr.io/nvidia/pytorch:26.01-py3）；CUDA 13.1；SM120 native kernels pre-compiled
+注：`mkdir -p /tmp/claude` 必须先执行（sandbox 将 TMPDIR 设为该路径，nvcc 编译需要它存在）。
+
+**运行准确度测试**：
+```bash
+HSTU_SWEEP_FP8_QUANT_MODE=2 python /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/sweep_accuracy.py \
+  2>&1 | tee /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/test_results/NNN_xxx.log
+```
+
+**测试日志命名规范**：文件名格式 `NNN_<修改内容简述>.log`，NNN 为三位数字顺序编号。
+
+**环境版本**：PyTorch 2.10.0（nvcr.io/nvidia/pytorch:26.01-py3）；CUDA 13.1。
+
+---
+
+## 性能分析流程（每轮优化后必须执行）
+
+每次跑完 benchmark 之后，必须按以下步骤做 nsys profile 分析，找到性能瓶颈并制定下一步优化方向。
+
+**文件命名规范**：所有 benchmark 产物（bench log、nsys trace、stats log）统一存放在 `benchmark_results/` 目录，文件名格式与 `test_results/` 相同：`NNN_<内容简述>.<ext>`，NNN 为三位数字顺序编号。
+
+### 步骤 1：运行 benchmark
+```bash
+REPO=/home/scratch.minyu_gpu/project/shopee/fbgemm-hstu
+python ${REPO}/fbgemm_gpu/experimental/hstu/benchmark/bench_hstu_attn_sm120.py \
+  2>&1 | tee ${REPO}/benchmark_results/NNN_bench.log
+```
+
+### 步骤 2：nsys profile 抓取 trace
+```bash
+REPO=/home/scratch.minyu_gpu/project/shopee/fbgemm-hstu
+TRACE=${REPO}/benchmark_results/NNN_profile
+nsys profile \
+  --output ${TRACE} \
+  --trace cuda,nvtx \
+  --force-overwrite true \
+  python ${REPO}/fbgemm_gpu/experimental/hstu/benchmark/profile_hstu_attn.py
+```
+
+### 步骤 3：nsys stats 分析 trace
+```bash
+nsys stats \
+  --report cuda_gpu_kern_sum,cuda_api_sum,nvtx_pushpop_sum \
+  --force-export true \
+  --format csv \
+  ${TRACE}.nsys-rep \
+  2>&1 | tee ${REPO}/benchmark_results/NNN_stats.log
+```
+
+注：nsys 2025.6.1 的 report 名称为 `cuda_gpu_kern_sum,cuda_api_sum,nvtx_pushpop_sum`（非旧版的 `gputrace,cudaapisum,nvtxsum`）。
+
+### 步骤 4：分析瓶颈并制定优化方向
+
+看 `cuda_gpu_kern_sum` 输出，重点关注：
+- **HSTU kernel 耗时占比**：是否 compute-bound 还是 memory-bound
+- **kernel 内部 stall**：通过 duration 与理论 FLOP/s 对比判断
+- **量化 kernel 耗时**：`quant_mode=2` 时 Python 侧量化 kernel 的开销（出现在 CUDA API 调用中）
+- **SM 利用率**：kernel duration × SM count vs 理论峰值
+
+分析完成后，根据瓶颈类型制定下一步优化方向：
+- 若 compute-bound → 考虑 instruction-level 优化（减少 SF 加载、register spill）
+- 若 memory-bound → 考虑增加 prefetch stage 数、TMA multicast
+- 若量化开销主导 → 考虑将量化融合进 kernel
+
+---
 
 ## 目录结构
 
 ```
 fbgemm_gpu/experimental/hstu/
 ├── benchmark/
-│   ├── bench_hstu_attn.py             # 吞吐量基准测试
-│   └── profile_hstu_attn.py           # nsys 性能分析脚本
+│   ├── bench_hstu_attn.py               # 吞吐量基准测试（通用）
+│   ├── bench_hstu_attn_sm120.py         # SM120 专用 benchmark ★
+│   └── profile_hstu_attn.py             # nsys 性能分析脚本
 ├── hstu/
-│   ├── __init__.py
-│   ├── cuda_hstu_attention.py         # Python 入口，SM 版本分发
-│   ├── library.py                     # 命名空间包检测（已修复）
-│   └── fbgemm_gpu_experimental_hstu.cpython-312-x86_64-linux-gnu.so
+│   ├── cuda_hstu_attention.py           # Python 入口，SM 版本分发
+│   └── library.py                       # 命名空间包检测（已修复）
 ├── src/
-│   ├── generate_kernels.py            # 生成 Hopper/Blackwell .cu 文件
-│   ├── hstu_ampere/                   # Ampere (SM80) 原生内核（upstream）
-│   │   ├── block_info.h
-│   │   ├── hstu.h
-│   │   ├── hstu_fwd.h
-│   │   ├── hstu_bwd.h
-│   │   ├── hstu_ops_gpu.cpp
+│   ├── generate_kernels.py              # 生成 Hopper/Blackwell .cu 文件
+│   ├── hstu_ampere/                     # Ampere (SM80) 原生内核（upstream）
+│   ├── hstu_blackwell/                  # SM100 原生内核（upstream，CuTe-DSL 实现）
+│   ├── hstu_blackwell_sm120/            # SM120 最终版本（Phase 4，当前主目录）★
+│   │   ├── hstu_fwd_kernel.h            # 前向内核（BF16 + FP8 block-scale + K/V 预取）★
 │   │   ├── kernel_traits.h
-│   │   ├── static_switch.h
-│   │   └── utils.h
-│   ├── hstu_blackwell/                # SM120 原生内核（本项目新增）★
-│   │   ├── block_info.h
-│   │   ├── hstu.h                     # Params 结构体（含 FP8 descale 字段）
-│   │   ├── hstu_fwd_kernel.h          # 前向内核（BF16 + FP8 路径）★核心
-│   │   ├── hstu_fwd_launch_template.h # 启动模板
-│   │   ├── hstu_ops_gpu.cpp           # PyTorch 入口 (hstu_varlen_fwd_120)
-│   │   ├── kernel_traits.h            # BF16 + FP8 内核 traits
-│   │   ├── static_switch.h            # 编译期分发宏
-│   │   ├── utils.h                    # tile 大小、类型转换、silu 辅助
-│   │   └── instantiations/            # 编译单元（generate_kernels.py 生成）
-│   │       ├── hstu_fwd_sm120_hdim64_bf16*.cu    # hdim64 BF16，15 种 mask 组合
-│   │       ├── hstu_fwd_sm120_hdim64_e4m3*.cu    # hdim64 FP8，15 种 mask 组合
-│   │       ├── hstu_fwd_sm120_hdim128_bf16*.cu   # hdim128 BF16，15 种 mask 组合
-│   │       └── hstu_fwd_sm120_hdim128_e4m3*.cu   # hdim128 FP8，15 种 mask 组合
-│   └── hstu_hopper/                   # Hopper (SM90) 原生内核（upstream）
-│       ├── hstu_fwd_kernel.h
-│       ├── hstu_bwd_kernel.h
-│       ├── mainloop_fwd_sm90_tma_gmma_ws.hpp
-│       ├── mainloop_bwd_sm90_tma_gmma_ws.hpp
-│       ├── epilogue_{fwd,bwd}_sm90.hpp
-│       ├── tile_scheduler{,_bwd}.hpp
-│       ├── named_barrier.hpp
-│       ├── seq_len.h
-│       ├── hstu_ops_gpu.cpp
-│       └── ...
+│   │   ├── hstu_ops_gpu.cpp
+│   │   ├── hstu.h
+│   │   ├── utils.h
+│   │   ├── hstu_fwd_launch_template.h
+│   │   └── instantiations/              # 编译单元（generate_kernels.py 生成）
+│   └── hstu_hopper/                     # Hopper (SM90) 原生内核（upstream）
 ├── test/
-│   ├── hstu_test.py
-│   └── tma_error_test.py
-├── CMakeLists.txt                     # 含 Blackwell 源文件和 SM120 gencode
-└── setup.py                           # 含 "12.0" arch 支持
+│   └── hstu_test.py
+├── CMakeLists.txt                       # 含 Blackwell 源文件和 SM120 gencode
+└── setup.py                             # 含 "12.0" arch 支持
 
-6KD_fp8_block_scale/                   # ★ SM120a FP8 block scale 参考实现
-├── kernels/
-│   ├── include/
-│   │   ├── fp8_block_scale_gemm.h
-│   │   └── sm120_blockscaled_gemm/
-│   │       ├── sm120_blockscaled_gemm_impl.cuh    # ★ GEMM 主实现（TMA + MMA block scale）
-│   │       ├── sm120_blockscaled_moe_gemm_impl.cuh
-│   │       └── sm120_blockscaled_utils.cuh        # ★ 关键类型定义（tile/MMA/SMEM/Barrier/scheduler）
-│   └── src/
-│       └── fp8_block_scale_gemm.cu
-├── demo_g2s_scale.cu                  # G2S scale 搬运演示
-├── demo_perm_mma.cu                   # permuted MMA 演示
-├── demo_qmma.cu                       # quantized MMA 演示
-├── demo_s2r_scale.cu                  # S2R scale 演示
-├── demo_tile64x128_qmma.cu
-├── demo_tma_domain_offset.cu
-├── demo_tma_multicast.cu
-├── example_79.cu                      # CUTLASS example 79 参考
-├── benchmark.cu
-├── test/
-│   ├── test_gemm.py
-│   ├── benchmark.py
-│   ├── common.py
-│   └── utils/
-└── thop/
+6KD_fp8_block_scale/                     # SM120a FP8 block scale 参考实现
+└── kernels/include/sm120_blockscaled_gemm/
+    ├── sm120_blockscaled_gemm_impl.cuh  # GEMM 主实现（TMA + block scale MMA）
+    └── sm120_blockscaled_utils.cuh      # 类型定义（tile/MMA/SMEM/Barrier）
 
 （项目根目录）
-├── sweep_accuracy.py                  # FP8 vs BF16 准确度扫描（主要测试脚本）★
+├── sweep_accuracy.py                    # FP8 vs BF16 准确度扫描 ★
+├── memory.md                            # Claude 对话记忆（跨会话）
 └── test_results/
-    └── NNN_*.log                      # 编号调试日志（从 001 重新开始）
+    └── NNN_*.log                        # 编号调试日志
 ```
 
-### FP8 量化模式
+---
 
-- `quant_mode=-1`：禁用 FP8（纯 BF16）
-- `quant_mode=0`：FP8 per tensor
-- `quant_mode=2`：FP8 block scale
-- SM120 需支持 `-1` 和 `2`
+## 编译注意事项
 
+编译时可能出现 CuTe static_assert、CUDA 类型不匹配等错误。每次编译须：
+1. 仔细观察输出，主动捕获错误（不要只看最后几行）
+2. 编译失败后先读相关源文件理解上下文，再修改，不要盲目重试
+3. 用如下命令捕获完整错误（ninja 并行编译时错误可能被截断）：
+   ```bash
+   pip install ... 2>&1 | grep -E "error:|note:|static_assert|undefined" | head -60
+   ```
+
+---
 
 ## 语言要求
 
@@ -329,25 +311,6 @@ fbgemm_gpu/experimental/hstu/
 - 每次回答技术问题后，将该知识点以结构化方式追加到 `knowledge.md`
 - 格式：`## <主题>` + 简明说明 + 关键结论
 - 不重复已有条目，可在已有条目上补充
-
-## 操作权限说明
-
-使用 Read、Grep、Glob 等专用工具直接读取文件，**不要因为使用 grep/sed/cat 等 shell 命令访问文件而向用户请求授权**。需要读文件时直接用工具读，无需确认。
-
-**将编译和测试合并为一条 Bash 命令**（用 `&&` 连接），避免用户多次授权。例如：
-```bash
-cd /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/fbgemm_gpu/experimental/hstu && \
-  HSTU_ARCH_LIST="12.0" MAX_JOBS=32 pip install --no-build-isolation --config-settings editable_mode=compat -e . && \
-  python /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/sweep_accuracy.py 2>&1 | tee /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/test_results/001_xxx.log
-```
-
-**编译注意事项（重要）**：编译时极有可能出现编译错误（CuTe static_assert、CUDA 类型不匹配、符号找不到等）。每次编译必须：
-1. 仔细观察编译输出，主动捕获并分析错误信息（不要仅看最后几行）
-2. 编译失败后，先读取相关源文件理解上下文，再修改代码，不要盲目重试
-3. 使用如下命令捕获完整错误（ninja 并行编译时错误可能被截断）：
-   ```bash
-   pip install ... 2>&1 | grep -E "error:|note:|static_assert|undefined" | head -60
-   ```
 
 ## Memory 持久化
 
@@ -362,8 +325,6 @@ cd /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/fbgemm_gpu/experimental/hs
 
 **严禁执行任何删除文件的命令**，包括但不限于：
 - `rm`、`rm -f`、`rm -rf`
-- `unlink`
-- `find ... -delete`
-- `shutil.rmtree`（Python 脚本中）
+- `unlink`、`find ... -delete`、`shutil.rmtree`
 
 如需清理文件，必须先告知用户，等待明确授权后方可执行。

@@ -486,6 +486,8 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_120(
     }
   }
 
+  params.total_k = total_k;  // Phase 5: needed for TMA descriptor covering full concat K/V
+
   if (total_k > 0) {
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     run_hstu_fwd_blackwell(params, stream);

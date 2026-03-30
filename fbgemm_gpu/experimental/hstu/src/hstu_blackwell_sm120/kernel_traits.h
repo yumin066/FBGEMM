@@ -25,6 +25,7 @@
 //       but that variant is NOT available on SM120 consumer hardware.
 #include "cute/arch/mma_sm89.hpp"
 #include "cute/atom/mma_traits_sm89.hpp"
+#include "cute/atom/mma_traits_sm90_gmma.hpp"  // for GMMA::Layout_K_SW128_Atom (Phase 5 TMA)
 
 using namespace cute;
 
@@ -320,6 +321,15 @@ struct Hstu_fwd_kernel_traits_sm120_fp8 {
   using SmemLayoutVtransposedNoSwizzle =
       decltype(get_nonswizzle_portion(SmemLayoutVtransposed{}));
 
+  // Phase 5 TMA layouts: SW128 swizzle (= SM120BlockScaledBuilder::SmemLayoutAtomA/B).
+  // Used for make_tma_copy in run_hstu_fwd_sm120_impl (host-side) and for the
+  // Phase 5 compute function (device-side).  These match the local SW128 types
+  // defined inside hstu_compute_attn_1rowblock_sm120 via BS1/BS2::SmemLayoutAtomA/B.
+  using SmemLayoutAtomSW128 = GMMA::Layout_K_SW128_Atom<Element>;  // 8-row × 128-FP8 atom
+  using SmemLayoutQ_TMA  = decltype(tile_to_shape(SmemLayoutAtomSW128{}, Shape<Int<kBlockM>, Int<kHeadDim>>{}));
+  using SmemLayoutK_TMA  = decltype(tile_to_shape(SmemLayoutAtomSW128{}, Shape<Int<kBlockN>, Int<kHeadDim>>{}));
+  using SmemLayoutVt_TMA = decltype(tile_to_shape(SmemLayoutAtomSW128{}, Shape<Int<kHeadDim>, Int<kBlockN>>{}));
+
   // Output layout: BF16 written to sO (reuses smem_ base), then copied to GMEM.
   // SM120 QMMA output uses PermMmaTileN = Layout<_8,_4,_4>, Stride<_1,_32,_8>, which
   // permutes the N-axis of the C fragment. The interleaved atom below matches this permutation:
@@ -364,9 +374,11 @@ struct Hstu_fwd_kernel_traits_sm120_fp8 {
       (Is_arbitrary ? size(SmemLayoutValidBlockIds{}) * sizeof(int) : 0);
   // Extra SMEM for block-scale SF: SFA (kBlockM int32 = 512B) + SFB (kBlockN int32 = 512B)
   static constexpr int kSmemSFSize = 1024;
+  // Extra SMEM for Phase 5 TMA barrier: 1 × ClusterTransactionBarrier (8 bytes, 8-byte aligned)
+  static constexpr int kSmemMbarSize = 8;
   static constexpr int kSmemSize = kSmemSizeQKVRabValidBlockIds +
       (Is_arbitrary ? (size(SmemLayoutMaxFunc{}) + size(SmemLayoutMinFunc{}) + 1) * sizeof(int) : 0) +
-      kSmemSFSize;
+      kSmemSFSize + kSmemMbarSize;
 
   // GMEM copy: cp.async FP8 elements directly into flat SMEM (no conversion).
   // Uses SM80_CP_ASYNC_CACHEGLOBAL<uint128_t> (16 bytes = 16 FP8 per thread per load).
