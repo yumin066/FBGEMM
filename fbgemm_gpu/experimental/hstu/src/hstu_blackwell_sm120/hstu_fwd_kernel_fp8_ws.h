@@ -124,11 +124,12 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
   Tensor sFunc_min = make_tensor(make_smem_ptr(sf_min_ptr), typename Kernel_traits::SmemLayoutMinFunc{});
   Tensor sFunc_max = make_tensor(make_smem_ptr(sf_max_ptr), typename Kernel_traits::SmemLayoutMaxFunc{});
 
-  // Is_arbitrary setup: warp 0 (= load warp) handles this before the WS split.
+  // Is_arbitrary setup: warp 1 (first math warp) handles this before the WS split.
+  // Warp 0 is the dedicated load warp and must not execute non-TMA preamble work.
   if constexpr (Is_arbitrary) {
     const int lane_id = cutlass::canonical_lane_idx();
     const int warp_id = cutlass::canonical_warp_idx_sync();
-    if (warp_id == 0) {
+    if (warp_id == 1) {
       *sn_valid_block_max = 0;
       sFunc_min[0] = 0;
       __syncwarp();
@@ -454,13 +455,15 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       }
       math_phase ^= 1;
 
-      // Issue TMA K[nb_abs] + V^T[nb_abs]: arrive.expect_tx BEFORE TMA copies per PTX ISA.
+      // Issue TMA K[nb_abs] + V^T[nb_abs]: copy first, then arrive.expect_tx.
+      // This matches the Phase 5 proven ordering (copy issues the TMA descriptor to HW,
+      // arrive.expect_tx sets the expected byte count so math warps can wait correctly).
       if (tidx == 0) {
         uint32_t laddr = static_cast<uint32_t>(__cvta_generic_to_shared(load_mbar_ptr));
-        asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"
-                     : : "r"(laddr), "r"(kKBytes + kVtBytes));
         cute::copy(params.tma_k.with(*load_mbar_ptr),  tKgK_tma(_, _, _, nb_abs), tKsK_d);
         cute::copy(params.tma_vt.with(*load_mbar_ptr), tVtgVt_tma(_, _, _, nb_abs), tVtsVt_d);
+        asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"
+                     : : "r"(laddr), "r"(kKBytes + kVtBytes));
       }
 
       if (is_jump && masking_step == n_masking_steps - 1)
