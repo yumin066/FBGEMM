@@ -1,0 +1,50 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls *)",
+      "Bash(ls)",
+      "Bash(cd *)",
+      "Bash(mkdir *)",
+      "Bash(git *)",
+      "Bash(cat *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(grep *)",
+      "Bash(wc *)",
+      "Bash(echo *)",
+      "Bash(pwd)",
+      "Bash(which *)",
+      "Bash(python *)",
+      "Bash(python3 *)",
+      "Grep",
+      "Bash(pip install *)",
+      "Bash(pytest *)",
+      "Bash(nvcc *)",
+      "Bash(nvcc)",
+      "Bash(nsys *)",
+      "Bash(PYTHONUSERBASE=* pip install *)",
+      "Bash(HSTU_ARCH_LIST=* pip install *)",
+      "Bash(HSTU_ARCH_LIST=* PYTHONUSERBASE=* pip install *)",
+      "Bash(HSTU_SWEEP_FP8_QUANT_MODE=* python *)",
+      "Bash(CUDA_LAUNCH_BLOCKING=* python *)",
+      "Bash(* pip install *)",
+      "Bash(* python *)",
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:code.claude.com)",
+      "WebSearch"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -c \"\nimport sys, json, os\ntry:\n    inp = json.loads(os.environ.get('CLAUDE_TOOL_INPUT', '{}'))\nexcept Exception:\n    sys.exit(0)\ncmd = inp.get('command', '')\nimport re\npatterns = [\n    r'\\brm\\s',\n    r'\\brm$',\n    r'\\bunlink\\s',\n    r'find\\s.*-delete',\n    r'shutil\\.rmtree',\n]\nfor p in patterns:\n    if re.search(p, cmd):\n        print(f'[BLOCKED] 禁止执行删除命令: {cmd[:80]}', file=sys.stderr)\n        sys.exit(1)\nsys.exit(0)\n\""
+          }
+        ]
+      }
+    ]
+  }
+}
