@@ -106,3 +106,4 @@ fbgemm_gpu/experimental/hstu/src/hstu_hopper/instantiations/*.cu
 fbgemm_gpu/experimental/hstu/src/hstu_blackwell_sm120/instantiations/*.cu
 
 *.log
+.humanize*
