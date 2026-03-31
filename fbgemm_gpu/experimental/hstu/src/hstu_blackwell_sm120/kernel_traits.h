@@ -374,7 +374,9 @@ struct Hstu_fwd_kernel_traits_sm120_fp8 {
       (Is_arbitrary ? size(SmemLayoutValidBlockIds{}) * sizeof(int) : 0);
   // Extra SMEM for block-scale SF: SFA (kBlockM int32 = 512B) + SFB (kBlockN int32 = 512B)
   static constexpr int kSmemSFSize = 1024;
-  // Extra SMEM for Phase 5 TMA barrier: 1 × ClusterTransactionBarrier (8 bytes, 8-byte aligned)
+  // Extra SMEM for TMA barrier(s).
+  // Phase 5: 1 barrier (load_mbar) = 8 bytes.
+  // Phase 6 WS: 2 barriers (load_mbar + math_mbar) = 16 bytes.
   static constexpr int kSmemMbarSize = 8;
   static constexpr int kSmemSize = kSmemSizeQKVRabValidBlockIds +
       (Is_arbitrary ? (size(SmemLayoutMaxFunc{}) + size(SmemLayoutMinFunc{}) + 1) * sizeof(int) : 0) +
@@ -436,4 +438,50 @@ struct Hstu_fwd_kernel_traits_sm120_fp8 {
       Copy_Atom<AutoVectorizingCopy, OutputType>{},
       GmemLayoutAtomO{},
       Layout<Shape<_1, Int<kGmemElemsPerLoadO>>>{}));
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Phase 6 warp-specialized FP8 kernel traits.
+// Extends the Phase 5 FP8 traits by designating warp 0 as a dedicated load warp (TMA-only)
+// and warps 1–8 as math warps (QMMA-only). Total threads = 9 × 32 = 288, but kNThreads stays
+// at 256 (8 math warps) so all SW128 GMEM/SMEM layout arithmetic remains unchanged.
+// The kernel is launched with kNThreadsTotal=288; math warps use tidx_math=tidx-32 (∈[0,255]).
+template <
+    int kHeadDim_,
+    int kBlockM_,
+    int kBlockN_,
+    int kNWarps_,   // number of MATH warps (= 8 for kBlockM=128)
+    bool Is_causal_,
+    bool Is_target_,
+    bool Is_context_,
+    bool Is_local_,
+    bool Is_arbitrary_,
+    int kNFunc_,
+    bool Has_rab_,
+    bool Is_Q_in_regs_ = false,
+    bool Share_Q_K_smem_ = false,
+    typename out_type = cutlass::bfloat16_t>
+struct Hstu_fwd_kernel_traits_sm120_fp8_ws
+    : public Hstu_fwd_kernel_traits_sm120_fp8<
+          kHeadDim_, kBlockM_, kBlockN_, kNWarps_,
+          Is_causal_, Is_target_, Is_context_, Is_local_, Is_arbitrary_, kNFunc_, Has_rab_,
+          Is_Q_in_regs_, Share_Q_K_smem_, out_type> {
+  using Base = Hstu_fwd_kernel_traits_sm120_fp8<
+      kHeadDim_, kBlockM_, kBlockN_, kNWarps_,
+      Is_causal_, Is_target_, Is_context_, Is_local_, Is_arbitrary_, kNFunc_, Has_rab_,
+      Is_Q_in_regs_, Share_Q_K_smem_, out_type>;
+
+  // Warp roles: warp 0 = load warp; warps 1..kNWarps_ = math warps.
+  static constexpr int kNMathWarps  = kNWarps_;      // 8
+  static constexpr int kNLoadWarps  = 1;
+  static constexpr int kLoadWarpIdx = 0;             // warp 0 is the load warp
+  static constexpr int kNWarpsTotal = kNMathWarps + kNLoadWarps;   // 9
+  static constexpr int kNThreadsTotal = kNWarpsTotal * cutlass::NumThreadsPerWarp;  // 288
+
+  // Two barriers: load_mbar (load warp → math warps) + math_mbar (math warps → load warp).
+  // Each barrier is 8 bytes; total = 16 bytes.  Placed at the last 16 bytes of kSmemSize.
+  static constexpr int kSmemMbarSize = 16;
+  // Override kSmemSize to include the larger barrier region.
+  static constexpr int kSmemSize =
+      Base::kSmemSize - Base::kSmemMbarSize + kSmemMbarSize;
 };
