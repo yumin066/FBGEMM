@@ -443,9 +443,11 @@ struct Hstu_fwd_kernel_traits_sm120_fp8 {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Phase 6 warp-specialized FP8 kernel traits.
 // Extends the Phase 5 FP8 traits by designating warp 0 as a dedicated load warp (TMA-only)
-// and warps 1–8 as math warps (QMMA-only). Total threads = 9 × 32 = 288, but kNThreads stays
-// at 256 (8 math warps) so all SW128 GMEM/SMEM layout arithmetic remains unchanged.
-// The kernel is launched with kNThreadsTotal=288; math warps use tidx_math=tidx-32 (∈[0,255]).
+// and warps 1–8 as math warps (QMMA-only).
+// kNThreads = 288 (9 warps × 32), kNMathThreads = 256 (8 math warps × 32).
+// Math warps use tidx_math = tidx - 32 ∈ [0, 255].
+// All GMEM/SMEM layout arithmetic (SmemLayoutQ, GmemTiledCopyQKV, etc.) is inherited from
+// the base FP8 traits where kNThreads=256, so those layouts remain correct for 256 math threads.
 template <
     int kHeadDim_,
     int kBlockM_,
@@ -472,11 +474,14 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
       Is_Q_in_regs_, Share_Q_K_smem_, out_type>;
 
   // Warp roles: warp 0 = load warp; warps 1..kNWarps_ = math warps.
-  static constexpr int kNMathWarps  = kNWarps_;      // 8
-  static constexpr int kNLoadWarps  = 1;
-  static constexpr int kLoadWarpIdx = 0;             // warp 0 is the load warp
-  static constexpr int kNWarpsTotal = kNMathWarps + kNLoadWarps;   // 9
-  static constexpr int kNThreadsTotal = kNWarpsTotal * cutlass::NumThreadsPerWarp;  // 288
+  static constexpr int kNMathWarps   = kNWarps_;     // 8 math warps
+  static constexpr int kNLoadWarps   = 1;            // 1 load warp (warp 0)
+  static constexpr int kLoadWarpIdx  = 0;            // warp 0 is the load warp
+
+  // kNThreads overrides Base::kNThreads: total = math warps + load warp = 9 × 32 = 288.
+  static constexpr int kNThreads     = (kNMathWarps + kNLoadWarps) * cutlass::NumThreadsPerWarp;  // 288
+  // kNMathThreads: math-warp-only thread count used for per-warp layout arithmetic.
+  static constexpr int kNMathThreads = kNMathWarps * cutlass::NumThreadsPerWarp;  // 256
 
   // Two barriers: load_mbar (load warp → math warps) + math_mbar (math warps → load warp).
   // Each barrier is 8 bytes; total = 16 bytes.  Placed at the last 16 bytes of kSmemSize.
@@ -484,4 +489,12 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
   // Override kSmemSize to include the larger barrier region.
   static constexpr int kSmemSize =
       Base::kSmemSize - Base::kSmemMbarSize + kSmemMbarSize;
+
+  // Invariant checks
+  static_assert(kNMathWarps * 16 == Base::kBlockM,
+      "kNMathWarps * 16 must equal kBlockM (8 warps × 16 rows = 128)");
+  static_assert(kNThreads == (kNMathWarps + kNLoadWarps) * 32,
+      "kNThreads == (kNMathWarps + kNLoadWarps) * 32");
+  static_assert(kSmemMbarSize == 16,
+      "kSmemMbarSize must be 16 (two 8-byte mbarriers)");
 };
