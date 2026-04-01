@@ -33,6 +33,21 @@
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
 
+// Force SM120-specific TMA path in cute/arch/copy_sm90_tma.hpp.
+// SM90_TMA_LOAD_xD::copy has two paths:
+//   - CUTE_ARCH_TMA_SM120_ENABLED defined → cp.async.bulk.tensor.Nd.shared::cta  (SM120 correct)
+//   - otherwise                            → cp.async.bulk.tensor.Nd.shared::cluster (SM90 clusters, illegal on SM120 consumer)
+// CUTE_ARCH_TMA_SM120_ENABLED is normally set by cute/arch/config.hpp when CUTLASS_ARCH_MMA_SM120_ENABLED
+// is defined (i.e., when __CUDA_ARCH__==1200). Due to include ordering, it may not be set before
+// SM90_TMA_LOAD_xD::copy is compiled. Force it here for device code only (host doesn't need it).
+// Note: CUTE_ARCH_TMA_SM90_ENABLED is NOT forced here — it's __device__-only and must come
+// from the normal config path to avoid calling synclog_emit_tma_load from __host__.
+#if defined(__CUDA_ARCH__)
+#ifndef CUTE_ARCH_TMA_SM120_ENABLED
+#define CUTE_ARCH_TMA_SM120_ENABLED
+#endif
+#endif
+
 #include <cute/tensor.hpp>
 #include <cute/arch/copy_sm90_tma.hpp>  // SM90_TMA_LOAD (also available on SM120)
 
@@ -766,6 +781,14 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
     uint64_t* kv_mbar_ptr = nullptr;
     int kv_phase = 0;  // phase bit toggles each iteration (odd/even)
     if constexpr (Use_TMA_KV) {
+        // Prefetch TMA descriptors from GMEM into L2/TDC before cp.async.bulk.tensor instructions.
+        // Required: without this prefetch, cp.async.bulk.tensor gives "Illegal instruction".
+        if (tidx == 0) {
+            cute::prefetch_tma_descriptor(params.tma_k.get_tma_descriptor());
+            cute::prefetch_tma_descriptor(params.tma_vt.get_tma_descriptor());
+        }
+        __syncthreads();
+
         // Barrier placed at the last 8 bytes of kSmemSize (already reserved by kSmemMbarSize=8).
         static constexpr int kSmemMbarOffset =
             Kernel_traits::kSmemSize - Kernel_traits::kSmemMbarSize;
@@ -961,39 +984,38 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
             const int nb_abs = binfo.sum_s_k / kBlockN + nb;
             const int bidh_kv = bidh / params.h_h_k_ratio;
 
-            // K: [total_k, d, h_k] → select head, tile all k-blocks, tile d (1 tile).
-            // Pattern from sm120_blockscaled_gemm_impl.cuh: local_tile with _ then index nb_abs.
+            // K: described as [total_k, d, h_k] with strides [k_row_stride, 1, k_head_stride].
+            // TMA inner mode = d (stride=1). Tile = [kBlockN, kHeadDim] to match SmemLayoutK_TMA.
             auto mK_tma = params.tma_k.get_tma_tensor(
                 make_shape(params.total_k, params.d, params.h_k));
             // Slice head dimension; result: [total_k, d]
             auto gK_head = mK_tma(_, _, bidh_kv);
-            // local_tile with wildcard coords → (kBlockN, kHeadDim, n_k_tiles, 1)
+            // local_tile with wildcard → (kBlockN, kHeadDim, 1, n_k_tiles)
             auto gK_tiles = local_tile(gK_head,
                 Shape<Int<kBlockN>, Int<kHeadDim>>{},
                 make_coord(_, _));
             auto tma_slice_K = params.tma_k.get_slice(0);
             auto tKsK_d = tma_slice_K.partition_D(sK_sw128);
-            // partition_S over the first d-tile (index 0 in dim 1 of gK_tiles)
+            // gK_tiles: (kBlockN, kHeadDim, n_k_tiles, n_d_tiles=1). Fix mode 3 (n_d_tiles=0), vary mode 2 (n_k_tiles).
             auto tKgK = tma_slice_K.partition_S(gK_tiles(_, _, _, Int<0>{}));
 
-            // Vt: described as [total_k, d, h_k] (same ordering as K) to trigger CuTe's
-            // dim-reorder path (unit stride at position 1).  After internal reorder to
-            // (d, total_k, h_k), the TMA box becomes (kHeadDim, kBlockN) which matches
-            // SmemLayoutVt_TMA — so V^T is written correctly to SMEM.
+            // Vt: transposed view [d, total_k, h_k] with strides [1, v_row_stride, v_head_stride].
+            // Tile = [kHeadDim, kBlockN] → gVt_tiles: (kHeadDim, kBlockN, n_d_tiles=1, n_k_tiles).
+            // Fix mode 2 (d-tile=0), vary mode 3 (n_k_tiles).
             auto mVt_tma = params.tma_vt.get_tma_tensor(
-                make_shape(params.total_k, params.d, params.h_k));
+                make_shape(params.d, params.total_k, params.h_k));
             auto gVt_head = mVt_tma(_, _, bidh_kv);
-            // local_tile with wildcard → (kBlockN, kHeadDim, n_k_tiles, 1)
             auto gVt_tiles = local_tile(gVt_head,
-                Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                Shape<Int<kHeadDim>, Int<kBlockN>>{},
                 make_coord(_, _));
             auto tma_slice_Vt = params.tma_vt.get_slice(0);
             auto tVtsVt_d = tma_slice_Vt.partition_D(sVt_tma);
-            // partition_S over the first d-tile (index 0 in dim 3 = the kHeadDim tile)
-            auto tVtgVt = tma_slice_Vt.partition_S(gVt_tiles(_, _, _, Int<0>{}));
+            // partition_S(rank-3 input: kHeadDim, kBlockN, n_k_tiles) → rank-4.
+            auto tVtgVt = tma_slice_Vt.partition_S(gVt_tiles(_, _, Int<0>{}, _));
 
             // Thread 0 issues both TMA copies then commits expected byte count.
-            // (Matches CUTLASS reference: arrive_and_expect_tx called after copy issue.)
+            // Indexing: partition_S(rank-3) → rank-4 (extra TMA mode). Use (_, _, _, nb_abs) to
+            // select tile nb_abs from the last (n_k_tiles) mode.
             if (tidx == 0) {
                 cute::copy(params.tma_k.with(*kv_mbar_ptr), tKgK(_, _, _, nb_abs), tKsK_d);
                 cute::copy(params.tma_vt.with(*kv_mbar_ptr), tVtgVt(_, _, _, nb_abs), tVtsVt_d);
@@ -1527,8 +1549,10 @@ void run_hstu_fwd_sm120_fp8_tma_impl(Hstu_fwd_params& params, cudaStream_t strea
   using SmemLayoutK_TMA  = typename Kernel_traits::SmemLayoutK_TMA;
   using SmemLayoutVt_TMA = typename Kernel_traits::SmemLayoutVt_TMA;
 
-  // K TMA descriptor: K GMEM has shape [total_k, d, h_k] with strides
-  // [k_row_stride, 1, k_head_stride].  Tile = [kBlockN, kHeadDim].
+  // K TMA descriptor: K described as [total_k, d, h_k] with strides
+  // [k_row_stride, _1{}, k_head_stride].  TMA inner mode = d (stride=1),
+  // globalStrides[0] = k_row_stride * sizeof(FP8Elem) >= 16 bytes.
+  // Tile = [kBlockN, kHeadDim] to match SmemLayoutK_TMA layout.
   auto tensor_K_full = cute::make_tensor(
       cute::make_gmem_ptr(static_cast<FP8Elem*>(params.k_ptr)),
       cute::make_layout(
@@ -1541,11 +1565,9 @@ void run_hstu_fwd_sm120_fp8_tma_impl(Hstu_fwd_params& params, cudaStream_t strea
       cute::make_shape(cute::Int<kBlockN>{}, cute::Int<kHeadDim>{}),
       cute::_1{});
 
-  // V^T TMA descriptor: V described with same dim ordering as K — shape [total_k, d, h_k]
-  // with strides [v_row_stride, 1, v_head_stride].  This triggers CuTe's dim-reorder path
-  // (unit stride at position 1), which correctly computes globalStrides for cuTensorMapEncodeTiled.
-  // After CuTe's internal reorder to (d, total_k, h_k), the TMA box becomes (kHeadDim, kBlockN)
-  // matching SmemLayoutVt_TMA — so V^T is written correctly to SMEM (V^T[d,n] = V[n,d]).
+  // V^T TMA descriptor: V described as [total_k, d, h_k] with strides
+  // [v_row_stride, _1{}, v_head_stride].  _1{} at position 1 triggers CuTe dim-reorder,
+  // producing correct V^T globalStrides.  Tile = [kBlockN, kHeadDim] (same as K).
   auto tensor_Vt_full = cute::make_tensor(
       cute::make_gmem_ptr(static_cast<FP8Elem*>(params.v_ptr)),
       cute::make_layout(
@@ -1583,7 +1605,8 @@ void run_hstu_fwd_sm120_fp8_tma_impl(Hstu_fwd_params& params, cudaStream_t strea
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Phase 6 WS impl: same TMA setup as Phase 5 but uses warp-specialized kernel traits + 288 threads.
+// Phase 6 WS impl: cp.async-based warp specialization (no TMA required).
+// Load warp (warp 0) issues cp.async for K+V each iteration; math warps do GEMM.
 template <
     typename elem_type,
     int kHeadDim,
@@ -1605,50 +1628,10 @@ void run_hstu_fwd_sm120_fp8_ws_impl(Hstu_fwd_params& params, cudaStream_t stream
       Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc, Has_rab,
       Is_Q_in_regs, Share_Q_K_smem, cutlass::half_t>;
 
-  using FP8Elem = typename Kernel_traits::Element;
-  using SmemLayoutK_TMA  = typename Kernel_traits::SmemLayoutK_TMA;
-  using SmemLayoutVt_TMA = typename Kernel_traits::SmemLayoutVt_TMA;
-
-  // K TMA descriptor: same layout as Phase 5.
-  auto tensor_K_full = cute::make_tensor(
-      cute::make_gmem_ptr(static_cast<FP8Elem*>(params.k_ptr)),
-      cute::make_layout(
-          cute::make_shape(params.total_k, params.d, params.h_k),
-          cute::make_stride(params.k_row_stride, cute::_1{}, params.k_head_stride)));
-  auto tma_k = cute::make_tma_copy(
-      cute::SM90_TMA_LOAD{},
-      tensor_K_full,
-      SmemLayoutK_TMA{},
-      cute::make_shape(cute::Int<kBlockN>{}, cute::Int<kHeadDim>{}),
-      cute::_1{});
-
-  // V^T TMA descriptor: same dim ordering as K to trigger CuTe's dim-reorder path.
-  // See run_hstu_fwd_sm120_fp8_tma_impl for full explanation.
-  auto tensor_Vt_full = cute::make_tensor(
-      cute::make_gmem_ptr(static_cast<FP8Elem*>(params.v_ptr)),
-      cute::make_layout(
-          cute::make_shape(params.total_k, params.d, params.h_k),
-          cute::make_stride(params.v_row_stride, cute::_1{}, params.v_head_stride)));
-  auto tma_vt = cute::make_tma_copy(
-      cute::SM90_TMA_LOAD{},
-      tensor_Vt_full,
-      SmemLayoutVt_TMA{},
-      cute::make_shape(cute::Int<kBlockN>{}, cute::Int<kHeadDim>{}),
-      cute::_1{});
-
-  using TMA_K_t  = decltype(tma_k);
-  using TMA_Vt_t = decltype(tma_vt);
-
-  Hstu_fwd_params_fp8_tma<TMA_K_t, TMA_Vt_t> tma_params;
-  static_cast<Hstu_fwd_params&>(tma_params) = params;
-  tma_params.tma_k  = tma_k;
-  tma_params.tma_vt = tma_vt;
-
-  // WS kernel uses kSmemSize from WS traits (16-byte mbar region).
   size_t smem_size = Kernel_traits::kSmemSize;
   const int num_m_block = (params.seqlen_q + kBlockM - 1) / kBlockM;
   dim3 grid = dim3(num_m_block, params.h, params.b);
-  auto kernel = &flash::hstu_fwd_kernel_sm120_fp8_ws<Kernel_traits, TMA_K_t, TMA_Vt_t>;
+  auto kernel = &flash::hstu_fwd_kernel_sm120_fp8_ws<Kernel_traits>;
 
   if (smem_size >= 48 * 1024) {
     C10_CUDA_CHECK(cudaFuncSetAttribute(
@@ -1656,7 +1639,7 @@ void run_hstu_fwd_sm120_fp8_ws_impl(Hstu_fwd_params& params, cudaStream_t stream
   }
 
   // Launch with kNThreads=288 (8 math warps + 1 load warp).
-  kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(tma_params);
+  kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -1685,19 +1668,16 @@ void run_hstu_fwd_sm120(Hstu_fwd_params& params, cudaStream_t stream) {
 
   if constexpr (Is_fp8_type) {
     if constexpr ((kBlockN % 128) == 0) {
-      if constexpr (!Has_rab) {
-        // Phase 6: warp-specialized TMA+QMMA pipeline.
-        run_hstu_fwd_sm120_fp8_ws_impl<
-            elem_type, kHeadDim, kBlockM, kBlockN, kNWarps,
-            Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc, Has_rab,
-            Is_Q_in_regs, Share_Q_K_smem>(params, stream);
-      } else {
-        // Has_rab: Phase 6 WS doesn't support RAB yet; fallback to Phase 4 cp.async.
-        run_hstu_fwd_sm120_impl<
-            elem_type, kHeadDim, kBlockM, kBlockN, kNWarps,
-            Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc, Has_rab,
-            /*Is_fp8=*/true, Is_Q_in_regs, Share_Q_K_smem>(params, stream);
-      }
+      // Phase 4 cp.async: proven baseline on this GPU (SM120, no TMA hardware).
+      // Phase 6 WS cp.async was tested (test 052) but is ~10x slower than Phase 4:
+      //   - 32-thread load warp issues 64 cp.async per iteration (vs 8 for 256-thread Phase 4)
+      //   - cp_async_wait<0> blocks before load_mbar signal → math warps wait entire copy time
+      //   - No computation-memory overlap achievable with cp.async in WS design
+      // WS code preserved in hstu_fwd_kernel_fp8_ws.h for future use if TMA becomes available.
+      run_hstu_fwd_sm120_impl<
+          elem_type, kHeadDim, kBlockM, kBlockN, kNWarps,
+          Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc, Has_rab,
+          /*Is_fp8=*/true, Is_Q_in_regs, Share_Q_K_smem>(params, stream);
     } else {
       // Compile-time gate: do not instantiate FP8 blockscaled kernel for unsupported N tiles.
       TORCH_CHECK(

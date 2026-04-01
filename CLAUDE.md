@@ -319,6 +319,31 @@ fbgemm_gpu/experimental/hstu/
    pip install ... 2>&1 | grep -E "error:|note:|static_assert|undefined" | head -60
    ```
 
+## 运行时调试技巧
+
+### Illegal Memory Access：使用 compute-sanitizer
+```bash
+HSTU_SWEEP_FP8_QUANT_MODE=2 compute-sanitizer --tool memcheck \
+  python /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/sweep_accuracy.py \
+  2>&1 | tee /tmp/claude/sanitizer_out.log
+```
+- `compute-sanitizer` 会精确报告出错的 PTX 指令地址、线程 ID 和访问地址
+- 常见原因：mbarrier wait phase 错误、SMEM 越界访问、TMA descriptor 地址计算错误
+
+### 数值不正确：GEMM1-only + all-ones 缩小范围
+
+在 kernel 内部通过条件编译或临时硬编码来分步验证：
+
+**Step 1**：将所有输入（Q/K/SFA/SFB）置为全 1，只跑 GEMM1（`acc_s = Q × K^T`），跳过 silu 和 GEMM2，直接将 `acc_s` 输出为结果
+- 预期：所有元素 = kHeadDim（128 次 1×1 乘加）
+- 若不符：GEMM1 数据路径有问题（SMEM layout、MMA warp partition、TMA 加载错误）
+
+**Step 2**：恢复正常输入但只跑 GEMM1，检查与参考实现（BF16 路径）的 cosine similarity
+- 若 GEMM1 结果 cos < 0.99：K 加载、SMEM layout、scale factor 有问题
+- 若 GEMM1 结果 cos ≈ 1.0 但最终结果差：问题在 GEMM2（V^T 加载、SMEM layout）
+
+**实现方式**：在 kernel 里加 `if constexpr (kDebugGemm1Only)` 分支，或在 hstu_fwd_launch_template.h 传入临时 debug 模板参数。
+
 ---
 
 ## 语言要求
