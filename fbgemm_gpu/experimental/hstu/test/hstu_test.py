@@ -1765,9 +1765,11 @@ def _bwd_reference_fp8(
 
 @unittest.skipIf(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() < (9, 0)
-    or torch.cuda.get_device_capability() >= (10, 0),
-    "Skip when no Hopper GPU is available. This test is only for Hopper GPU.",
+    or not (
+        (9, 0) <= torch.cuda.get_device_capability() < (10, 0)   # Hopper SM90
+        or torch.cuda.get_device_capability() >= (12, 0)          # Blackwell SM120+
+    ),
+    "Skip when no Hopper (SM90) or Blackwell (SM120+) GPU is available.",
 )
 class HSTU8Test(unittest.TestCase):
     """Test HSTU attention with float8_e4m3 inputs."""

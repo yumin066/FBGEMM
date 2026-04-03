@@ -1457,6 +1457,14 @@ struct Hstu_fwd_params_fp8_tma : public Hstu_fwd_params {
     TMA_Vt_t tma_vt;  // TMA descriptor for V^T: [d, total_v, h_k] (pre-transposed)
 };
 
+// Phase 6 WS TMA params: extends Hstu_fwd_params with TMA Q and K descriptors.
+// TMA_Q_t / TMA_K_t are the CuTe TMA copy atom types returned by make_tma_copy.
+template <typename TMA_Q_t, typename TMA_K_t>
+struct Hstu_fwd_params_fp8_ws_tma : public Hstu_fwd_params {
+    TMA_Q_t tma_q;  // TMA descriptor for Q: [total_q, d, h]
+    TMA_K_t tma_k;  // TMA descriptor for K: [total_k, d, h_k]
+};
+
 namespace flash {  // reopen flash namespace for kernel
 
 // Phase 5 TMA kernel: takes extended params with TMA descriptors.
@@ -1605,8 +1613,7 @@ void run_hstu_fwd_sm120_fp8_tma_impl(Hstu_fwd_params& params, cudaStream_t strea
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Phase 6 WS impl: cp.async-based warp specialization (no TMA required).
-// Load warp (warp 0) issues cp.async for K+V each iteration; math warps do GEMM.
+// Phase 6 WS TMA impl: creates TMA Q and K descriptors on host, launches WS TMA kernel.
 template <
     typename elem_type,
     int kHeadDim,
@@ -1622,24 +1629,61 @@ template <
     bool Has_rab,
     bool Is_Q_in_regs = false,
     bool Share_Q_K_smem = false>
-void run_hstu_fwd_sm120_fp8_ws_impl(Hstu_fwd_params& params, cudaStream_t stream) {
+void run_hstu_fwd_sm120_fp8_ws_tma_impl(Hstu_fwd_params& params, cudaStream_t stream) {
   using Kernel_traits = Hstu_fwd_kernel_traits_sm120_fp8_ws<
       kHeadDim, kBlockM, kBlockN, kNWarps,
       Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc, Has_rab,
       Is_Q_in_regs, Share_Q_K_smem, cutlass::half_t>;
 
+  using FP8Elem = typename Kernel_traits::Element;
+  using SmemLayoutQ_TMA = typename Kernel_traits::SmemLayoutQ_TMA;
+  using SmemLayoutK_TMA = typename Kernel_traits::SmemLayoutK_TMA;
+
+  // Q TMA descriptor: Q described as [total_q, d, h] with strides [q_row_stride, 1, q_head_stride].
+  auto tensor_Q_full = cute::make_tensor(
+      cute::make_gmem_ptr(static_cast<FP8Elem*>(params.q_ptr)),
+      cute::make_layout(
+          cute::make_shape(params.total_q, params.d, params.h),
+          cute::make_stride(params.q_row_stride, cute::_1{}, params.q_head_stride)));
+  auto tma_q = cute::make_tma_copy(
+      cute::SM90_TMA_LOAD{},
+      tensor_Q_full,
+      SmemLayoutQ_TMA{},
+      cute::make_shape(cute::Int<kBlockM>{}, cute::Int<kHeadDim>{}),
+      cute::_1{});
+
+  // K TMA descriptor: same as Phase 5.
+  auto tensor_K_full = cute::make_tensor(
+      cute::make_gmem_ptr(static_cast<FP8Elem*>(params.k_ptr)),
+      cute::make_layout(
+          cute::make_shape(params.total_k, params.d, params.h_k),
+          cute::make_stride(params.k_row_stride, cute::_1{}, params.k_head_stride)));
+  auto tma_k = cute::make_tma_copy(
+      cute::SM90_TMA_LOAD{},
+      tensor_K_full,
+      SmemLayoutK_TMA{},
+      cute::make_shape(cute::Int<kBlockN>{}, cute::Int<kHeadDim>{}),
+      cute::_1{});
+
+  using TMA_Q_t = decltype(tma_q);
+  using TMA_K_t = decltype(tma_k);
+
+  Hstu_fwd_params_fp8_ws_tma<TMA_Q_t, TMA_K_t> tma_params;
+  static_cast<Hstu_fwd_params&>(tma_params) = params;
+  tma_params.tma_q = tma_q;
+  tma_params.tma_k = tma_k;
+
   size_t smem_size = Kernel_traits::kSmemSize;
   const int num_m_block = (params.seqlen_q + kBlockM - 1) / kBlockM;
   dim3 grid = dim3(num_m_block, params.h, params.b);
-  auto kernel = &flash::hstu_fwd_kernel_sm120_fp8_ws<Kernel_traits>;
+  auto kernel = &flash::hstu_fwd_kernel_sm120_fp8_ws_tma<Kernel_traits, TMA_Q_t, TMA_K_t>;
 
   if (smem_size >= 48 * 1024) {
     C10_CUDA_CHECK(cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
   }
 
-  // Launch with kNThreads=288 (8 math warps + 1 load warp).
-  kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
+  kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(tma_params);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -1668,16 +1712,21 @@ void run_hstu_fwd_sm120(Hstu_fwd_params& params, cudaStream_t stream) {
 
   if constexpr (Is_fp8_type) {
     if constexpr ((kBlockN % 128) == 0) {
-      // Phase 4 cp.async: proven baseline on this GPU (SM120, no TMA hardware).
-      // Phase 6 WS cp.async was tested (test 052) but is ~10x slower than Phase 4:
-      //   - 32-thread load warp issues 64 cp.async per iteration (vs 8 for 256-thread Phase 4)
-      //   - cp_async_wait<0> blocks before load_mbar signal → math warps wait entire copy time
-      //   - No computation-memory overlap achievable with cp.async in WS design
-      // WS code preserved in hstu_fwd_kernel_fp8_ws.h for future use if TMA becomes available.
-      run_hstu_fwd_sm120_impl<
-          elem_type, kHeadDim, kBlockM, kBlockN, kNWarps,
-          Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc, Has_rab,
-          /*Is_fp8=*/true, Is_Q_in_regs, Share_Q_K_smem>(params, stream);
+      if constexpr (!Has_rab) {
+        // Phase 6 WS TMA: Q+K via TMA (load warp, thread 0), V via cp.async (load warp, 32 threads).
+        // No load/math overlap — sequential TMA→compute per tile.
+        // Has_rab not yet supported in WS kernel; fall through to Phase 4 impl for that case.
+        run_hstu_fwd_sm120_fp8_ws_tma_impl<
+            elem_type, kHeadDim, kBlockM, kBlockN, kNWarps,
+            Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc, Has_rab,
+            Is_Q_in_regs, Share_Q_K_smem>(params, stream);
+      } else {
+        // Phase 4 cp.async fallback for Has_rab=true (WS kernel does not support RAB yet).
+        run_hstu_fwd_sm120_impl<
+            elem_type, kHeadDim, kBlockM, kBlockN, kNWarps,
+            Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc, Has_rab,
+            /*Is_fp8=*/true, Is_Q_in_regs, Share_Q_K_smem>(params, stream);
+      }
     } else {
       // Compile-time gate: do not instantiate FP8 blockscaled kernel for unsupported N tiles.
       TORCH_CHECK(

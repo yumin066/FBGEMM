@@ -483,18 +483,26 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
   // kNMathThreads: math-warp-only thread count used for per-warp layout arithmetic.
   static constexpr int kNMathThreads = kNMathWarps * cutlass::NumThreadsPerWarp;  // 256
 
-  // Two barriers: load_mbar (load warp → math warps) + math_mbar (math warps → load warp).
-  // Each barrier is 8 bytes; total = 16 bytes.  Placed at the last 16 bytes of kSmemSize.
-  static constexpr int kSmemMbarSize = 16;
+  // Three barriers: tma_k_mbar (K TMA completion, also Q TMA at init)
+  //                 load_mbar  (load warp → math warps: K+V ready)
+  //                 math_mbar  (math warps → load warp: SMEM consumed)
+  // Each barrier is 8 bytes; total = 24 bytes.  Placed at the last 24 bytes of kSmemSize.
+  static constexpr int kSmemMbarSize = 24;
   // Override kSmemSize to include the larger barrier region.
-  static constexpr int kSmemSize =
-      Base::kSmemSize - Base::kSmemMbarSize + kSmemMbarSize;
+  // IMPORTANT: mbarrier.init requires 8-byte aligned SMEM address.
+  // When Is_arbitrary=true, the func data region (20 bytes for kNFunc=3) can make the
+  // pre-SF boundary land on a 4-byte offset (e.g., 34836 % 8 == 4), causing misaligned address.
+  // Fix: pad the data region (everything before SF+mbar) to the next 8-byte boundary.
+  static constexpr int kSmemDataSize =
+      Base::kSmemSize - Base::kSmemMbarSize - Base::kSmemSFSize;
+  static constexpr int kSmemDataSizePadded = ((kSmemDataSize + 7) / 8) * 8;
+  static constexpr int kSmemSize = kSmemDataSizePadded + Base::kSmemSFSize + kSmemMbarSize;
 
   // Invariant checks
   static_assert(kNMathWarps * 16 == Base::kBlockM,
       "kNMathWarps * 16 must equal kBlockM (8 warps × 16 rows = 128)");
   static_assert(kNThreads == (kNMathWarps + kNLoadWarps) * 32,
       "kNThreads == (kNMathWarps + kNLoadWarps) * 32");
-  static_assert(kSmemMbarSize == 16,
-      "kSmemMbarSize must be 16 (two 8-byte mbarriers)");
+  static_assert(kSmemMbarSize == 24,
+      "kSmemMbarSize must be 24 (three 8-byte mbarriers: tma_k_mbar + load_mbar + math_mbar)");
 };

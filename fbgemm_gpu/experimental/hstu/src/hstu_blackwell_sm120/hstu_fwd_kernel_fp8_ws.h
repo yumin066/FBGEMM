@@ -1,13 +1,28 @@
-// Phase 6 warp-specialized FP8 kernel body.
+// Phase 6 warp-specialized FP8 kernel body — Q and K via TMA, V via cp.async.
 // Included inside namespace flash from hstu_fwd_kernel.h.
 // Do not include directly; use hstu_fwd_kernel.h.
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Spin-wait helper: blocks until mbarrier phase parity != expected parity.
+__device__ inline void wait_mbar_parity(uint64_t* mbar, uint32_t parity) {
+  uint32_t maddr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar));
+  uint32_t done = 0;
+  do {
+    asm volatile(
+        "{.reg .pred p;\n"
+        "mbarrier.test_wait.parity.shared::cta.b64 p, [%1], %2;\n"
+        "selp.u32 %0, 1, 0, p;}\n"
+        : "=r"(done) : "r"(maddr), "r"(parity));
+  } while (!done);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 // Phase 6: warp-specialized FP8 compute function.
-// Warp 0 (threads 0-31):   dedicated TMA load warp — issues K + V^T TMA each iteration.
+// Warp 0 (threads 0-31):   load warp — Q TMA preamble (thread 0), then K TMA + V cp.async per iter.
 // Warps 1-8 (threads 32-287): math warps — QMMA block-scale GEMM1+silu+GEMM2.
-// Dual mbarrier: load_mbar (TMA→math) + math_mbar (math→load).
-// SMEM layout: [Q/K/Vt/ValidBlockIds/...][SFA(512B)][SFB(512B)][load_mbar(8B)][math_mbar(8B)]
+// Three mbarriers: tma_k_mbar (TMA Q/K completion), load_mbar (K+V→math), math_mbar (math→load).
+// SMEM: [Q/K/Vt/ValidBlockIds/...][SFA(512B)][SFB(512B)][tma_k_mbar(8B)][load_mbar(8B)][math_mbar(8B)]
 template <typename Kernel_traits, typename Params>
 inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     const Params& params,
@@ -97,12 +112,6 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       ? 0 : n_masking_block_max - n_masking_block_min;
 
   // GMEM tensors
-  Tensor mQ = make_tensor(
-      make_gmem_ptr(reinterpret_cast<FP8Elem*>(params.q_ptr) + binfo.q_offset(params.q_row_stride)),
-      make_shape(actual_seqlen_q, params.h, params.d),
-      make_stride(params.q_row_stride, params.q_head_stride, _1{}));
-  Tensor gQ = local_tile(mQ(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{}, make_coord(m_block, 0));
-
   // Arbitrary func GMEM tensors
   Tensor mMaxFunc = make_tensor(
       make_gmem_ptr(reinterpret_cast<int*>(params.func_ptr) + binfo.sum_s_q),
@@ -213,26 +222,34 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       make_smem_ptr(reinterpret_cast<FP8Elem*>(smem_q) + size(SmemLayoutK_SW128{})),
       SmemLayoutV_SW128{});
 
-  // WS SMEM layout: [DATA...][SFA(512B)][SFB(512B)][load_mbar(8B)][math_mbar(8B)]
-  // SF is placed at kSmemSize - kSmemMbarSize(16) - kSmemSFSize(1024) — no overlap with mbars.
+  // WS SMEM layout: [DATA...][SFA(512B)][SFB(512B)][tma_k_mbar(8B)][load_mbar(8B)][math_mbar(8B)]
+  // SF placed at kSmemSize - kSmemMbarSize(24) - kSmemSFSize(1024).
   static constexpr int kSmemSFOffset_WS =
       Kernel_traits::kSmemSize - Kernel_traits::kSmemMbarSize - Kernel_traits::kSmemSFSize;
   int32_t* smem_sfa_ptr = reinterpret_cast<int32_t*>(smem_ + kSmemSFOffset_WS);
   int32_t* smem_sfb_ptr = smem_sfa_ptr + kBlockM;  // SFB at +512B after SFA
 
-  // Two WS barriers at the last 16 bytes of SMEM.
-  static constexpr int kSmemLoadMbarOffset =
-      Kernel_traits::kSmemSize - Kernel_traits::kSmemMbarSize;
-  static constexpr int kSmemMathMbarOffset =
-      Kernel_traits::kSmemSize - Kernel_traits::kSmemMbarSize / 2;
-  uint64_t* load_mbar_ptr = reinterpret_cast<uint64_t*>(smem_ + kSmemLoadMbarOffset);
-  uint64_t* math_mbar_ptr = reinterpret_cast<uint64_t*>(smem_ + kSmemMathMbarOffset);
+  // Three WS barriers at the last 24 bytes of SMEM.
+  // tma_k_mbar: TMA completion for Q (preamble) and K (per-iteration); reused across loop.
+  // load_mbar:  load warp signals math warps that K+V is ready in SMEM.
+  // math_mbar:  math warp leaders signal load warp that SMEM has been consumed.
+  static constexpr int kSmemTmaKMbarOffset =
+      Kernel_traits::kSmemSize - Kernel_traits::kSmemMbarSize;      // base of 3-mbar region
+  static constexpr int kSmemLoadMbarOffset = kSmemTmaKMbarOffset + 8;
+  static constexpr int kSmemMathMbarOffset = kSmemTmaKMbarOffset + 16;
+  uint64_t* tma_k_mbar_ptr = reinterpret_cast<uint64_t*>(smem_ + kSmemTmaKMbarOffset);
+  uint64_t* load_mbar_ptr  = reinterpret_cast<uint64_t*>(smem_ + kSmemLoadMbarOffset);
+  uint64_t* math_mbar_ptr  = reinterpret_cast<uint64_t*>(smem_ + kSmemMathMbarOffset);
 
-  // Thread 0 inits both barriers and pre-satisfies math_mbar phase 0 (8 fake arrives)
-  // so load warp can issue the first TMA without waiting.
+  // Thread 0 inits all 3 barriers and pre-satisfies math_mbar (8 arrives) so load warp starts immediately.
+  // tma_k_mbar count=1: thread 0 does arrive.expect_tx for both Q TMA and K TMA (one at a time).
+  // load_mbar count=1: thread 0 signals after K TMA + V cp.async both complete each iteration.
+  // math_mbar count=8: one per math warp leader; pre-satisfied so iteration 0 load can proceed.
   if (tidx == 0) {
+    uint32_t taddr = static_cast<uint32_t>(__cvta_generic_to_shared(tma_k_mbar_ptr));
     uint32_t laddr = static_cast<uint32_t>(__cvta_generic_to_shared(load_mbar_ptr));
     uint32_t maddr = static_cast<uint32_t>(__cvta_generic_to_shared(math_mbar_ptr));
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" : : "r"(taddr), "r"(1));
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" : : "r"(laddr), "r"(1));
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" : : "r"(maddr), "r"(8));
     for (int i = 0; i < 8; i++)
@@ -247,16 +264,6 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
   Tensor sSFB_ = make_tensor(make_smem_ptr(smem_sfb_ptr), SmemLayoutSFB{});
   auto sSFA = as_position_independent_swizzle_tensor(sSFA_);
   auto sSFB = as_position_independent_swizzle_tensor(sSFB_);
-
-  // GMEM copy atom for SW128 FP8 (based on kNMathThreads=256, math warps only)
-  using GmemLayoutAtom_SW128 = Layout<Shape<Int<kNMathThreads / 8>, _8>, Stride<_8, _1>>;
-  auto gmem_tiled_copy_sw128 = make_tiled_copy(
-      Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, FP8Elem>{},
-      GmemLayoutAtom_SW128{},
-      Layout<Shape<_1, _16>>{});
-  auto gmem_thr_copy_math = gmem_tiled_copy_sw128.get_thread_slice(tidx_math);
-  Tensor tQgQ = gmem_thr_copy_math.partition_S(gQ);
-  Tensor tQsQ = gmem_thr_copy_math.partition_D(sQ_sw128);
 
   // MMA tiled objects (math warps use tidx_math)
   typename BS1::TiledMma tiled_mma_g1;
@@ -289,16 +296,29 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       BS2::get_layoutSFB_TV(tiled_mma_g2), make_shape(size<1>(tile_shape(tiled_mma_g2)), _1{}));
   auto s2r_thr_SFV  = s2r_copy_SFV.get_thread_slice(tidx_math);
 
-  // Load Q (math warps only; load warp idles through cp_async_fence/wait/__syncthreads)
-  if (!is_load_warp) {
-    Tensor cQ = make_identity_tensor(make_shape(size<0>(sQ_sw128), size<1>(sQ_sw128)));
-    Tensor tQcQ = gmem_thr_copy_math.partition_S(cQ);
-    flash::copy<false>(gmem_tiled_copy_sw128, tQgQ, tQsQ, tQcQ,
-        actual_seqlen_q - m_block * kBlockM);
+  // Q TMA preamble: thread 0 issues TMA to sQ_sw128, waits for completion, then __syncthreads.
+  // tma_k_mbar is used here (initialized to phase 0). After Q TMA completes, phase becomes 1.
+  // K TMA loop starts with k_tma_phase=1 to account for this phase advance.
+  {
+    constexpr int kSmemQBytes = kBlockM * kHeadDim * sizeof(FP8Elem);
+    if (tidx == 0) {
+      auto mQ_tma = params.tma_q.get_tma_tensor(
+          make_shape(params.total_q, params.d, params.h));
+      auto gQ_head  = mQ_tma(_, _, bidh);
+      auto gQ_tiles = local_tile(gQ_head,
+          Shape<Int<kBlockM>, Int<kHeadDim>>{}, make_coord(_, _));
+      auto tma_slice_Q = params.tma_q.get_slice(0);
+      auto tQsQ_d      = tma_slice_Q.partition_D(sQ_sw128);
+      auto tQgQ_tma    = tma_slice_Q.partition_S(gQ_tiles(_, _, _, Int<0>{}));
+      const int m_abs  = binfo.sum_s_q / kBlockM + m_block;
+      uint32_t taddr   = static_cast<uint32_t>(__cvta_generic_to_shared(tma_k_mbar_ptr));
+      cute::copy(params.tma_q.with(*tma_k_mbar_ptr), tQgQ_tma(_, _, _, m_abs), tQsQ_d);
+      asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"
+                   : : "r"(taddr), "r"(kSmemQBytes));
+      wait_mbar_parity(tma_k_mbar_ptr, 0);  // block until phase != 0  (phase becomes 1)
+    }
   }
-  cute::cp_async_fence();
-  cute::cp_async_wait<0>();
-  __syncthreads();
+  __syncthreads();  // broadcast Q readiness; tma_k_mbar now at phase 1
   // s2r Q (math warps only)
   auto sQ_pi = as_position_independent_swizzle_tensor(sQ_sw128);
   Tensor tCrQ = thr_mma_g1.partition_fragment_A(sQ_pi);
@@ -336,35 +356,36 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
   }
   auto tCrSFA_frg = BS1::transform_fragment_for_qmma(tCrSFA);
 
-  // cp.async GMEM tensors for K and V (Phase 6 cp.async load warp).
-  // Load warp (32 threads) issues cp.async for K+V each iteration; math warps then transpose V→Vt.
+  // V cp.async tensors for load warp (32 threads).
+  // K is loaded via TMA (thread 0 only); V remains cp.async for all 32 load warp threads.
   const int bidh_kv = bidh / params.h_h_k_ratio;
-  Tensor mK = make_tensor(
-      make_gmem_ptr(reinterpret_cast<FP8Elem*>(params.k_ptr) + binfo.k_offset(params.k_row_stride)),
-      make_shape(actual_seqlen_k, params.h_k, params.d),
-      make_stride(params.k_row_stride, params.k_head_stride, _1{}));
-  Tensor gK = local_tile(mK(_, bidh_kv, _), Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(_, 0));
   Tensor mV = make_tensor(
       make_gmem_ptr(reinterpret_cast<FP8Elem*>(params.v_ptr) + binfo.k_offset(params.v_row_stride)),
       make_shape(actual_seqlen_k, params.h_k, params.d),
       make_stride(params.v_row_stride, params.v_head_stride, _1{}));
   Tensor gV = local_tile(mV(_, bidh_kv, _), Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(_, 0));
 
-  // cp.async tiled copy for load warp (32 threads).
-  // GmemLayoutAtom_LW: 4 rows × 8 threads = 32 threads; each loads 16 FP8 per step.
-  // Per step covers 4 rows × 128 cols = 512 FP8.  32 steps cover full 128×128 K or V tile.
+  // cp.async tiled copy for V load warp (32 threads).
   using GmemLayoutAtom_LW = Layout<Shape<_4, _8>, Stride<_8, _1>>;
   auto gmem_tiled_copy_lw = make_tiled_copy(
       Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, FP8Elem>{},
       GmemLayoutAtom_LW{},
       Layout<Shape<_1, _16>>{});
   auto gmem_thr_copy_lw = gmem_tiled_copy_lw.get_thread_slice(tidx);
-  Tensor tKgK    = gmem_thr_copy_lw.partition_S(gK);
-  Tensor tKsK    = gmem_thr_copy_lw.partition_D(sK_sw128);
-  Tensor tVgV    = gmem_thr_copy_lw.partition_S(gV);
-  Tensor tVsV    = gmem_thr_copy_lw.partition_D(sV_sw128);
-  Tensor cKV     = make_identity_tensor(make_shape(size<0>(sK_sw128), size<1>(sK_sw128)));
-  Tensor tKVcKV  = gmem_thr_copy_lw.partition_S(cKV);
+  Tensor tVgV   = gmem_thr_copy_lw.partition_S(gV);
+  Tensor tVsV   = gmem_thr_copy_lw.partition_D(sV_sw128);
+  Tensor cKV    = make_identity_tensor(make_shape(size<0>(sK_sw128), size<1>(sK_sw128)));
+  Tensor tKVcKV = gmem_thr_copy_lw.partition_S(cKV);
+
+  // K TMA tensors (pre-built outside loop; thread 0 indexes by nb_abs per iteration).
+  // tma_k_mbar is reused here; after Q TMA it is at phase 1, so k_tma_phase starts at 1.
+  constexpr int kSmemKBytes = kBlockN * kHeadDim * sizeof(FP8Elem);
+  auto mK_tma   = params.tma_k.get_tma_tensor(make_shape(params.total_k, params.d, params.h_k));
+  auto gK_head  = mK_tma(_, _, bidh_kv);
+  auto gK_tiles = local_tile(gK_head, Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(_, _));
+  auto tma_slice_K = params.tma_k.get_slice(0);
+  auto tKsK_d      = tma_slice_K.partition_D(sK_sw128);
+  auto tKgK_tma    = tma_slice_K.partition_S(gK_tiles(_, _, _, Int<0>{}));
 
   // Mask lambda (uses thr_mma_g1 partitioned with tidx_math → math warps only)
   auto col_limit_right = [&](int row) {
@@ -444,8 +465,9 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
   //   After first TMA completion, phase=1 → test_wait(addr,0) passes (1≠0).
   // math_phase: parity for math_mbar waits (load warp uses this).
   //   After pre-satisfaction, phase=1 → test_wait(addr,0) passes (1≠0) immediately.
-  int load_phase = 0;
-  int math_phase = 0;
+  int load_phase  = 0;  // load_mbar parity expected by math warps
+  int math_phase  = 0;  // math_mbar parity expected by load warp
+  int k_tma_phase = 1;  // tma_k_mbar parity after Q TMA (phase 0→1); K TMA loop starts at 1
 
   if (is_load_warp) {
     // ===== LOAD WARP: cp.async producer loop =====
@@ -464,13 +486,20 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       }
       math_phase ^= 1;
 
-      // Issue K[nb] + V[nb] cp.async (all 32 load warp threads participate in the tiled copy).
-      // cp_async_wait<0> blocks until all cp.async writes are in SMEM.
-      // fence.proxy.async ensures async-proxy writes are ordered before mbarrier.arrive.
-      // Thread 0 then signals load_mbar so math warps can proceed with GEMM1.
-      flash::copy<false, true>(gmem_tiled_copy_lw,
-          tKgK(_,_,_, nb), tKsK, tKVcKV,
-          actual_seqlen_k - nb * kBlockN);
+      // K TMA (thread 0 only): issue TMA K[nb] into sK_sw128, wait for completion.
+      // tma_k_mbar is reused per iteration; k_tma_phase tracks current expected parity.
+      // Threads 1-31 skip the K TMA block and proceed directly to V cp.async below.
+      if (tidx == 0) {
+        const int nb_abs = binfo.sum_s_k / kBlockN + nb;
+        uint32_t taddr = static_cast<uint32_t>(__cvta_generic_to_shared(tma_k_mbar_ptr));
+        cute::copy(params.tma_k.with(*tma_k_mbar_ptr), tKgK_tma(_, _, _, nb_abs), tKsK_d);
+        asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"
+                     : : "r"(taddr), "r"(kSmemKBytes));
+        wait_mbar_parity(tma_k_mbar_ptr, k_tma_phase);
+        k_tma_phase ^= 1;
+      }
+      // V cp.async (all 32 load warp threads): load V[nb] into sV_sw128.
+      // fence.proxy.async ensures TMA K writes + V cp.async writes visible before load_mbar.arrive.
       flash::copy<false, true>(gmem_tiled_copy_lw,
           tVgV(_,_,_, nb), tVsV, tKVcKV,
           actual_seqlen_k - nb * kBlockN);
@@ -728,12 +757,12 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Phase 6 WS kernel entry: launched with kNThreadsTotal=288.
-// Uses cp.async (no TMA), takes plain Hstu_fwd_params (no TMA descriptors).
-template <typename Kernel_traits>
+// Phase 6 WS TMA kernel entry: launched with kNThreadsTotal=288.
+// Q and K via TMA; V via cp.async.  Takes Hstu_fwd_params_fp8_ws_tma<TMA_Q_t, TMA_K_t>.
+template <typename Kernel_traits, typename TMA_Q_t, typename TMA_K_t>
 __global__ void __launch_bounds__(Kernel_traits::kNThreads)
-hstu_fwd_kernel_sm120_fp8_ws(
-    Hstu_fwd_params params) {
+hstu_fwd_kernel_sm120_fp8_ws_tma(
+    __grid_constant__ Hstu_fwd_params_fp8_ws_tma<TMA_Q_t, TMA_K_t> const params) {
   int m_block = gridDim.x - blockIdx.x - 1;
   int bidh    = blockIdx.y;
   int bidb    = blockIdx.z;
