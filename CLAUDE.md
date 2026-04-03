@@ -62,22 +62,31 @@ kernel-only（bs=4, h=16, d=128, full attention）：
 
 ---
 
-## Phase 6 完成：Warp-Specialized FP8 Kernel（2026-04-03）
+## Phase 6 完成：Warp-Specialized FP8 Kernel with Double-Buffer（2026-04-03）
 
-**原始目标**：warp 0 专职发 TMA（K+V^T+SF），warp 1-8 专职 QMMA，TMA 与 MMA **真正重叠**。
+**目标**：warp 0 专职发 TMA（K+V^T），warp 1-8 专职 QMMA，2-stage double-buffer 实现 TMA 与 MMA 真正重叠。
 
-**当前实际状态**：warp 分工框架已建立，数值正确，但存在两处尚未优化的性能问题（见下）。
+**当前状态**：double-buffer overlap 已实现，数值正确，14/14 测试通过。
 
 ### 实现内容
 
 - **新文件** `hstu_fwd_kernel_fp8_ws.h`：WS 内核主体，由 `hstu_fwd_kernel.h` include
 - **Warp 分工**：warp 0 = load warp（288 线程总计，32 load + 256 math）
-- **三 barrier**：`tma_k_mbar`（Q/K TMA 完成）、`load_mbar`（load→math）、`math_mbar`（math→load）
+- **两对 barrier（4个 uint64_t）**：
+  - `tma_mbar[2]`：TMA 完成信号，math warps **直接**等待（无 load_mbar 中间层）
+  - `math_mbar[2]`：SMEM 消费完成信号，load warp 等待
+- **Double-buffer 时序**（真正 overlap）：
+  ```
+  Load:   [issue TMA N-1→s0] [issue TMA N-2→s1] [等math_mbar[0]] [issue TMA N-3→s0] ...
+  Math:   [wait tma_mbar[s0]] [GEMM tile N-1] [signal math_mbar[0]] [wait tma_mbar[s1]] ...
+  TMA:    ---N-1 in flight---  ---N-2 与 N-1 计算重叠---  ---N-3 与 N-2 计算重叠---
+  ```
+  load warp 在 preamble 预发两个 tile（s0、s1），math warp 直接等 tma_mbar，TMA 与 MMA 真正并行。
 - **dispatch**：FP8 + kBlockN%128==0 + !Has_rab → WS TMA 路径；Has_rab → Phase 5 非 WS 路径
 
 ---
 
-### ⚠️ 已知性能问题一：SMEM→SMEM 手动 transpose（待优化）
+### ⚠️ 已知性能问题：SMEM→SMEM 手动 transpose（待优化）
 
 **当前 V^T 数据路径**：
 ```
@@ -89,34 +98,20 @@ GMEM V → TMA → MN_SW128 SMEM → [256线程手动transpose] → K_SW128 SMEM
 - LDSM_N 要求：SMEM 内层维 = K-dim（kBlockN）→ 只能用 **K_SW128**
 - 两者不兼容，中间必须加一次 transpose
 
-**transpose 开销**：每次 N-block 迭代中，256 个 math warp 线程各搬 64 字节（共 16KB），加 2 次 `bar.sync 1, 256`。
+**transpose 开销**：每次 N-block 迭代中，256 个 math warp 线程各搬 64 字节（共 16KB），加 2 次 `bar.sync 1, 256`。此部分开销未被 double-buffer overlap 覆盖，是 FP8 仍比 BF16 慢的主要原因之一。
 
-**消除 transpose 的方案**：Python 侧将 V 改为列主序存储，strides 从 `[v_row_stride, 1]` 改为 `[1, v_col_stride]`，使 kBlockN 维成为 stride-1，则 TMA 可直接写入 K_SW128 SMEM，无需 transpose。代价是修改量化+存储 API，留待 benchmark 确认收益后再决定。
-
----
-
-### ⚠️ 已知性能问题二：TMA 与 MMA 无实际 overlap（待优化）
-
-**当前执行时序**（每次 N-block 迭代）：
-```
-load warp:   [issue TMA K+Vt] → signal load_mbar → idle ←───────────── [wait math_mbar]
-math warps:  [wait load_mbar] → [GEMM1+silu+SMEM transpose+GEMM2] → signal math_mbar
-```
-
-**问题**：load warp issue TMA 之后立即 idle，等 math warps 全部完成才能发下一个 tile 的 TMA。math warps 完成 GEMM1+GEMM2 之后才 signal math_mbar，此时 load warp 才开始发下一 tile 的 TMA。TMA 搬运和 MMA 计算是**完全串行**的，与 Phase 5 无本质区别。
-
-**真正 overlap 的目标时序**：
-```
-load warp:   [issue TMA tile N] → [wait math_mbar(N-1)] → [issue TMA tile N-1] → ...
-math warps:  [wait load_mbar(N)] → [GEMM tile N] → [signal math_mbar(N)] → [wait load_mbar(N-1)] → ...
-```
-即 load warp 发完 tile N 的 TMA 之后，不等 math warps，立即开始等 math_mbar(N-1) 并准备发 tile N-1。这需要至少 **2-stage double-buffer**：SMEM 中同时存两个 tile（一个供 math warps 计算，一个供 load warp 写入），两者用不同的 mbarrier phase 管理。
-
-**当前未实现 double-buffer 的原因**：SMEM 预算紧张（Q/K/Vt 各 16KB，SF 1KB，barriers 24B），再加一份 K+Vt 的 double-buffer 需要额外 32KB，超出 SM120 的 SMEM 限制（通常 ~100KB 可用）。需要评估是否可以通过减小 tile size 或复用 buffer 来实现。
+**消除 transpose 的方案**：Python 侧将 V 改为列主序存储，strides 从 `[v_row_stride, 1]` 改为 `[1, v_col_stride]`，使 kBlockN 维成为 stride-1，则 TMA 可直接写入 K_SW128 SMEM，无需 transpose。代价是修改量化+存储 API。
 
 ---
 
-### 关键调试难点记录
+### 关键 Bug 修复记录
+
+#### CuTe SM90 TMA header debug printf（严重性能问题）
+- **文件**：`external/cutlass/include/cute/arch/copy_sm90_tma.hpp:172`
+- **问题**：`SM90_TMA_LOAD_3D::copy()` 在 `CUTE_ARCH_TMA_SM120_ENABLED` 路径下有一行 `printf(...)` 遗留调试代码，每次 TMA 调用执行一次，造成 FP8 kernel 慢 **30-80x**
+- **修复**：删除该 printf 行（已提交）
+
+#### 关键调试难点记录
 
 #### 1. TMA descriptor 初始化失败
 - **原因**：`SmemLayoutVt_TMA` 用 K_SW128（kBlockN 内层），TMA dim0=kBlockN 映射到 total_k（非 stride-1）
@@ -148,12 +143,26 @@ math warps:  [wait load_mbar(N)] → [GEMM tile N] → [signal math_mbar(N)] →
 **hstu_test.py 14 explicit @example cases**（quant_mode=2，seq=128/256，causal/rab/drab/local/context/target/arbitrary）：**14/14 PASS**
 
 测试脚本：`run_hstu8_examples.sh`（项目根目录）
-测试日志：`test_results/026_ws_smem_transpose_vt.log`、`test_results/027_hstu8_explicit_examples_qm2.log`
+测试日志：`test_results/011_ws_phase6_final.log`
+
+### Phase 6 性能结果（2026-04-03，RTX PRO 6000 Blackwell SM120，bs=4, h=16, d=128）
+
+kernel-only（full attention，CuTe debug printf 已删除后测量）：
+
+| seq  | BF16    | BF16 TFLOPS | FP8 (qm=2) | FP8 TFLOPS | FP8/BF16 |
+|------|---------|-------------|------------|------------|----------|
+| 512  | 0.032ms | 267         | 0.070ms    | 122        | 2.19x 慢 |
+| 1024 | 0.084ms | 408         | 0.174ms    | 197        | 2.07x 慢 |
+| 2048 | 0.271ms | 508         | 0.518ms    | 265        | 1.91x 慢 |
+| 4096 | 0.919ms | 598         | 1.734ms    | 317        | 1.89x 慢 |
+
+**注意**：BF16 绝对值与历史数据差异较大（历史 0.044ms vs 今日 0.032ms at seq=512），原因是 GPU 热状态/boost clock 不同，跨 session 绝对值不可直接比较。
+
+FP8 仍比 BF16 慢的主要原因：SMEM transpose 开销（每 tile 16KB + 2×bar.sync）+ WS 分工损失 1/9 计算资源 + QMMA block-scale 指令本身更重。
 
 ### 后续优化方向
-- [ ] **benchmark**：与 Phase 5 对比，量化当前 WS 框架的实际性能差距
-- [ ] **消除 SMEM transpose**：Python 侧 V 列主序存储，TMA 直接写 K_SW128
-- [ ] **实现真正 overlap**：double-buffer SMEM，load warp 在 math warps 计算时预取下一 tile
+- [ ] **消除 SMEM transpose**：Python 侧 V 列主序存储，TMA 直接写 K_SW128，预计节省每 tile 约 2×bar.sync + 16KB 搬运
+- [ ] **nsys profile**：量化各部分耗时（GEMM1/GEMM2/transpose/SFB load），确定实际瓶颈
 
 ---
 

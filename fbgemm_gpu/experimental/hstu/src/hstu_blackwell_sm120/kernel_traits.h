@@ -487,26 +487,42 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
   // kNMathThreads: math-warp-only thread count used for per-warp layout arithmetic.
   static constexpr int kNMathThreads = kNMathWarps * cutlass::NumThreadsPerWarp;  // 256
 
-  // Three barriers: tma_k_mbar (K TMA completion, also Q TMA at init)
-  //                 load_mbar  (load warp → math warps: K+V ready)
-  //                 math_mbar  (math warps → load warp: SMEM consumed)
-  // Each barrier is 8 bytes; total = 24 bytes.  Placed at the last 24 bytes of kSmemSize.
-  static constexpr int kSmemMbarSize = 24;
-  // Override kSmemSize to include the larger barrier region.
-  // IMPORTANT: mbarrier.init requires 8-byte aligned SMEM address.
-  // When Is_arbitrary=true, the func data region (20 bytes for kNFunc=3) can make the
-  // pre-SF boundary land on a 4-byte offset (e.g., 34836 % 8 == 4), causing misaligned address.
-  // Fix: pad the data region (everything before SF+mbar) to the next 8-byte boundary.
-  static constexpr int kSmemDataSize =
-      Base::kSmemSize - Base::kSmemMbarSize - Base::kSmemSFSize;
-  static constexpr int kSmemDataSizePadded = ((kSmemDataSize + 7) / 8) * 8;
-  static constexpr int kSmemSize = kSmemDataSizePadded + Base::kSmemSFSize + kSmemMbarSize;
+  // Double-buffer pipeline: 4 barriers (2 per role), no load_mbar needed.
+  //   tma_mbar[0], tma_mbar[1]: TMA completion per stage (math warps wait these)
+  //   math_mbar[0], math_mbar[1]: SMEM consumed per stage (load warp waits these)
+  // Each barrier is 8 bytes; total = 32 bytes.  Placed at the last 32 bytes of kSmemSize.
+  static constexpr int kSmemMbarSize = 32;
+
+  // Double-buffer KV SMEM layout.
+  // Each K or Vt tile is kBlockN * kHeadDim FP8 bytes (1 byte each).
+  static constexpr int kSmemKVBytes =
+      Base::kBlockN * Base::kHeadDim * (int)sizeof(typename Base::Element);
+  // 2 stages × (K + Vt) = 4 × kSmemKVBytes (e.g. 4 × 16384 = 65536 for kBlockN=kHeadDim=128)
+  static constexpr int kSmemWsKVTotalBytes = 4 * kSmemKVBytes;
+
+  // WS SMEM region offsets (double-buffer layout):
+  //   [0 .. kSmemWsKVTotalBytes)          : K[0], Vt[0], K[1], Vt[1]
+  //   [kSmemWsKVTotalBytes .. +ValidBl)   : ValidBlockIds (Is_arbitrary only)
+  //   [.. + func region)                  : func arrays (Is_arbitrary only)
+  //   [padded to 8B)                      : SFA + SFB  (kSmemSFSize = 1024 bytes)
+  //   [last kSmemMbarSize bytes)          : 4 mbarriers × 8B
+  static constexpr int kSmemWsValidBlockIdsOffset = kSmemWsKVTotalBytes;
+  static constexpr int kSmemWsFuncOffset = kSmemWsValidBlockIdsOffset +
+      (Is_arbitrary_ ? (int)(size(typename Base::SmemLayoutValidBlockIds{}) * sizeof(int)) : 0);
+  // Arbitrary func data: sn_valid_block_max (1 int) + sFunc_min (kNFunc/2+1 ints) + sFunc_max (kNFunc/2+1 ints)
+  static constexpr int kSmemWsFuncEnd = kSmemWsFuncOffset +
+      (Is_arbitrary_ ? (int)((Base::kNFunc/2 + 1 + Base::kNFunc/2 + 1 + 1) * (int)sizeof(int)) : 0);
+
+  // Override kSmemSize: WS data (padded to 8B) + SF + 4 mbarriers.
+  // Pad data to 8 bytes so mbarrier addresses are properly aligned.
+  static constexpr int kSmemWsDataSizePadded = ((kSmemWsFuncEnd + 7) / 8) * 8;
+  static constexpr int kSmemSize = kSmemWsDataSizePadded + Base::kSmemSFSize + kSmemMbarSize;
 
   // Invariant checks
   static_assert(kNMathWarps * 16 == Base::kBlockM,
       "kNMathWarps * 16 must equal kBlockM (8 warps × 16 rows = 128)");
   static_assert(kNThreads == (kNMathWarps + kNLoadWarps) * 32,
       "kNThreads == (kNMathWarps + kNLoadWarps) * 32");
-  static_assert(kSmemMbarSize == 24,
-      "kSmemMbarSize must be 24 (three 8-byte mbarriers: tma_k_mbar + load_mbar + math_mbar)");
+  static_assert(kSmemMbarSize == 32,
+      "kSmemMbarSize must be 32 (four 8-byte mbarriers: tma_mbar[2] + math_mbar[2])");
 };

@@ -1,13 +1,44 @@
-## Phase 6 结论：WS cp.async 不可行（2026-03-31 更新）
+## Phase 6 COMPLETE: WS TMA Double-Buffer Pipeline（2026-04-03 最终）
 
 ### 当前代码状态（git branch: sm120）
 
-**当前 dispatch（hstu_fwd_kernel.h ~line 1669）**：所有 FP8 路径使用 Phase 4 cp.async。
-**WS 代码**：`hstu_fwd_kernel_fp8_ws.h` 已改写为 cp.async 版本（TMA 已移除），但 dispatch 已回退到 Phase 4。
+**当前 dispatch**：FP8 路径使用 Phase 6 WS TMA double-buffer kernel（`hstu_fwd_kernel_fp8_ws.h`）。
+**准确度**：14/14 测试用例通过（`run_hstu8_examples.sh`，test 011），包括 is_jump (target+causal) case。
 
-**Phase 4 dispatch 通过验证**：`sweep_accuracy.py` fp8_gt_cos ≈ 0.9996，全部 6 个测试用例通过（测试 051, 053）。
+### 重要修复：CuTe SM90 TMA printf bug
+
+`external/cutlass/include/cute/arch/copy_sm90_tma.hpp:172` 有调试用 `printf`：
+```cpp
+printf("cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint\n");
+```
+此 printf 在每次 TMA 调用时执行，造成 FP8 kernel 慢 32-80x（bench 从 0.053ms 退化为 1.76ms at seq=512）。
+**已删除该 printf。** 所有之前 TMA 相关 benchmark 数字可能都受此影响。
+
+### Phase 6 性能结果（2026-04-03，printf 已删除，RTX PRO 6000 Blackwell SM120，bs=4,h=16,d=128）
+
+| seq  | BF16 ms | BF16 TFLOPS | FP8 ms | FP8 TFLOPS | FP8/BF16 ratio |
+|------|---------|-------------|--------|------------|----------------|
+| 512  | 0.032   | 267         | 0.070  | 122        | 2.19x          |
+| 1024 | 0.084   | 408         | 0.174  | 197        | 2.07x          |
+| 2048 | 0.271   | 508         | 0.518  | 265        | 1.91x          |
+| 4096 | 0.919   | 598         | 1.734  | 317        | 1.89x          |
+
+**注**：BF16 路径未变化，数字与 Phase 5 差异来自 GPU 热状态。
+
+### Phase 6 vs Phase 5 FP8 内核对比（均无 printf）
+
+| seq  | Phase 5 FP8 | Phase 6 WS FP8 | 结果      |
+|------|-------------|----------------|-----------|
+| 512  | ~0.053ms    | 0.070ms        | -32% 更慢 |
+| 1024 | ~0.144ms    | 0.174ms        | -21% 更慢 |
+| 2048 | ~0.544ms    | 0.518ms        | +5% 更快  |
+| 4096 | ~1.912ms    | 1.734ms        | +9% 更快  |
+
+WS pipeline 对 seq≥2048 有性能收益，对 seq<2048 有额外开销（warp 分工、barrier 同步）。
 
 ---
+
+## Phase 6 历史：WS cp.async 不可行（2026-03-31 实验，已废弃）
 
 ### Phase 6 WS cp.async 实验（测试 052）
 

@@ -62,7 +62,8 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
   if (m_block * kBlockM >= binfo.actual_seqlen_q_padded) return;
 
   char* smem_q    = reinterpret_cast<char*>(smem_);
-  char* smem_func = reinterpret_cast<char*>(smem_) + Kernel_traits::kSmemSizeQKVRabValidBlockIds;
+  // WS double-buffer: func/validblockids start after 4 KV stage buffers.
+  char* smem_func = reinterpret_cast<char*>(smem_) + Kernel_traits::kSmemWsFuncOffset;
   int* sn_valid_block_max = reinterpret_cast<int*>(smem_func);
   int* sf_min_ptr = reinterpret_cast<int*>(sn_valid_block_max) + 1;
   int* sf_max_ptr = sf_min_ptr + (kNFunc/2 + 1);
@@ -128,7 +129,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
 
   // SMEM tensors
   Tensor sValidBlockIds = make_tensor(
-      make_smem_ptr(reinterpret_cast<int*>(smem_ + Kernel_traits::kSmemSizeQKVRab)),
+      make_smem_ptr(reinterpret_cast<int*>(smem_ + Kernel_traits::kSmemWsValidBlockIdsOffset)),
       typename Kernel_traits::SmemLayoutValidBlockIds{});
   Tensor sFunc_min = make_tensor(make_smem_ptr(sf_min_ptr), typename Kernel_traits::SmemLayoutMinFunc{});
   Tensor sFunc_max = make_tensor(make_smem_ptr(sf_max_ptr), typename Kernel_traits::SmemLayoutMaxFunc{});
@@ -211,48 +212,63 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       Shape<Int<kBlockN>, Int<kHeadDim>>{}));
   // V^T layout: [kHeadDim, kBlockN] in SMEM, loaded directly by TMA (no kernel-side transpose).
   // Must match SmemLayoutVt_TMA (MN_SW128): TMA requires SMEM inner=kHeadDim → GMEM d (stride=1).
-  // LDSM_N (K inner) is NOT used; s2r copy uses partition_B + cute::copy (element-by-element).
   using SmemLayoutVt_SW128 = typename Kernel_traits::SmemLayoutVt_TMA;
 
-  Tensor sQ_sw128 = make_tensor(make_smem_ptr(reinterpret_cast<FP8Elem*>(smem_q)), SmemLayoutQ_SW128{});
-  Tensor sK_sw128 = make_tensor(make_smem_ptr(reinterpret_cast<FP8Elem*>(smem_q)), SmemLayoutK_SW128{});
-  // sVt_sw128: V^T tile loaded via TMA at smem_q[kBlockN*kHeadDim] (same slot as old sV).
-  Tensor sVt_sw128 = make_tensor(
-      make_smem_ptr(reinterpret_cast<FP8Elem*>(smem_q) + size(SmemLayoutK_SW128{})),
-      SmemLayoutVt_SW128{});
+  // Double-buffer SMEM layout:
+  //   Stage 0: sK[0] at smem_q + 0,              sVt[0] at smem_q + kSmemKVElems
+  //   Stage 1: sK[1] at smem_q + 2*kSmemKVElems, sVt[1] at smem_q + 3*kSmemKVElems
+  constexpr int kSmemKVElems = kBlockN * kHeadDim;  // FP8 elements per K or Vt tile (= 16384)
+  FP8Elem* const sK_base[2] = {
+      reinterpret_cast<FP8Elem*>(smem_q),
+      reinterpret_cast<FP8Elem*>(smem_q) + 2 * kSmemKVElems
+  };
+  FP8Elem* const sVt_base[2] = {
+      reinterpret_cast<FP8Elem*>(smem_q) + kSmemKVElems,
+      reinterpret_cast<FP8Elem*>(smem_q) + 3 * kSmemKVElems
+  };
+  // sQ shares stage-0's K buffer (Q preamble happens before the K loop overwrites it)
+  Tensor sQ_sw128 = make_tensor(make_smem_ptr(sK_base[0]), SmemLayoutQ_SW128{});
 
-  // WS SMEM layout: [DATA...][SFA(512B)][SFB(512B)][tma_k_mbar(8B)][load_mbar(8B)][math_mbar(8B)]
-  // SF placed at kSmemSize - kSmemMbarSize(24) - kSmemSFSize(1024).
+  // WS double-buffer SMEM layout:
+  //   [DATA...][SFA(512B)][SFB(512B)][tma_mbar[0](8B)][tma_mbar[1](8B)][math_mbar[0](8B)][math_mbar[1](8B)]
+  // SF placed at kSmemSize - kSmemMbarSize(32) - kSmemSFSize(1024).
   static constexpr int kSmemSFOffset_WS =
       Kernel_traits::kSmemSize - Kernel_traits::kSmemMbarSize - Kernel_traits::kSmemSFSize;
   int32_t* smem_sfa_ptr = reinterpret_cast<int32_t*>(smem_ + kSmemSFOffset_WS);
   int32_t* smem_sfb_ptr = smem_sfa_ptr + kBlockM;  // SFB at +512B after SFA
 
-  // Three WS barriers at the last 24 bytes of SMEM.
-  // tma_k_mbar: TMA completion for Q (preamble) and K (per-iteration); reused across loop.
-  // load_mbar:  load warp signals math warps that K+V is ready in SMEM.
-  // math_mbar:  math warp leaders signal load warp that SMEM has been consumed.
-  static constexpr int kSmemTmaKMbarOffset =
-      Kernel_traits::kSmemSize - Kernel_traits::kSmemMbarSize;      // base of 3-mbar region
-  static constexpr int kSmemLoadMbarOffset = kSmemTmaKMbarOffset + 8;
-  static constexpr int kSmemMathMbarOffset = kSmemTmaKMbarOffset + 16;
-  uint64_t* tma_k_mbar_ptr = reinterpret_cast<uint64_t*>(smem_ + kSmemTmaKMbarOffset);
-  uint64_t* load_mbar_ptr  = reinterpret_cast<uint64_t*>(smem_ + kSmemLoadMbarOffset);
-  uint64_t* math_mbar_ptr  = reinterpret_cast<uint64_t*>(smem_ + kSmemMathMbarOffset);
+  // Four WS barriers (double-buffer pipeline) at the last 32 bytes of SMEM.
+  //   tma_mbar[2]: TMA completion per stage; math warps wait these.
+  //   math_mbar[2]: SMEM consumed per stage; load warp waits these.
+  // Both tma_mbar[] are also shared with Q TMA (tma_mbar[0] used for Q in preamble).
+  static constexpr int kSmemMbar0Offset =
+      Kernel_traits::kSmemSize - Kernel_traits::kSmemMbarSize;  // tma_mbar[0]
+  uint64_t* tma_mbar_ptr[2] = {
+      reinterpret_cast<uint64_t*>(smem_ + kSmemMbar0Offset),
+      reinterpret_cast<uint64_t*>(smem_ + kSmemMbar0Offset + 8)
+  };
+  uint64_t* math_mbar_ptr[2] = {
+      reinterpret_cast<uint64_t*>(smem_ + kSmemMbar0Offset + 16),
+      reinterpret_cast<uint64_t*>(smem_ + kSmemMbar0Offset + 24)
+  };
 
-  // Thread 0 inits all 3 barriers and pre-satisfies math_mbar (8 arrives) so load warp starts immediately.
-  // tma_k_mbar count=1: thread 0 does arrive.expect_tx for both Q TMA and K TMA (one at a time).
-  // load_mbar count=1: thread 0 signals after K TMA + V cp.async both complete each iteration.
-  // math_mbar count=8: one per math warp leader; pre-satisfied so iteration 0 load can proceed.
+  // Thread 0 inits all 4 barriers.
+  //   tma_mbar[0], tma_mbar[1]: count=1 (thread 0 will arrive.expect_tx each time)
+  //   math_mbar[0], math_mbar[1]: count=8 (one arrive per math warp leader)
+  // Pre-satisfy both math_mbar[0] and math_mbar[1] so load warp starts immediately.
   if (tidx == 0) {
-    uint32_t taddr = static_cast<uint32_t>(__cvta_generic_to_shared(tma_k_mbar_ptr));
-    uint32_t laddr = static_cast<uint32_t>(__cvta_generic_to_shared(load_mbar_ptr));
-    uint32_t maddr = static_cast<uint32_t>(__cvta_generic_to_shared(math_mbar_ptr));
-    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" : : "r"(taddr), "r"(1));
-    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" : : "r"(laddr), "r"(1));
-    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" : : "r"(maddr), "r"(8));
-    for (int i = 0; i < 8; i++)
-      asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" : : "r"(maddr));
+    uint32_t tm0 = static_cast<uint32_t>(__cvta_generic_to_shared(tma_mbar_ptr[0]));
+    uint32_t tm1 = static_cast<uint32_t>(__cvta_generic_to_shared(tma_mbar_ptr[1]));
+    uint32_t mm0 = static_cast<uint32_t>(__cvta_generic_to_shared(math_mbar_ptr[0]));
+    uint32_t mm1 = static_cast<uint32_t>(__cvta_generic_to_shared(math_mbar_ptr[1]));
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" : : "r"(tm0), "r"(1));
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" : : "r"(tm1), "r"(1));
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" : : "r"(mm0), "r"(8));
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" : : "r"(mm1), "r"(8));
+    for (int i = 0; i < 8; i++) {
+      asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" : : "r"(mm0));
+      asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" : : "r"(mm1));
+    }
   }
   asm volatile("fence.proxy.async.shared::cta;\n" : : : "memory");
   __syncthreads();
@@ -295,9 +311,10 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       BS2::get_layoutSFB_TV(tiled_mma_g2), make_shape(size<1>(tile_shape(tiled_mma_g2)), _1{}));
   auto s2r_thr_SFV  = s2r_copy_SFV.get_thread_slice(tidx_math);
 
-  // Q TMA preamble: thread 0 issues TMA to sQ_sw128, waits for completion, then __syncthreads.
-  // tma_k_mbar is used here (initialized to phase 0). After Q TMA completes, phase becomes 1.
-  // K TMA loop starts with k_tma_phase=1 to account for this phase advance.
+  // Q TMA preamble: thread 0 issues TMA to sQ_sw128 (= sK_base[0]), waits for completion.
+  // Uses tma_mbar_ptr[0] (initialized to phase 0). After Q TMA completes, phase becomes 1.
+  // K TMA stage-0 first use will advance tma_mbar_ptr[0] from phase 1→0.
+  // Math warps waiting for stage-0 first K TMA must use parity=1 (passes when phase=0).
   {
     constexpr int kSmemQBytes = kBlockM * kHeadDim * sizeof(FP8Elem);
     if (tidx == 0) {
@@ -310,14 +327,14 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       auto tQsQ_d      = tma_slice_Q.partition_D(sQ_sw128);
       auto tQgQ_tma    = tma_slice_Q.partition_S(gQ_tiles(_, _, _, Int<0>{}));
       const int m_abs  = binfo.sum_s_q / kBlockM + m_block;
-      uint32_t taddr   = static_cast<uint32_t>(__cvta_generic_to_shared(tma_k_mbar_ptr));
-      cute::copy(params.tma_q.with(*tma_k_mbar_ptr), tQgQ_tma(_, _, _, m_abs), tQsQ_d);
+      uint32_t taddr   = static_cast<uint32_t>(__cvta_generic_to_shared(tma_mbar_ptr[0]));
+      cute::copy(params.tma_q.with(*tma_mbar_ptr[0]), tQgQ_tma(_, _, _, m_abs), tQsQ_d);
       asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"
                    : : "r"(taddr), "r"(kSmemQBytes));
-      wait_mbar_parity(tma_k_mbar_ptr, 0);  // block until phase != 0  (phase becomes 1)
+      wait_mbar_parity(tma_mbar_ptr[0], 0);  // block until phase != 0  (phase becomes 1)
     }
   }
-  __syncthreads();  // broadcast Q readiness; tma_k_mbar now at phase 1
+  __syncthreads();  // broadcast Q readiness; tma_mbar_ptr[0] now at phase 1
   // s2r Q (math warps only)
   auto sQ_pi = as_position_independent_swizzle_tensor(sQ_sw128);
   Tensor tCrQ = thr_mma_g1.partition_fragment_A(sQ_pi);
@@ -355,8 +372,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
   }
   auto tCrSFA_frg = BS1::transform_fragment_for_qmma(tCrSFA);
 
-  // K and V^T TMA tensors (pre-built outside loop; thread 0 indexes by nb_abs per iteration).
-  // tma_k_mbar is reused here; after Q TMA it is at phase 1, so k_tma_phase starts at 1.
+  // K and V^T TMA tensors — one partition_D per stage (double-buffer).
   // Both K and Vt TMA are issued together with a single arrive.expect_tx(kSmemKBytes+kSmemVtBytes).
   const int bidh_kv = bidh / params.h_h_k_ratio;
   constexpr int kSmemKBytes  = kBlockN * kHeadDim * sizeof(FP8Elem);
@@ -366,18 +382,25 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
   auto gK_head  = mK_tma(_, _, bidh_kv);
   auto gK_tiles = local_tile(gK_head, Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(_, _));
   auto tma_slice_K = params.tma_k.get_slice(0);
-  auto tKsK_d      = tma_slice_K.partition_D(sK_sw128);
   auto tKgK_tma    = tma_slice_K.partition_S(gK_tiles(_, _, _, Int<0>{}));
+  // Per-stage partition_D for K (must be computed before entering the WS split)
+  auto tKsK_d_0 = tma_slice_K.partition_D(
+      make_tensor(make_smem_ptr(sK_base[0]), SmemLayoutK_SW128{}));
+  auto tKsK_d_1 = tma_slice_K.partition_D(
+      make_tensor(make_smem_ptr(sK_base[1]), SmemLayoutK_SW128{}));
 
-  // V^T TMA: descriptor built as [k, d, h_k]; get_tma_tensor uses [d, k, h_k] shape
-  // (same Phase 5 pattern: reordered shape + tile[kBlockN,kHeadDim] causes SMEM-layout
-  // mismatch that TMA uses to perform the V→V^T transposition).
+  // V^T TMA: descriptor built as [d, total_k, h_k]; TMA uses [kHeadDim, kBlockN] tile shape
+  // to load V^T directly (no kernel-side transpose needed).
   auto mVt_tma   = params.tma_vt.get_tma_tensor(make_shape(params.d, params.total_k, params.h_k));
   auto gVt_head  = mVt_tma(_, _, bidh_kv);
   auto gVt_tiles = local_tile(gVt_head, Shape<Int<kHeadDim>, Int<kBlockN>>{}, make_coord(_, _));
   auto tma_slice_Vt = params.tma_vt.get_slice(0);
-  auto tVtsVt_d     = tma_slice_Vt.partition_D(sVt_sw128);
   auto tVtgVt_tma   = tma_slice_Vt.partition_S(gVt_tiles(_, _, Int<0>{}, _));
+  // Per-stage partition_D for Vt
+  auto tVtsVt_d_0 = tma_slice_Vt.partition_D(
+      make_tensor(make_smem_ptr(sVt_base[0]), SmemLayoutVt_SW128{}));
+  auto tVtsVt_d_1 = tma_slice_Vt.partition_D(
+      make_tensor(make_smem_ptr(sVt_base[1]), SmemLayoutVt_SW128{}));
 
   // Mask lambda (uses thr_mma_g1 partitioned with tidx_math → math warps only)
   auto col_limit_right = [&](int row) {
@@ -450,65 +473,116 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
   // Sync all 288 threads before entering WS loop.
   // Ensures math warps finish s2r SFA before load warp starts issuing TMA.
   __syncthreads();
-  // ===== WS MAIN LOOP =====
-  // load_phase: expected parity for load_mbar waits (math warps use this).
-  //   test_wait.parity returns TRUE when current_phase != parity.
-  //   Fresh mbarrier phase=0 → test_wait(addr,0) blocks (0==0 → FALSE).
-  //   After first TMA completion, phase=1 → test_wait(addr,0) passes (1≠0).
-  // math_phase: parity for math_mbar waits (load warp uses this).
-  //   After pre-satisfaction, phase=1 → test_wait(addr,0) passes (1≠0) immediately.
-  int load_phase  = 0;  // load_mbar parity expected by math warps
-  int math_phase  = 0;  // math_mbar parity expected by load warp
-  int k_tma_phase = 1;  // tma_k_mbar parity after Q TMA (phase 0→1); K TMA loop starts at 1
+
+  // ===== DOUBLE-BUFFER WS PIPELINE =====
+  // Phase tracking for tma_mbar[2]:
+  //   tma_mbar[0] starts at phase=1 (after Q TMA), so first K stage-0 TMA advances it 1→0.
+  //   Math warps wait parity=1 for stage-0 first tile (passes when phase=0).
+  //   tma_mbar[1] starts at phase=0, so first K stage-1 TMA advances it 0→1.
+  //   Math warps wait parity=0 for stage-1 first tile (passes when phase=1).
+  //   After each wait: toggle the parity for that stage.
+  // Phase tracking for math_mbar[2]:
+  //   Both pre-satisfied → phase=1. Load warp waits parity=0 (passes when phase=1 ≠ 0).
+  //   After wait: toggle to parity=1. Next wait (parity=1) blocks until math warps arrive.
+  //
+  // Layout of K+Vt SMEM helper lambda (stage s → base pointer):
+  using SmemLayoutVt_K_SW128 = decltype(tile_to_shape(typename BS2::SmemLayoutAtomB{},
+      Shape<Int<kHeadDim>, Int<kBlockN>>{}));
 
   if (is_load_warp) {
-    // ===== LOAD WARP: cp.async producer loop =====
-    for (int n_valid = n_block_max - 1, masking_step = 0; n_valid >= n_block_min;
-         ++masking_step, --n_valid) {
+    // ===== LOAD WARP: double-buffer TMA producer =====
+    // Phase state per stage: initially tma_wait = {1,0}, math_wait = {0,0} (both pre-satisfied).
+    int math_wait_parity[2] = {0, 0};  // load warp waits math_mbar[s] with this parity
+
+    // --- PREAMBLE: issue TMA for tile n_block_max-1 into stage 0 ---
+    // Wait math_mbar[0] parity=0 (pre-satisfied → phase=1 → passes immediately)
+    {
+      uint32_t maddr = static_cast<uint32_t>(__cvta_generic_to_shared(math_mbar_ptr[0]));
+      uint32_t done = 0;
+      do {
+        asm volatile("{.reg .pred p;\nmbarrier.test_wait.parity.shared::cta.b64 p, [%1], %2;\nselp.u32 %0, 1, 0, p;}\n"
+                     : "=r"(done) : "r"(maddr), "r"((uint32_t)math_wait_parity[0]));
+      } while (!done);
+    }
+    math_wait_parity[0] ^= 1;
+
+    // Thread 0: issue K+Vt TMA for tile n_block_max-1 into stage 0 (tma_mbar[0])
+    if (tidx == 0) {
+      const int nb0 = Is_arbitrary ? int(sValidBlockIds[n_block_max - 1]) : (n_block_max - 1);
+      const int nb_abs0 = binfo.sum_s_k / kBlockN + nb0;
+      uint32_t taddr0 = static_cast<uint32_t>(__cvta_generic_to_shared(tma_mbar_ptr[0]));
+      cute::copy(params.tma_k.with(*tma_mbar_ptr[0]),  tKgK_tma(_, _, _, nb_abs0), tKsK_d_0);
+      cute::copy(params.tma_vt.with(*tma_mbar_ptr[0]), tVtgVt_tma(_, _, _, nb_abs0), tVtsVt_d_0);
+      asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"
+                   : : "r"(taddr0), "r"(kSmemKBytes + kSmemVtBytes));
+      // Do NOT wait for TMA completion here — math warps wait on tma_mbar[0] directly.
+    }
+
+    // Compute load warp loop's starting n_valid by mirroring math warp's masking_step=0 update.
+    // Math warp at masking_step=0: is_jump adjusts n_valid = min(n_block_max-1, n_block_history),
+    // then loop --n_valid gives the n_valid for masking_step=1.
+    // Load warp's loop starts at masking_step=1 and must use the SAME n_valid sequence as math warp.
+    int load_n_valid_init = n_block_max - 1;
+    if (is_jump && (n_masking_steps - 1 == 0))  // is_jump triggers at masking_step=0?
+      load_n_valid_init = std::min(load_n_valid_init, n_block_history);
+    load_n_valid_init -= 1;  // loop --n_valid after masking_step=0
+
+    // --- LOAD LOOP: tiles for math warp's masking_step=1,2,... alternating stages 1→0→1... ---
+    int load_stage = 1;
+    for (int n_valid = load_n_valid_init, masking_step_load = 1; n_valid >= n_block_min;
+         ++masking_step_load, --n_valid) {
       const int nb = Is_arbitrary ? int(sValidBlockIds[n_valid]) : n_valid;
 
-      // Wait for math warps to consume previous tile (math_mbar phase 0 pre-satisfied on first iter).
+      // Wait for math warps to consume load_stage's SMEM before overwriting it
       {
-        uint32_t maddr = static_cast<uint32_t>(__cvta_generic_to_shared(math_mbar_ptr));
+        uint32_t maddr = static_cast<uint32_t>(__cvta_generic_to_shared(math_mbar_ptr[load_stage]));
         uint32_t done = 0;
         do {
           asm volatile("{.reg .pred p;\nmbarrier.test_wait.parity.shared::cta.b64 p, [%1], %2;\nselp.u32 %0, 1, 0, p;}\n"
-                       : "=r"(done) : "r"(maddr), "r"((uint32_t)math_phase));
+                       : "=r"(done) : "r"(maddr), "r"((uint32_t)math_wait_parity[load_stage]));
         } while (!done);
       }
-      math_phase ^= 1;
+      math_wait_parity[load_stage] ^= 1;
 
-      // K TMA + V^T TMA (thread 0 only): issue both into sK_sw128 and sVt_sw128.
-      // Single arrive.expect_tx announces total bytes (K+Vt); both TMAs arrive at tma_k_mbar
-      // when complete; phase completes when total TX bytes delivered.
+      // Thread 0: issue K+Vt TMA for this tile into load_stage — do NOT wait for completion
       if (tidx == 0) {
         const int nb_abs = binfo.sum_s_k / kBlockN + nb;
-        uint32_t taddr = static_cast<uint32_t>(__cvta_generic_to_shared(tma_k_mbar_ptr));
-        cute::copy(params.tma_k.with(*tma_k_mbar_ptr),  tKgK_tma(_, _, _, nb_abs),  tKsK_d);
-        cute::copy(params.tma_vt.with(*tma_k_mbar_ptr), tVtgVt_tma(_, _, _, nb_abs), tVtsVt_d);
+        uint32_t taddr = static_cast<uint32_t>(__cvta_generic_to_shared(tma_mbar_ptr[load_stage]));
+        if (load_stage == 0) {
+          cute::copy(params.tma_k.with(*tma_mbar_ptr[0]),  tKgK_tma(_, _, _, nb_abs), tKsK_d_0);
+          cute::copy(params.tma_vt.with(*tma_mbar_ptr[0]), tVtgVt_tma(_, _, _, nb_abs), tVtsVt_d_0);
+        } else {
+          cute::copy(params.tma_k.with(*tma_mbar_ptr[1]),  tKgK_tma(_, _, _, nb_abs), tKsK_d_1);
+          cute::copy(params.tma_vt.with(*tma_mbar_ptr[1]), tVtgVt_tma(_, _, _, nb_abs), tVtsVt_d_1);
+        }
         asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"
                      : : "r"(taddr), "r"(kSmemKBytes + kSmemVtBytes));
-        wait_mbar_parity(tma_k_mbar_ptr, k_tma_phase);
-        k_tma_phase ^= 1;
-        // Signal math warps: K and V^T are ready in SMEM.
-        uint32_t laddr = static_cast<uint32_t>(__cvta_generic_to_shared(load_mbar_ptr));
-        asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" : : "r"(laddr));
+        // TMA runs asynchronously — math warps will wait on tma_mbar[load_stage].
       }
 
-      if (is_jump && masking_step == n_masking_steps - 1)
+      // Mirror math warp's is_jump at the same masking_step index
+      if (is_jump && masking_step_load == n_masking_steps - 1)
         n_valid = std::min(n_valid, n_block_history);
+
+      load_stage ^= 1;
     }
     // Load warp done; falls through to __syncthreads() below.
 
   } else {
-    // ===== MATH WARPS: QMMA consumer loop =====
+    // ===== MATH WARPS: double-buffer QMMA consumer loop =====
+    // Math warps wait tma_mbar[stage] directly (no load_mbar intermediary).
+    // tma_wait_parity[0]=1: after Q TMA phase=1, K stage-0 TMA: phase 1→0; wait parity=1 passes.
+    // tma_wait_parity[1]=0: tma_mbar[1] fresh phase=0, K stage-1 TMA: phase 0→1; wait parity=0 passes.
+    int tma_wait_parity[2] = {1, 0};
+    int math_stage = 0;  // starts with stage 0 (preamble loaded tile N-1 there)
+
     for (int n_valid = n_block_max - 1, masking_step = 0; n_valid >= n_block_min;
          ++masking_step, --n_valid) {
       const int nb = Is_arbitrary ? int(sValidBlockIds[n_valid]) : n_valid;
       const bool is_masking = masking_step < n_masking_steps ||
           (nb + 1) * kBlockN > actual_seqlen_h;
 
-      // Load SFB (K scale) into SMEM — can happen before waiting on load_mbar
+      // Load SFB (K scale) into SMEM — can happen before waiting on tma_mbar (different GMEM).
       if (params.sf_k_packed_ptr != nullptr && params.cu_seqlens_kv_block_descale != nullptr) {
         const int64_t k_tile_base = static_cast<int64_t>(bidh) * params.kv_block_descale_head_stride
             + params.cu_seqlens_kv_block_descale[bidb] + nb * kBlockN;
@@ -519,24 +593,29 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
           smem_sfb_ptr[i] = 0x7f7f7f7f;
       }
 
-      // Wait for TMA K[nb]+V^T[nb] to land in SMEM
+      // Wait for TMA K[nb]+Vt[nb] to land in SMEM for math_stage
       {
-        uint32_t laddr = static_cast<uint32_t>(__cvta_generic_to_shared(load_mbar_ptr));
+        uint32_t taddr = static_cast<uint32_t>(__cvta_generic_to_shared(tma_mbar_ptr[math_stage]));
         uint32_t done = 0;
         do {
           asm volatile("{.reg .pred p;\nmbarrier.test_wait.parity.shared::cta.b64 p, [%1], %2;\nselp.u32 %0, 1, 0, p;}\n"
-                       : "=r"(done) : "r"(laddr), "r"((uint32_t)load_phase));
+                       : "=r"(done) : "r"(taddr), "r"((uint32_t)tma_wait_parity[math_stage]));
         } while (!done);
       }
-      load_phase ^= 1;
-      // Sync math warps: SFB + K/Vt SMEM visible before s2r
+      tma_wait_parity[math_stage] ^= 1;
+      // Sync math warps: SFB writes + TMA data both visible
       asm volatile("bar.sync 1, 256;\n" : : : "memory");
 
-      // s2r K
-      auto sK_pi = as_position_independent_swizzle_tensor(sK_sw128);
-      Tensor tCrK = thr_mma_g1.partition_fragment_B(sK_pi);
+      // Stage-specific SMEM pointers for K and Vt
+      FP8Elem* sK_cur  = sK_base[math_stage];
+      FP8Elem* sVt_cur = sVt_base[math_stage];
+
+      // s2r K from sK[math_stage]
+      auto sK_cur_pi = as_position_independent_swizzle_tensor(
+          make_tensor(make_smem_ptr(sK_cur), SmemLayoutK_SW128{}));
+      Tensor tCrK = thr_mma_g1.partition_fragment_B(sK_cur_pi);
       {
-        auto tXsK = s2r_thr_B.partition_S(sK_pi);
+        auto tXsK = s2r_thr_B.partition_S(sK_cur_pi);
         auto tXrK = s2r_thr_B.retile_D(tCrK);
         cute::copy(s2r_copy_B, tXsK, tXrK);
       }
@@ -560,11 +639,12 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       if (params.debug_gemm1_only) {
         for (int i = 0; i < size(acc_s); ++i) acc_o(i) += acc_s(i);
         if ((tidx & 31) == 0) {
-          uint32_t maddr = static_cast<uint32_t>(__cvta_generic_to_shared(math_mbar_ptr));
+          uint32_t maddr = static_cast<uint32_t>(__cvta_generic_to_shared(math_mbar_ptr[math_stage]));
           asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" : : "r"(maddr));
         }
         if (is_jump && masking_step == n_masking_steps - 1)
           n_valid = std::min(n_valid, n_block_history);
+        math_stage ^= 1;
         continue;
       }
 
@@ -590,10 +670,10 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
           smem_sfb_ptr[i] = 0x7f7f7f7f;
       }
 
-      // P SMEM roundtrip: write rP to sPbuf (= sQ_sw128 = sK_sw128 shared buffer)
-      // bar.sync before write: ensure all warps done s2r K (so overwriting sPbuf is safe)
+      // P SMEM roundtrip: write rP to sPbuf = sK[math_stage] (K already in registers, buffer free)
+      // bar.sync before write: ensure all warps done s2r K
       asm volatile("bar.sync 1, 256;\n" : : : "memory");
-      Tensor sPbuf = make_tensor(sQ_sw128.data(), SmemLayoutQ_SW128{});
+      Tensor sPbuf = make_tensor(make_smem_ptr(sK_cur), SmemLayoutQ_SW128{});
       auto sPbuf_pi = as_position_independent_swizzle_tensor(sPbuf);
       {
         Tensor cP_id = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
@@ -613,26 +693,22 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       // bar.sync after write: P SMEM visible to all warps before s2r P
       asm volatile("bar.sync 1, 256;\n" : : : "memory");
 
-      // s2r P (GEMM2 A-operand)
+      // s2r P (GEMM2 A-operand) from sK[math_stage] (now used as P buffer)
       Tensor tCrP = thr_mma_g2.partition_fragment_A(sPbuf_pi);
       {
         auto tXsP = s2r_thr_A2.partition_S(sPbuf_pi);
         auto tXrP = s2r_thr_A2.retile_D(tCrP);
         cute::copy(s2r_copy_A2, tXsP, tXrP);
       }
-      // bar.sync: all threads done reading sPbuf (smem_q); safe to reuse smem_q for V^T K_SW128.
+      // bar.sync: all threads done reading P; safe to reuse sK[math_stage] for V^T K_SW128.
       asm volatile("bar.sync 1, 256;\n" : : : "memory");
 
-      // Cooperative SMEM transpose: V^T MN_SW128 (sVt_sw128) → K_SW128 (smem_q, now free).
-      // Root cause of GEMM2 error: partition_B with MN_SW128 gives N-first element ordering in
-      // registers, but SM120 QMMA block-scale expects K-first ordering (as established by K_SW128).
-      // Fix: re-layout V^T data in SMEM to K_SW128 so standard LDSM_N s2r gives K-first ordering.
-      // sVt_sw128 is at smem_q + kBlockN*kHeadDim (separate buffer), no overlap with smem_q. ✓
-      using SmemLayoutVt_K_SW128 = decltype(tile_to_shape(typename BS2::SmemLayoutAtomB{},
-          Shape<Int<kHeadDim>, Int<kBlockN>>{}));
+      // Cooperative SMEM transpose: Vt[math_stage] MN_SW128 → sK[math_stage] K_SW128.
+      // Root cause: partition_B with MN_SW128 gives N-first register ordering; QMMA needs K-first.
+      // Fix: copy Vt to sK[math_stage] in K_SW128 layout so standard LDSM_N gives correct ordering.
       {
-        Tensor sVt_mn = make_tensor(sVt_sw128.data(), SmemLayoutVt_SW128{});    // MN_SW128 source
-        Tensor sVt_k  = make_tensor(sQ_sw128.data(), SmemLayoutVt_K_SW128{});  // K_SW128 dest
+        Tensor sVt_mn = make_tensor(make_smem_ptr(sVt_cur), SmemLayoutVt_SW128{});
+        Tensor sVt_k  = make_tensor(make_smem_ptr(sK_cur),  SmemLayoutVt_K_SW128{});
         for (int i = tidx_math; i < kHeadDim * kBlockN; i += kNMathThreads) {
           sVt_k(i / kBlockN, i % kBlockN) = sVt_mn(i / kBlockN, i % kBlockN);
         }
@@ -640,9 +716,9 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       // bar.sync: K_SW128 V^T visible to all math warps before s2r.
       asm volatile("bar.sync 1, 256;\n" : : : "memory");
 
-      // s2r V^T (GEMM2 B-operand) from K_SW128 SMEM using standard SM75_U32x4_LDSM_N.
+      // s2r V^T (GEMM2 B-operand) from K_SW128 SMEM in sK[math_stage]
       auto sVt_k_pi = as_position_independent_swizzle_tensor(
-          make_tensor(sQ_sw128.data(), SmemLayoutVt_K_SW128{}));
+          make_tensor(make_smem_ptr(sK_cur), SmemLayoutVt_K_SW128{}));
       Tensor tCrV = thr_mma_g2.partition_fragment_B(sVt_k_pi);
       {
         auto tXsVt = s2r_thr_B2.partition_S(sVt_k_pi);
@@ -650,14 +726,15 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         cute::copy(s2r_copy_B2, tXsVt, tXrV);
       }
 
-      // Notify load warp: K+Vt SMEM no longer needed (s2r K done + s2r Vt done).
-      // smem_q[0] (sK/sPbuf) and smem_q[kSmemKBytes] (sVt) are both free for next tile.
+      // Notify load warp: sK[math_stage] and sVt[math_stage] are fully consumed (s2r done).
+      // Load warp can now overwrite this stage's SMEM with the next K+Vt tile.
+      // GEMM2 below uses only registers, so overwriting SMEM is safe.
       if ((tidx & 31) == 0) {
-        uint32_t maddr = static_cast<uint32_t>(__cvta_generic_to_shared(math_mbar_ptr));
+        uint32_t maddr = static_cast<uint32_t>(__cvta_generic_to_shared(math_mbar_ptr[math_stage]));
         asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" : : "r"(maddr));
       }
 
-      // s2r SFP and SFV (from SF SMEM, unaffected by load warp TMA for next tile)
+      // s2r SFP and SFV (from SF SMEM; load warp TMA only touches sK/sVt, not SF region)
       Tensor tCrSFP = BS2::partition_fragment_SFA(sSFA(_,_,_0{}), thr_mma_g2);
       {
         auto tXsSFP = s2r_thr_SFP.partition_S(sSFA);
@@ -673,7 +750,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       }
       auto tCrSFV_frg = BS2::transform_fragment_for_qmma(tCrSFV);
 
-      // GEMM2: acc_o += P × V^T (block-scaled)
+      // GEMM2: acc_o += P × V^T (block-scaled) — runs while load warp issues next TMA
       cute::gemm(tiled_mma_g2,
           make_zip_tensor(tCrP, tCrSFP_frg(_,_,_,_0{})),
           make_zip_tensor(tCrV, tCrSFV_frg(_,_,_,_0{})),
@@ -681,6 +758,8 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
 
       if (is_jump && masking_step == n_masking_steps - 1)
         n_valid = std::min(n_valid, n_block_history);
+
+      math_stage ^= 1;
     }
   }
 
