@@ -14,7 +14,7 @@
 - [x] **Phase 3**：数值验证通过（fp8_gt_cos ≈ 0.9996，远超 0.95 阈值）
 - [x] **Phase 4**：性能优化（K+V double-prefetch pipeline，消除迭代中途 blocking V wait）
 - [x] **Phase 5**：TMA K+V^T（消除 kernel-side 逐元素 V 转置，K 从 cp.async 升级为 TMA）
-- [ ] **Phase 6**：Warp-specialized kernel（load warp 专职 TMA，math warps 专职 MMA，producer/consumer pipeline）
+- [x] **Phase 6**：Warp-specialized kernel（load warp 专职 TMA，math warps 专职 MMA，producer/consumer pipeline）— 数值验证通过（2026-04-03）
 
 ### Phase 4 最终性能结果（RTX PRO 6000 Blackwell SM120，2026-03-27）
 
@@ -62,83 +62,98 @@ kernel-only（bs=4, h=16, d=128, full attention）：
 
 ---
 
-## Phase 6 任务：前向 Warp-Specialized Kernel（当前目标）
+## Phase 6 完成：Warp-Specialized FP8 Kernel（2026-04-03）
 
-**目标**：将 `hstu_blackwell_sm120/hstu_fwd_kernel.h` 改造为 warp-specialized 前向设计，通过 producer/consumer pipeline 实现 TMA 搬运与 MMA 计算真正重叠。**暂不实现后向。**
+**原始目标**：warp 0 专职发 TMA（K+V^T+SF），warp 1-8 专职 QMMA，TMA 与 MMA **真正重叠**。
 
-### Phase 5 现状 vs Phase 6 目标
+**当前实际状态**：warp 分工框架已建立，数值正确，但存在两处尚未优化的性能问题（见下）。
 
-**Phase 5 现状**：所有线程 spin-wait mbarrier → 全部线程一起做 MMA。TMA 与 MMA **串行**，无真正 overlap。
+### 实现内容
 
-**Phase 6 目标**：
-- **warp 0（load warp）**：专职发 TMA（K[nb]+V^T[nb]+SF[nb]），等 math warps 消费完毕后发下一个
-- **warp 1-7（math warps）**：等待 load warp 完成 TMA，执行 GEMM1+silu+GEMM2，通知 load warp 可以发下一个
-- TMA 搬运与 MMA 计算**真正 overlap**
+- **新文件** `hstu_fwd_kernel_fp8_ws.h`：WS 内核主体，由 `hstu_fwd_kernel.h` include
+- **Warp 分工**：warp 0 = load warp（288 线程总计，32 load + 256 math）
+- **三 barrier**：`tma_k_mbar`（Q/K TMA 完成）、`load_mbar`（load→math）、`math_mbar`（math→load）
+- **dispatch**：FP8 + kBlockN%128==0 + !Has_rab → WS TMA 路径；Has_rab → Phase 5 非 WS 路径
 
-### 参考文件（必读）
-- **SM100 前向参考**：`src/hstu_blackwell/hstu_fwd.py`
-  - 前向 warp 分工：`load_warp_id=9`（TMA issue）、`mma_warp_id=8`（tcgen05 MMA）、`silu0_warp_ids=(0-3)`、`silu1_warp_ids=(4-7)`，共 12 warps
-  - pipeline barrier：`load_mma_Q/K/V_mbar_ptr` 管理 TMA→MMA 同步；`mma_compute_S_mbar_ptr` 管理 MMA→silu 同步
-  - 多 stage pipeline：`kv_stage=4`（FP8）/`kv_stage=3`（BF16），`q_stage=2`
+---
 
-### SM120 与 SM100 的关键差异
+### ⚠️ 已知性能问题一：SMEM→SMEM 手动 transpose（待优化）
 
-| 特性 | SM100（参考） | SM120（目标） |
-|------|--------------|--------------|
-| Tensor Core 指令 | `tcgen05`（全 CTA 共享 TMEM） | `mma.sync`（per-warp，block-scale QMMA） |
-| MMA 调用 | 单 mma_warp 代理全 CTA | 所有 math warps 各自执行 QMMA |
-| TMA API | 相同（SM90+） | 相同 |
-| SF 处理 | 无（非 block-scale） | SFA/SFB/SFV 需随 K/V tile 预取 |
-| V transpose | TMA 预转置 GMEM layout | Phase 5 已完成 TMA 预转置 ✅ |
-
-### Phase 6 Warp 分工方案（SM120 适配）
-
-SM120 无 TMEM，mma.sync 是 per-warp 的，因此所有 math warps 都要执行 MMA：
-
+**当前 V^T 数据路径**：
 ```
-warp 0      : load warp（专职 TMA issue：K/V^T + SF）
-warp 1-7    : math warps（QMMA block-scale + silu + softmax）
-warp 8-X    : 可选 epilogue / empty warps
+GMEM V → TMA → MN_SW128 SMEM → [256线程手动transpose] → K_SW128 SMEM → LDSM_N → 寄存器
 ```
 
-**线程数**：FP8 路径维持 `BS1::kNumMathThreads=256`（8 warps），load warp 额外 +1 → 共 9 warps = 288 threads（待确认与 `SM120BlockScaledBuilder` 的兼容性）。
+**为什么需要手动 transpose**：TMA 和 LDSM_N 对 SMEM layout 的要求互相冲突：
+- TMA 要求：SMEM 内层维 = GMEM stride-1 维。GMEM 中 V^T 的 stride-1 维是 d=kHeadDim，因此 SMEM 内层必须是 kHeadDim → 只能用 **MN_SW128**
+- LDSM_N 要求：SMEM 内层维 = K-dim（kBlockN）→ 只能用 **K_SW128**
+- 两者不兼容，中间必须加一次 transpose
 
-### Phase 6 核心实现步骤
+**transpose 开销**：每次 N-block 迭代中，256 个 math warp 线程各搬 64 字节（共 16KB），加 2 次 `bar.sync 1, 256`。
 
-1. **双 barrier 设计**：
-   - `load_mbar`（load→math）：load warp 发完 TMA 后 arrive，math warps wait
-   - `math_mbar`（math→load）：math warps 消费完 SMEM 后 arrive，load warp wait
+**消除 transpose 的方案**：Python 侧将 V 改为列主序存储，strides 从 `[v_row_stride, 1]` 改为 `[1, v_col_stride]`，使 kBlockN 维成为 stride-1，则 TMA 可直接写入 K_SW128 SMEM，无需 transpose。代价是修改量化+存储 API，留待 benchmark 确认收益后再决定。
 
-2. **Load warp 职责**：
-   ```cpp
-   if (warp_idx == 0) {
-       // preamble: 发出 K[0]+V^T[0]+SF[0] TMA
-       for (nb = n_block_max-1; nb >= 0; nb--) {
-           math_mbar.wait(phase);          // 等 math warps 消费完上一 tile
-           issue_tma_kv(nb);               // 发 K[nb]+V^T[nb] TMA
-           load_mbar.arrive_and_expect_tx(...); // 通知 math warps
-       }
-   }
-   ```
+---
 
-3. **Math warp 职责**：
-   ```cpp
-   else {
-       for (nb = n_block_max-1; nb >= 0; nb--) {
-           load_mbar.wait(phase);          // 等 TMA 完成
-           // GEMM1: Q×K → acc_s
-           // silu + softmax
-           // GEMM2: P×V^T → acc_o
-           math_mbar.arrive();             // 通知 load warp 可发下一个
-       }
-   }
-   ```
+### ⚠️ 已知性能问题二：TMA 与 MMA 无实际 overlap（待优化）
 
-4. **SF prefetch 与 MMA overlap**：SFA/SFB/SFV 在上一轮 MMA 执行期间由 load warp 预取到 SMEM。
+**当前执行时序**（每次 N-block 迭代）：
+```
+load warp:   [issue TMA K+Vt] → signal load_mbar → idle ←───────────── [wait math_mbar]
+math warps:  [wait load_mbar] → [GEMM1+silu+SMEM transpose+GEMM2] → signal math_mbar
+```
 
-### 验证目标
-- 编译通过，`sweep_accuracy.py` fp8_gt_cos > 0.95
-- bench 性能显著优于 Phase 5（预期：TMA 与 MMA 真正 overlap，消除 GMEM 读延迟气泡）
+**问题**：load warp issue TMA 之后立即 idle，等 math warps 全部完成才能发下一个 tile 的 TMA。math warps 完成 GEMM1+GEMM2 之后才 signal math_mbar，此时 load warp 才开始发下一 tile 的 TMA。TMA 搬运和 MMA 计算是**完全串行**的，与 Phase 5 无本质区别。
+
+**真正 overlap 的目标时序**：
+```
+load warp:   [issue TMA tile N] → [wait math_mbar(N-1)] → [issue TMA tile N-1] → ...
+math warps:  [wait load_mbar(N)] → [GEMM tile N] → [signal math_mbar(N)] → [wait load_mbar(N-1)] → ...
+```
+即 load warp 发完 tile N 的 TMA 之后，不等 math warps，立即开始等 math_mbar(N-1) 并准备发 tile N-1。这需要至少 **2-stage double-buffer**：SMEM 中同时存两个 tile（一个供 math warps 计算，一个供 load warp 写入），两者用不同的 mbarrier phase 管理。
+
+**当前未实现 double-buffer 的原因**：SMEM 预算紧张（Q/K/Vt 各 16KB，SF 1KB，barriers 24B），再加一份 K+Vt 的 double-buffer 需要额外 32KB，超出 SM120 的 SMEM 限制（通常 ~100KB 可用）。需要评估是否可以通过减小 tile size 或复用 buffer 来实现。
+
+---
+
+### 关键调试难点记录
+
+#### 1. TMA descriptor 初始化失败
+- **原因**：`SmemLayoutVt_TMA` 用 K_SW128（kBlockN 内层），TMA dim0=kBlockN 映射到 total_k（非 stride-1）
+- **修复**：改为 MN_SW128（kHeadDim 内层），dim0=kHeadDim → d（stride-1）✓
+
+#### 2. LDSM_N 编译报错（MN_SW128 不兼容）
+- **原因**：`SM75_U32x4_LDSM_N` 要求 K-inner（K_SW128），MN_SW128 是 N-inner → static_assert 失败
+- **修复**：绕过 LDSM_N，改用手动 SMEM transpose + 标准 LDSM_N（见性能问题一）
+
+#### 3. fp8_gt_cos = 0.13~0.23（GEMM2 数值错误）
+- **原因**：`partition_B(MN_SW128 tensor)` 内部 `make_ordered_layout` 按 N-first 顺序将元素分配到寄存器槽位，而 SM120 QMMA block-scale 指令按 K-first 顺序解释寄存器（与 K_SW128 的排列一致），导致 V^T 元素放错寄存器位置
+- **修复**：s2r P 完成后 smem_q 空闲，256 个 math 线程协同将 V^T 从 MN_SW128 SMEM 转写到 K_SW128 SMEM（smem_q），再用标准 LDSM_N s2r，寄存器排列恢复正确
+
+---
+
+### 验证结果（2026-04-03）
+
+**sweep_accuracy.py**（quant_mode=2）：
+
+| D | H | SEQ | fp8_gt_cos |
+|---|---|-----|------------|
+| 128 | 1 | 128 | 0.9996 ✓ |
+| 128 | 1 | 256 | 0.9997 ✓ |
+| 128 | 1 | 512 | 0.9997 ✓ |
+| 128 | 4 | 128 | 0.9996 ✓ |
+| 128 | 4 | 256 | 0.9996 ✓ |
+| 128 | 4 | 512 | 0.9996 ✓ |
+
+**hstu_test.py 14 explicit @example cases**（quant_mode=2，seq=128/256，causal/rab/drab/local/context/target/arbitrary）：**14/14 PASS**
+
+测试脚本：`run_hstu8_examples.sh`（项目根目录）
+测试日志：`test_results/026_ws_smem_transpose_vt.log`、`test_results/027_hstu8_explicit_examples_qm2.log`
+
+### 后续优化方向
+- [ ] **benchmark**：与 Phase 5 对比，量化当前 WS 框架的实际性能差距
+- [ ] **消除 SMEM transpose**：Python 侧 V 列主序存储，TMA 直接写 K_SW128
+- [ ] **实现真正 overlap**：double-buffer SMEM，load warp 在 math warps 计算时预取下一 tile
 
 ---
 
@@ -146,12 +161,13 @@ warp 8-X    : 可选 epilogue / empty warps
 
 ### SM120 原生内核（当前主目录）
 `fbgemm_gpu/experimental/hstu/src/hstu_blackwell_sm120/`
-- `hstu_fwd_kernel.h` — 前向内核（BF16 + FP8 block-scale 路径）★核心
-- `kernel_traits.h` — BF16 + FP8 内核 traits
+- `hstu_fwd_kernel.h` — 前向内核（BF16 + FP8 非WS路径 + include WS文件）★核心
+- `hstu_fwd_kernel_fp8_ws.h` — Phase 6 WS FP8 内核主体（由 hstu_fwd_kernel.h include）★
+- `kernel_traits.h` — BF16 + FP8 内核 traits（含 SmemLayoutVt_TMA = MN_SW128）
 - `hstu_ops_gpu.cpp` — PyTorch 入口（`hstu_varlen_fwd_120`）
 - `hstu.h` — Params 结构体（含 FP8 descale 字段）
 - `utils.h` — tile 大小、类型转换、silu 辅助
-- `hstu_fwd_launch_template.h` — 启动模板
+- `hstu_fwd_launch_template.h` — 启动模板（WS dispatch 逻辑在此）
 
 ### FP8 block-scale 参考实现
 `6KD_fp8_block_scale/kernels/include/sm120_blockscaled_gemm/`

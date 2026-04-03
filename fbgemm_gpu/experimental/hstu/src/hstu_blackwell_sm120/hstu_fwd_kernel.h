@@ -1457,12 +1457,13 @@ struct Hstu_fwd_params_fp8_tma : public Hstu_fwd_params {
     TMA_Vt_t tma_vt;  // TMA descriptor for V^T: [d, total_v, h_k] (pre-transposed)
 };
 
-// Phase 6 WS TMA params: extends Hstu_fwd_params with TMA Q and K descriptors.
-// TMA_Q_t / TMA_K_t are the CuTe TMA copy atom types returned by make_tma_copy.
-template <typename TMA_Q_t, typename TMA_K_t>
+// Phase 6 WS TMA params: extends Hstu_fwd_params with TMA Q, K, and V^T descriptors.
+// TMA_Q_t / TMA_K_t / TMA_Vt_t are the CuTe TMA copy atom types returned by make_tma_copy.
+template <typename TMA_Q_t, typename TMA_K_t, typename TMA_Vt_t>
 struct Hstu_fwd_params_fp8_ws_tma : public Hstu_fwd_params {
-    TMA_Q_t tma_q;  // TMA descriptor for Q: [total_q, d, h]
-    TMA_K_t tma_k;  // TMA descriptor for K: [total_k, d, h_k]
+    TMA_Q_t  tma_q;   // TMA descriptor for Q:   [total_q, d, h]
+    TMA_K_t  tma_k;   // TMA descriptor for K:   [total_k, d, h_k]
+    TMA_Vt_t tma_vt;  // TMA descriptor for V^T: [d, total_k, h_k] (pre-transposed view)
 };
 
 namespace flash {  // reopen flash namespace for kernel
@@ -1573,19 +1574,18 @@ void run_hstu_fwd_sm120_fp8_tma_impl(Hstu_fwd_params& params, cudaStream_t strea
       cute::make_shape(cute::Int<kBlockN>{}, cute::Int<kHeadDim>{}),
       cute::_1{});
 
-  // V^T TMA descriptor: V described as [total_k, d, h_k] with strides
-  // [v_row_stride, _1{}, v_head_stride].  _1{} at position 1 triggers CuTe dim-reorder,
-  // producing correct V^T globalStrides.  Tile = [kBlockN, kHeadDim] (same as K).
+  // V^T TMA: GMEM [d, total_k, h_k] strides [1, v_row_stride, v_head_stride].
+  // Tile [kHeadDim, kBlockN]: unambiguous 1:1 dim mapping when kHeadDim==kBlockN==128.
   auto tensor_Vt_full = cute::make_tensor(
       cute::make_gmem_ptr(static_cast<FP8Elem*>(params.v_ptr)),
       cute::make_layout(
-          cute::make_shape(params.total_k, params.d, params.h_k),
-          cute::make_stride(params.v_row_stride, cute::_1{}, params.v_head_stride)));
+          cute::make_shape(params.d, params.total_k, params.h_k),
+          cute::make_stride(cute::_1{}, params.v_row_stride, params.v_head_stride)));
   auto tma_vt = cute::make_tma_copy(
       cute::SM90_TMA_LOAD{},
       tensor_Vt_full,
       SmemLayoutVt_TMA{},
-      cute::make_shape(cute::Int<kBlockN>{}, cute::Int<kHeadDim>{}),
+      cute::make_shape(cute::Int<kHeadDim>{}, cute::Int<kBlockN>{}),
       cute::_1{});
 
   using TMA_K_t  = decltype(tma_k);
@@ -1613,7 +1613,7 @@ void run_hstu_fwd_sm120_fp8_tma_impl(Hstu_fwd_params& params, cudaStream_t strea
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Phase 6 WS TMA impl: creates TMA Q and K descriptors on host, launches WS TMA kernel.
+// Phase 6 WS TMA impl: creates TMA Q, K, and V^T descriptors on host, launches WS TMA kernel.
 template <
     typename elem_type,
     int kHeadDim,
@@ -1636,8 +1636,9 @@ void run_hstu_fwd_sm120_fp8_ws_tma_impl(Hstu_fwd_params& params, cudaStream_t st
       Is_Q_in_regs, Share_Q_K_smem, cutlass::half_t>;
 
   using FP8Elem = typename Kernel_traits::Element;
-  using SmemLayoutQ_TMA = typename Kernel_traits::SmemLayoutQ_TMA;
-  using SmemLayoutK_TMA = typename Kernel_traits::SmemLayoutK_TMA;
+  using SmemLayoutQ_TMA  = typename Kernel_traits::SmemLayoutQ_TMA;
+  using SmemLayoutK_TMA  = typename Kernel_traits::SmemLayoutK_TMA;
+  using SmemLayoutVt_TMA = typename Kernel_traits::SmemLayoutVt_TMA;
 
   // Q TMA descriptor: Q described as [total_q, d, h] with strides [q_row_stride, 1, q_head_stride].
   auto tensor_Q_full = cute::make_tensor(
@@ -1652,7 +1653,7 @@ void run_hstu_fwd_sm120_fp8_ws_tma_impl(Hstu_fwd_params& params, cudaStream_t st
       cute::make_shape(cute::Int<kBlockM>{}, cute::Int<kHeadDim>{}),
       cute::_1{});
 
-  // K TMA descriptor: same as Phase 5.
+  // K TMA descriptor: K described as [total_k, d, h_k] with strides [k_row_stride, 1, k_head_stride].
   auto tensor_K_full = cute::make_tensor(
       cute::make_gmem_ptr(static_cast<FP8Elem*>(params.k_ptr)),
       cute::make_layout(
@@ -1665,18 +1666,36 @@ void run_hstu_fwd_sm120_fp8_ws_tma_impl(Hstu_fwd_params& params, cudaStream_t st
       cute::make_shape(cute::Int<kBlockN>{}, cute::Int<kHeadDim>{}),
       cute::_1{});
 
-  using TMA_Q_t = decltype(tma_q);
-  using TMA_K_t = decltype(tma_k);
+  // V^T TMA: GMEM described as [d, total_k, h_k] strides [1, v_row_stride, v_head_stride].
+  // Tile = [kHeadDim, kBlockN]: dim 0 = d (kHeadDim), dim 1 = k (kBlockN).
+  // Unambiguous 1:1 dim mapping even when kHeadDim == kBlockN == 128.
+  // SmemLayoutVt_TMA uses MN_SW128 → kHeadDim (d, stride-1 in GMEM) is SMEM inner axis.
+  auto tensor_Vt_full = cute::make_tensor(
+      cute::make_gmem_ptr(static_cast<FP8Elem*>(params.v_ptr)),
+      cute::make_layout(
+          cute::make_shape(params.d, params.total_k, params.h_k),
+          cute::make_stride(cute::_1{}, params.v_row_stride, params.v_head_stride)));
+  auto tma_vt = cute::make_tma_copy(
+      cute::SM90_TMA_LOAD{},
+      tensor_Vt_full,
+      SmemLayoutVt_TMA{},
+      cute::make_shape(cute::Int<kHeadDim>{}, cute::Int<kBlockN>{}),
+      cute::_1{});
 
-  Hstu_fwd_params_fp8_ws_tma<TMA_Q_t, TMA_K_t> tma_params;
+  using TMA_Q_t  = decltype(tma_q);
+  using TMA_K_t  = decltype(tma_k);
+  using TMA_Vt_t = decltype(tma_vt);
+
+  Hstu_fwd_params_fp8_ws_tma<TMA_Q_t, TMA_K_t, TMA_Vt_t> tma_params;
   static_cast<Hstu_fwd_params&>(tma_params) = params;
-  tma_params.tma_q = tma_q;
-  tma_params.tma_k = tma_k;
+  tma_params.tma_q  = tma_q;
+  tma_params.tma_k  = tma_k;
+  tma_params.tma_vt = tma_vt;
 
   size_t smem_size = Kernel_traits::kSmemSize;
   const int num_m_block = (params.seqlen_q + kBlockM - 1) / kBlockM;
   dim3 grid = dim3(num_m_block, params.h, params.b);
-  auto kernel = &flash::hstu_fwd_kernel_sm120_fp8_ws_tma<Kernel_traits, TMA_Q_t, TMA_K_t>;
+  auto kernel = &flash::hstu_fwd_kernel_sm120_fp8_ws_tma<Kernel_traits, TMA_Q_t, TMA_K_t, TMA_Vt_t>;
 
   if (smem_size >= 48 * 1024) {
     C10_CUDA_CHECK(cudaFuncSetAttribute(

@@ -328,7 +328,11 @@ struct Hstu_fwd_kernel_traits_sm120_fp8 {
   using SmemLayoutAtomSW128 = GMMA::Layout_K_SW128_Atom<Element>;  // 8-row × 128-FP8 atom
   using SmemLayoutQ_TMA  = decltype(tile_to_shape(SmemLayoutAtomSW128{}, Shape<Int<kBlockM>, Int<kHeadDim>>{}));
   using SmemLayoutK_TMA  = decltype(tile_to_shape(SmemLayoutAtomSW128{}, Shape<Int<kBlockN>, Int<kHeadDim>>{}));
-  using SmemLayoutVt_TMA = decltype(tile_to_shape(SmemLayoutAtomSW128{}, Shape<Int<kHeadDim>, Int<kBlockN>>{}));
+  // V^T [kHeadDim, kBlockN] in SMEM, loaded via TMA from GMEM [d, total_k] (stride-1 on d=kHeadDim axis).
+  // TMA requires SMEM inner dimension → GMEM stride-1 dimension.
+  // V^T: N=kHeadDim (d, stride 1) is fast → use MN_SW128 (N/kHeadDim inner) so TMA dim0=kHeadDim→d (stride=1). ✓
+  // LDSM_N (K inner) cannot be used with MN_SW128; use partition_B + cute::copy (element-by-element) instead.
+  using SmemLayoutVt_TMA = decltype(tile_to_shape(GMMA::Layout_MN_SW128_Atom<Element>{}, Shape<Int<kHeadDim>, Int<kBlockN>>{}));
 
   // Output layout: BF16 written to sO (reuses smem_ base), then copied to GMEM.
   // SM120 QMMA output uses PermMmaTileN = Layout<_8,_4,_4>, Stride<_1,_32,_8>, which
