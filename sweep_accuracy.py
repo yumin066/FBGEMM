@@ -231,7 +231,9 @@ for D in [128]:  # D=64 disabled in this build (HSTU_DISABLE_HDIM64=TRUE)
                     v_raw, cu, block_size=128, fp8_type=torch.float8_e4m3fn)
                 sf_q = pack_descale_to_e8m0x4_int32(q_descale)
                 sf_k = pack_descale_to_e8m0x4_int32(k_descale)
-                sf_v = pack_descale_to_e8m0x4_int32(v_descale)
+                # TMA SFV requires sf_v expanded from [H, total_blocks] to [H, total_tokens]
+                # so that each block's scale repeats kBlockN times (one copy per token).
+                sf_v = pack_descale_to_e8m0x4_int32(v_descale).repeat_interleave(128, dim=1)
                 # q_descale/k_descale: [H, SEQ]  (per-token, D-direction quant)
                 # v_descale:           [H, SEQ//128]  (per-tile, N-direction quant)
                 # cu_kv_blk: K's per-token cu_seqlens (offset in tokens)

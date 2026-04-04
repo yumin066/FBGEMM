@@ -516,8 +516,9 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
   // Override kSmemSize: WS data (padded to 128B for TMA alignment) + SF + 4 mbarriers.
   // TMA destination SMEM address must be 128-byte aligned.
   static constexpr int kSmemWsDataSizePadded = ((kSmemWsFuncEnd + 127) / 128) * 128;
-  // WS SF SMEM: SFA(512B) + SFB[0](512B) + SFB[1](512B) = 1536B. Double-buffered SFB for TMA.
-  static constexpr int kSmemWsSFSize = Base::kSmemSFSize + Base::kBlockN * (int)sizeof(int32_t);
+  // WS SF SMEM: SFA(512B) + SFB[0](512B) + SFB[1](512B) + SFV[0](512B) + SFV[1](512B) = 2560B.
+  // SFB and SFV are both double-buffered, each loaded by TMA in load warp.
+  static constexpr int kSmemWsSFSize = Base::kSmemSFSize + 3 * Base::kBlockN * (int)sizeof(int32_t);
   static constexpr int kSmemSize = kSmemWsDataSizePadded + kSmemWsSFSize + kSmemMbarSize;
 
   // Invariant checks

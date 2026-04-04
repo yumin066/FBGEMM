@@ -338,7 +338,10 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
                     v, cu_seqlens_k, block_size=bn, fp8_type=torch.float8_e4m3fn)
                 sf_q_packed = pack_descale_to_e8m0x4_int32(q_descale)
                 sf_k_packed = pack_descale_to_e8m0x4_int32(k_descale)
-                sf_v_packed = pack_descale_to_e8m0x4_int32(v_descale)
+                # v_descale has shape [H, total_blocks]; expand to [H, total_tokens] so
+                # sf_v_packed has the same layout as sf_k_packed and TMA SFV can use
+                # identical kBlockN-element tiles indexed by nb_abs (same as SFB).
+                sf_v_packed = pack_descale_to_e8m0x4_int32(v_descale).repeat_interleave(bn, dim=1)
                 if _hstu_debug_enabled():
                     print(
                         f"[HSTU_DEBUG] quant_mode=2 bm={bm} bn={bn} "

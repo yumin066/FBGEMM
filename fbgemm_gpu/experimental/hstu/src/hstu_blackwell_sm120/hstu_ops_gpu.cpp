@@ -491,6 +491,9 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_120(
     }
     if (sf_v_packed.has_value()) {
       params.sf_v_packed_ptr = static_cast<int32_t*>(sf_v_packed.value().data_ptr());
+      if (sf_v_packed.value().dim() >= 2) {
+        params.v_block_descale_head_stride = sf_v_packed.value().size(1);
+      }
     }
   }
 

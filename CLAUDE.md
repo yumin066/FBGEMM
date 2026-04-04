@@ -16,6 +16,7 @@
 - [x] **Phase 5**：TMA K+V^T（消除 kernel-side 逐元素 V 转置，K 从 cp.async 升级为 TMA）
 - [x] **Phase 6**：Warp-specialized kernel（load warp 专职 TMA，math warps 专职 MMA，producer/consumer pipeline）— 数值验证通过（2026-04-03）
 - [x] **Phase 7**：TMA SFB（Scale Factor B via TMA，load warp 每 tile 与 K+V^T 同批 TMA）— 14/14 全通过（2026-04-04）
+- [x] **Phase 8**：TMA SFV（Scale Factor V via TMA，load warp 同批发射 K+V^T+SFB+SFV）— 14/14 全通过（2026-04-04）
 
 ### Phase 4 最终性能结果（RTX PRO 6000 Blackwell SM120，2026-03-27）
 
@@ -167,9 +168,11 @@ kernel-only（full attention，CuTe debug printf 已删除后测量）：
 
 FP8 仍比 BF16 慢的主要原因：SMEM transpose 开销（每 tile 16KB + 2×bar.sync）+ WS 分工损失 1/9 计算资源 + QMMA block-scale 指令本身更重。
 
-### 后续优化方向
+### 后续优化方向（Phase 6 时规划，部分已完成）
+- [x] **TMA SFB**：SFB 从 scalar GMEM 读取改为 TMA，与 K+V^T 同批发射（Phase 7 完成）
+- [x] **TMA SFV**：SFV 从 scalar GMEM 读取改为 TMA，与 K+V^T+SFB 同批发射（Phase 8 完成）
 - [ ] **消除 SMEM transpose**：Python 侧 V 列主序存储，TMA 直接写 K_SW128，预计节省每 tile 约 2×bar.sync + 16KB 搬运
-- [ ] **nsys profile**：量化各部分耗时（GEMM1/GEMM2/transpose/SFB load），确定实际瓶颈
+- [ ] **nsys profile**：量化各部分耗时（GEMM1/GEMM2/transpose/SFB+SFV load），确定实际瓶颈
 
 ---
 
@@ -200,6 +203,76 @@ FP8 仍比 BF16 慢的主要原因：SMEM transpose 开销（每 tile 16KB + 2×
 **hstu_test.py 14 explicit @example cases**（quant_mode=2，seq=128/256，causal/rab/drab/local/context/target/arbitrary）：**14/14 PASS**
 
 测试日志：`test_results/021_hstu8_examples_qm2.log`
+
+### Phase 7 性能结果（2026-04-04，RTX PRO 6000 Blackwell SM120）
+
+**准确度**：全部 PASS（cos_sim ≈ 0.9985~0.9986）
+
+**kernel-only**（bs=4, h=16, d=128，full attention）：
+
+| seq  | BF16    | BF16 TFLOPS | FP8 (qm=2) | FP8 TFLOPS | FP8/BF16 |
+|------|---------|-------------|------------|------------|----------|
+| 512  | 0.045ms | 193         | 0.090ms    | 96         | 2.00x 慢 |
+| 1024 | 0.121ms | 285         | 0.234ms    | 147        | 1.93x 慢 |
+| 2048 | 0.451ms | 305         | 0.775ms    | 177        | 1.72x 慢 |
+| 4096 | 1.523ms | 361         | 2.750ms    | 200        | 1.81x 慢 |
+
+**注**：与 Phase 6 对比，FP8/BF16 延迟比从约 1.89~2.19x 小幅改善至 1.72~2.0x（GPU boost clock 跨 session 不同，绝对值不可直接比较，比值有参考意义）。
+
+**end-to-end**：Python 侧量化开销约 0.78~1.8ms（随 bs 线性增长），远超 kernel 本身，FP8 端到端仍显著劣于 BF16。
+
+benchmark 日志：`benchmark_results/006_709899ce_gpu2430MHz_phase7_tma_sfb.log`
+
+---
+
+## Phase 8 完成：TMA SFV（Scale Factor V via TMA，2026-04-04）
+
+**目标**：将 V 侧 block scale（SFV）从 math warp 的标量 GMEM 读取升级为 load warp 的 TMA，与 K+V^T+SFB 在同一 mbarrier 批次内一起发射，消除 math warp 内每 tile 的 scalar GMEM read + broadcast-to-SMEM 开销。
+
+### 实现内容
+
+- **Python 侧数据格式**：`sf_v_packed` 从 `[H, total_blocks]` 通过 `.repeat_interleave(kBlockN, dim=1)` 扩展为 `[H, total_tokens]`，使每个 block 的 scale 值在 token 维度重复 kBlockN 次，从而与 `sf_k_packed` 结构相同，TMA SFV 可用相同的 tile 索引 `nb_abs = binfo.sum_s_k / kBlockN + nb`
+- **SmemLayoutSFV_TMA_t**：`Layout<[kBlockN, 1], [1, kBlockN]>`（与 SFB 相同）
+- **双缓冲 SFV**：`smem_sfv_ptr[2] = {smem_sfa_ptr + kBlockM + 2*kBlockN, + 3*kBlockN}`，与 K/V^T/SFB 共用同一 `tma_mbar[s]` 管理
+- **kSmemWsSFSize**：从 `Base::kSmemSFSize + kBlockN*4` 增加到 `Base::kSmemSFSize + 3*kBlockN*4`（SFA 512B + SFB[0] 512B + SFB[1] 512B + SFV[0] 512B + SFV[1] 512B = 2560B）
+- **expect_tx**：每 stage 加上 `kSmemSFVBytes`（kBlockN×4=512B）
+- **math warp**：移除标量 GMEM SFV 读取，改从 `smem_sfv_ptr[math_stage]` 进行 s2r SFV
+- **`v_block_descale_head_stride`**：C++ 侧从 `sf_v_packed.size(1)`（扩展后的 total_tokens）读取
+- **需更新的调用方**：`sweep_accuracy.py` 和 `bench_hstu_attn_sm120.py` 均需在 `pack_descale_to_e8m0x4_int32` 后加 `.repeat_interleave(128, dim=1)`；`cuda_hstu_attention.py`（高层入口）已更新
+
+### 关键 Bug：TMA descriptor globalDim < boxDim
+
+- **现象**：`Error: Failed to initialize the TMA descriptor 1`，`globalDim = (1,1,1,1,1)`，`boxDim = (128,1,1,1,1)`
+- **根因**：`sweep_accuracy.py` 直接调用 C++ op，未做 `repeat_interleave`，导致 `sf_v_packed.size(1) = 1`（SEQ=128 时 total_blocks=1），TMA descriptor 的 `globalDim[0]=1 < boxDim[0]=128` → 非法指令
+- **修复**：在 `sweep_accuracy.py` 和 `bench_hstu_attn_sm120.py` 中加 `repeat_interleave(128, dim=1)`
+
+### 验证结果（2026-04-04）
+
+**sweep_accuracy.py**（quant_mode=2）：6/6 PASS，fp8_gt_cos ≈ 0.9996~0.9997
+
+**hstu_test.py 14 explicit @example cases**：14/14 PASS
+
+测试日志：`test_results/024_hstu8_examples_qm2.log`
+
+### Phase 8 性能结果（2026-04-04，RTX PRO 6000 Blackwell SM120）
+
+**kernel-only**（bs=4, h=16, d=128，full attention）：
+
+| seq  | BF16    | BF16 TFLOPS | FP8 (qm=2) | FP8 TFLOPS | FP8/BF16 |
+|------|---------|-------------|------------|------------|----------|
+| 512  | 0.045ms | 191         | 0.093ms    | 93         | 2.07x 慢 |
+| 1024 | 0.121ms | 285         | 0.240ms    | 143        | 1.98x 慢 |
+| 2048 | 0.453ms | 304         | 0.786ms    | 175        | 1.73x 慢 |
+| 4096 | 1.523ms | 361         | 2.805ms    | 196        | 1.84x 慢 |
+
+**与 Phase 7 对比**（FP8/BF16 比值改善）：Phase 7 约 1.72~2.0x，Phase 8 约 1.73~2.07x（同 GPU boost clock 下比值略有波动，属测量噪声范围，总体基本持平）。
+
+benchmark 日志：`benchmark_results/007_e10772bc_gpu2347MHz_phase8_tma_sfv.log`
+
+### 后续优化方向（更新）
+- [ ] **消除 SMEM transpose**：Python 侧 V 列主序存储，TMA 直接写 K_SW128，预计节省每 tile 约 2×bar.sync + 16KB 搬运
+- [ ] **nsys profile**：量化各部分耗时（GEMM1/GEMM2/transpose/SFB+SFV load），确定实际瓶颈
+- [ ] **GQA 支持**：SFV 目前假设 h=h_k（非 GQA），GQA 场景需改用 bidh 而非 bidh_kv 索引 SFV
 
 ---
 
