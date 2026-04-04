@@ -15,6 +15,7 @@
 - [x] **Phase 4**：性能优化（K+V double-prefetch pipeline，消除迭代中途 blocking V wait）
 - [x] **Phase 5**：TMA K+V^T（消除 kernel-side 逐元素 V 转置，K 从 cp.async 升级为 TMA）
 - [x] **Phase 6**：Warp-specialized kernel（load warp 专职 TMA，math warps 专职 MMA，producer/consumer pipeline）— 数值验证通过（2026-04-03）
+- [x] **Phase 7**：TMA SFB（Scale Factor B via TMA，load warp 每 tile 与 K+V^T 同批 TMA）— 14/14 全通过（2026-04-04）
 
 ### Phase 4 最终性能结果（RTX PRO 6000 Blackwell SM120，2026-03-27）
 
@@ -125,6 +126,12 @@ GMEM V → TMA → MN_SW128 SMEM → [256线程手动transpose] → K_SW128 SMEM
 - **原因**：`partition_B(MN_SW128 tensor)` 内部 `make_ordered_layout` 按 N-first 顺序将元素分配到寄存器槽位，而 SM120 QMMA block-scale 指令按 K-first 顺序解释寄存器（与 K_SW128 的排列一致），导致 V^T 元素放错寄存器位置
 - **修复**：s2r P 完成后 smem_q 空闲，256 个 math 线程协同将 V^T 从 MN_SW128 SMEM 转写到 K_SW128 SMEM（smem_q），再用标准 LDSM_N s2r，寄存器排列恢复正确
 
+#### 4. Is_arbitrary=true 时 CUDA misaligned address（Phase 7 TMA SFB）
+- **现象**：Is_arbitrary=false（cases 1-6）正常，Is_arbitrary=true（case 7，seq=128 arbitrary masking）在 TMA SFA copy 处崩溃
+- **根因**：`kSmemWsDataSizePadded` 仅填充到 8B 对齐。Is_arbitrary=true 时 `kSmemWsFuncEnd=67604`，填充到 8B 得 67608，但 `67608 mod 16 = 8`，不满足 TMA 要求的 128B 目标地址对齐。Is_arbitrary=false 时 `kSmemWsFuncEnd=65536`（已 128B 对齐）故不触发
+- **修复**：`kernel_traits.h` 将 `((kSmemWsFuncEnd + 7) / 8) * 8` 改为 `((kSmemWsFuncEnd + 127) / 128) * 128`
+- **定位**：compute-sanitizer memcheck 在 `hstu_fwd_kernel_fp8_ws.h:344` 精确报告 "Misaligned shared or local address"
+
 ---
 
 ### 验证结果（2026-04-03）
@@ -143,7 +150,7 @@ GMEM V → TMA → MN_SW128 SMEM → [256线程手动transpose] → K_SW128 SMEM
 **hstu_test.py 14 explicit @example cases**（quant_mode=2，seq=128/256，causal/rab/drab/local/context/target/arbitrary）：**14/14 PASS**
 
 测试脚本：`run_hstu8_examples.sh`（项目根目录）
-测试日志：`test_results/011_ws_phase6_final.log`
+测试日志：`test_results/011_ws_phase6_final.log`（Phase 6），`test_results/021_hstu8_examples_qm2.log`（Phase 7）
 
 ### Phase 6 性能结果（2026-04-03，RTX PRO 6000 Blackwell SM120，bs=4, h=16, d=128）
 
@@ -163,6 +170,36 @@ FP8 仍比 BF16 慢的主要原因：SMEM transpose 开销（每 tile 16KB + 2×
 ### 后续优化方向
 - [ ] **消除 SMEM transpose**：Python 侧 V 列主序存储，TMA 直接写 K_SW128，预计节省每 tile 约 2×bar.sync + 16KB 搬运
 - [ ] **nsys profile**：量化各部分耗时（GEMM1/GEMM2/transpose/SFB load），确定实际瓶颈
+
+---
+
+## Phase 7 完成：TMA SFB（Scale Factor B via TMA，2026-04-04）
+
+**目标**：将 K 侧 block scale（SFB）从 GMEM 标量加载升级为 TMA，与 K+V^T TMA 在同一 mbarrier 批次内一起发射，消除逐元素 GMEM 读取开销。
+
+### 实现内容
+
+- **SmemLayoutSFB_TMA_t**：`Layout<[kBlockN, 1], [1, kBlockN]>`，对应 `kBlockN` 个 int32（128×4=512 字节）
+- **TMA 描述符**：`sf_k_packed [H, SEQ]` 以 `[kv_block_descale_head_stride, 1, h_k]` 展开，tile `[kBlockN, 1]`，单 int32 swizzle
+- **双缓冲 SFB**：`smem_sfb_ptr[2]`，与 K/V^T 共用同一 `tma_mbar[s]` 管理；load warp preamble 预发两个 tile，主循环轮转
+- **expect_tx**：每 stage 的 `expect_tx` 加上 `kSmemSFBBytes`（128×4=512），mbarrier 计数正确
+
+### 关键 Bug 修复：SMEM 128B 对齐（Is_arbitrary=true 崩溃）
+
+- **现象**：Is_arbitrary=false（cases 1-6）正常，Is_arbitrary=true（case 7）出现 `CUDA error: misaligned address`
+- **根因**：`kSmemWsDataSizePadded = ((kSmemWsFuncEnd + 7) / 8) * 8`，对 Is_arbitrary=true：
+  - `kSmemWsFuncEnd = 65536 + 2048 + 20 = 67604`
+  - 填充到 8B → `67608`
+  - `67608 mod 16 = 8` → **TMA 要求目标 SMEM 地址 128B 对齐，67608 不满足**
+  - Is_arbitrary=false 时 `kSmemWsFuncEnd = 65536`（已 128B 对齐），所以不触发
+- **修复**：`kernel_traits.h` 中将填充改为 128B：`((kSmemWsFuncEnd + 127) / 128) * 128`
+- **定位方式**：compute-sanitizer memcheck，在 `hstu_fwd_kernel_fp8_ws.h:344` 处精确报告 misaligned shared address
+
+### 验证结果（2026-04-04）
+
+**hstu_test.py 14 explicit @example cases**（quant_mode=2，seq=128/256，causal/rab/drab/local/context/target/arbitrary）：**14/14 PASS**
+
+测试日志：`test_results/021_hstu8_examples_qm2.log`
 
 ---
 

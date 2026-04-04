@@ -504,7 +504,7 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
   //   [0 .. kSmemWsKVTotalBytes)          : K[0], Vt[0], K[1], Vt[1]
   //   [kSmemWsKVTotalBytes .. +ValidBl)   : ValidBlockIds (Is_arbitrary only)
   //   [.. + func region)                  : func arrays (Is_arbitrary only)
-  //   [padded to 8B)                      : SFA + SFB  (kSmemSFSize = 1024 bytes)
+  //   [padded to 8B)                      : SFA(512B) + SFB(512B) = 1024B
   //   [last kSmemMbarSize bytes)          : 4 mbarriers × 8B
   static constexpr int kSmemWsValidBlockIdsOffset = kSmemWsKVTotalBytes;
   static constexpr int kSmemWsFuncOffset = kSmemWsValidBlockIdsOffset +
@@ -513,10 +513,12 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
   static constexpr int kSmemWsFuncEnd = kSmemWsFuncOffset +
       (Is_arbitrary_ ? (int)((Base::kNFunc/2 + 1 + Base::kNFunc/2 + 1 + 1) * (int)sizeof(int)) : 0);
 
-  // Override kSmemSize: WS data (padded to 8B) + SF + 4 mbarriers.
-  // Pad data to 8 bytes so mbarrier addresses are properly aligned.
-  static constexpr int kSmemWsDataSizePadded = ((kSmemWsFuncEnd + 7) / 8) * 8;
-  static constexpr int kSmemSize = kSmemWsDataSizePadded + Base::kSmemSFSize + kSmemMbarSize;
+  // Override kSmemSize: WS data (padded to 128B for TMA alignment) + SF + 4 mbarriers.
+  // TMA destination SMEM address must be 128-byte aligned.
+  static constexpr int kSmemWsDataSizePadded = ((kSmemWsFuncEnd + 127) / 128) * 128;
+  // WS SF SMEM: SFA(512B) + SFB[0](512B) + SFB[1](512B) = 1536B. Double-buffered SFB for TMA.
+  static constexpr int kSmemWsSFSize = Base::kSmemSFSize + Base::kBlockN * (int)sizeof(int32_t);
+  static constexpr int kSmemSize = kSmemWsDataSizePadded + kSmemWsSFSize + kSmemMbarSize;
 
   // Invariant checks
   static_assert(kNMathWarps * 16 == Base::kBlockM,

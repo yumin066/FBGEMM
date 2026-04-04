@@ -477,9 +477,17 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_120(
     }
     if (sf_q_packed.has_value()) {
       params.sf_q_packed_ptr = static_cast<int32_t*>(sf_q_packed.value().data_ptr());
+      // For TMA: use sf_q_packed.size(1) as head stride (PyTorch sets stride(0)=1 for H=1,
+      // which would make TMA globalDim[0]=1 < boxDim=kBlockM → fail).
+      if (sf_q_packed.value().dim() >= 2) {
+        params.q_block_descale_head_stride = sf_q_packed.value().size(1);
+      }
     }
     if (sf_k_packed.has_value()) {
       params.sf_k_packed_ptr = static_cast<int32_t*>(sf_k_packed.value().data_ptr());
+      if (sf_k_packed.value().dim() >= 2) {
+        params.kv_block_descale_head_stride = sf_k_packed.value().size(1);
+      }
     }
     if (sf_v_packed.has_value()) {
       params.sf_v_packed_ptr = static_cast<int32_t*>(sf_v_packed.value().data_ptr());
