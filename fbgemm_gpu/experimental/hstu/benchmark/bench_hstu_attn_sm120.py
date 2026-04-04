@@ -518,7 +518,7 @@ def parse_args():
         metavar="BS",
     )
     parser.add_argument(
-        "--seqlens", type=int, nargs="+", default=[256, 512, 1024, 2048, 4096],
+        "--seqlens", type=int, nargs="+", default=[128, 256, 512, 1024, 2048, 4096],
         metavar="S",
     )
     parser.add_argument(

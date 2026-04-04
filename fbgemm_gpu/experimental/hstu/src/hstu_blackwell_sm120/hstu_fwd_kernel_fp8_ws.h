@@ -613,6 +613,10 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     int tma_wait_parity[2] = {1, 0};
     int math_stage = 0;  // starts with stage 0 (preamble loaded tile N-1 there)
 
+    // SFA (unit scale for P) is constant across all N-block tiles — initialize once.
+    for (int i = tidx_math; i < kBlockM; i += kNMathThreads)
+      smem_sfa_ptr[i] = 0x7f7f7f7f;
+
     for (int n_valid = n_block_max - 1, masking_step = 0; n_valid >= n_block_min;
          ++masking_step, --n_valid) {
       const int nb = Is_arbitrary ? int(sValidBlockIds[n_valid]) : n_valid;
@@ -685,11 +689,6 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       // Convert acc_s → FP8 rP
       Tensor rP = make_tensor_like<FP8Elem>(acc_s);
       flash::convert_type_safe(acc_s, rP);
-
-      // Write SFP (unit) into SF SMEM (before P SMEM roundtrip).
-      // SFV is already in smem_sfv_ptr[math_stage] via TMA — no scalar GMEM read needed.
-      for (int i = tidx_math; i < kBlockM; i += kNMathThreads)
-        smem_sfa_ptr[i] = 0x7f7f7f7f;
 
       // P SMEM roundtrip: write rP to sPbuf = sK[math_stage] (K already in registers, buffer free)
       // bar.sync before write: ensure all warps done s2r K

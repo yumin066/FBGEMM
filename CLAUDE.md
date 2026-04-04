@@ -356,11 +356,34 @@ HSTU_SWEEP_FP8_QUANT_MODE=2 python /home/scratch.minyu_gpu/project/shopee/fbgemm
 
 **文件命名规范**：所有 benchmark 产物（bench log、nsys trace、stats log）统一存放在 `benchmark_results/` 目录，文件名格式与 `test_results/` 相同：`NNN_<内容简述>.<ext>`，NNN 为三位数字顺序编号。
 
+**Log 文件名必须包含 commit id 和 GPU 频率**，格式：`NNN_<commit_short>_gpu<MHz>MHz_<描述>.log`，例如 `009_ab6f6a3c_gpu2407MHz_phase9_col_major_v.log`。
+
+### 前置：锁定 GPU 频率
+
+跑 benchmark 前必须锁频，保证结果可复现、跨 session 可比较。
+
+```bash
+# 查询当前最大可用 graphics clock
+nvidia-smi -q -d SUPPORTED_CLOCKS | grep "Graphics" | head -3
+
+# 锁定（需要 sudo 或 persistence mode 已开启）
+sudo nvidia-smi -lgc 2407   # 2407 = RTX PRO 6000 Blackwell 的最大 boost clock
+
+# 验证锁频是否生效
+nvidia-smi --query-gpu=clocks.current.graphics,clocks.max.graphics \
+  --format=csv,noheader,nounits
+
+# 跑完后解锁
+sudo nvidia-smi -rgc
+```
+
 ### 步骤 1：运行 benchmark
 ```bash
 REPO=/home/scratch.minyu_gpu/project/shopee/fbgemm-hstu
+COMMIT=$(git -C ${REPO} rev-parse --short HEAD)
+CLOCK=$(nvidia-smi --query-gpu=clocks.current.graphics --format=csv,noheader,nounits | head -1 | tr -d ' ')
 python ${REPO}/fbgemm_gpu/experimental/hstu/benchmark/bench_hstu_attn_sm120.py \
-  2>&1 | tee ${REPO}/benchmark_results/NNN_bench.log
+  2>&1 | tee ${REPO}/benchmark_results/NNN_${COMMIT}_gpu${CLOCK}MHz_<描述>.log
 ```
 
 ### 步骤 2：nsys profile 抓取 trace
