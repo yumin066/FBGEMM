@@ -19,10 +19,10 @@ __device__ inline void wait_mbar_parity(uint64_t* mbar, uint32_t parity) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Phase 6: warp-specialized FP8 compute function — Q, K, V^T all via TMA.
-// Warp 0 (threads 0-31):   load warp — Q TMA preamble (thread 0), then K+Vt TMA per iter (thread 0).
-// Warps 1-8 (threads 32-287): math warps — QMMA block-scale GEMM1+silu+GEMM2.
-// Three mbarriers: tma_k_mbar (TMA Q/K/Vt completion), load_mbar (K+Vt→math), math_mbar (math→load).
-// SMEM: [Q/K/Vt/ValidBlockIds/...][SFA(512B)][SFB(512B)][tma_k_mbar(8B)][load_mbar(8B)][math_mbar(8B)]
+// Warps 0-7 (threads 0-255):  math warps — QMMA block-scale GEMM1+silu+GEMM2.
+// Warp 8 (threads 256-287): load warp — Q TMA preamble (thread 256), then K+Vt TMA per iter (thread 256).
+// Four mbarriers: tma_mbar[0,1] (TMA K/Vt/SFB/SFV completion), math_mbar[0,1] (SMEM consumed signal).
+// SMEM: [Q/K/Vt/ValidBlockIds/...][SFA(512B)][SFB×2(1024B)][SFV×2(1024B)][mbar×4(32B)]
 template <typename Kernel_traits, typename Params>
 inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     const Params& params,
@@ -42,11 +42,11 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
   extern __shared__ char smem_[];
 
   const int tidx = threadIdx.x;
-  // Warp 0 = load warp (threads 0-31); warps 1-8 = math warps (threads 32-287).
-  const bool is_load_warp = (tidx < 32);
-  // Math warp thread index in [0,255]; load warp slot 0 is unused for compute.
-  const int tidx_math = is_load_warp ? 0 : (tidx - 32);
+  // Warps 0-7 = math warps (threads 0-255); warp 8 = load warp (threads 256-287).
   constexpr int kNMathThreads = Kernel_traits::kNMathThreads;  // 256
+  const bool is_load_warp = (tidx >= kNMathThreads);
+  // Math warp thread index in [0,255]; load warp uses 0 (unused for compute).
+  const int tidx_math = is_load_warp ? 0 : tidx;
 
   constexpr bool Is_causal   = Kernel_traits::Is_causal;
   constexpr bool Is_target   = Kernel_traits::Is_target;
@@ -260,11 +260,11 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       reinterpret_cast<uint64_t*>(smem_ + kSmemMbar0Offset + 24)
   };
 
-  // Thread 0 inits all 4 barriers.
-  //   tma_mbar[0], tma_mbar[1]: count=1 (thread 0 will arrive.expect_tx each time)
+  // Load warp thread 0 (tidx==kNMathThreads) inits all 4 barriers.
+  //   tma_mbar[0], tma_mbar[1]: count=1 (load warp will arrive.expect_tx each time)
   //   math_mbar[0], math_mbar[1]: count=8 (one arrive per math warp leader)
   // Pre-satisfy both math_mbar[0] and math_mbar[1] so load warp starts immediately.
-  if (tidx == 0) {
+  if (tidx == kNMathThreads) {
     uint32_t tm0 = static_cast<uint32_t>(__cvta_generic_to_shared(tma_mbar_ptr[0]));
     uint32_t tm1 = static_cast<uint32_t>(__cvta_generic_to_shared(tma_mbar_ptr[1]));
     uint32_t mm0 = static_cast<uint32_t>(__cvta_generic_to_shared(math_mbar_ptr[0]));
@@ -324,7 +324,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     using SmemLayoutSFA_TMA_t = cute::Layout<cute::Shape<cute::Int<kBlockM>, cute::Int<1>>,
                                              cute::Stride<cute::_1, cute::Int<kBlockM>>>;
     const int m_abs = binfo.sum_s_q / kBlockM + m_block;
-    if (tidx == 0) {
+    if (tidx == kNMathThreads) {
       // Q TMA
       auto mQ_tma   = params.tma_q.get_tma_tensor(make_shape(params.total_q, params.d, params.h));
       auto gQ_head  = mQ_tma(_, _, bidh);
@@ -537,8 +537,8 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     }
     math_wait_parity[0] ^= 1;
 
-    // Thread 0: issue K+Vt TMA for tile n_block_max-1 into stage 0 (tma_mbar[0])
-    if (tidx == 0) {
+    // Thread 256: issue K+Vt TMA for tile n_block_max-1 into stage 0 (tma_mbar[0])
+    if (tidx == kNMathThreads) {
       const int nb0 = Is_arbitrary ? int(sValidBlockIds[n_block_max - 1]) : (n_block_max - 1);
       const int nb_abs0 = binfo.sum_s_k / kBlockN + nb0;
       uint32_t taddr0 = static_cast<uint32_t>(__cvta_generic_to_shared(tma_mbar_ptr[0]));
@@ -577,8 +577,8 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       }
       math_wait_parity[load_stage] ^= 1;
 
-      // Thread 0: issue K+Vt TMA for this tile into load_stage — do NOT wait for completion
-      if (tidx == 0) {
+      // Thread 256: issue K+Vt TMA for this tile into load_stage — do NOT wait for completion
+      if (tidx == kNMathThreads) {
         const int nb_abs = binfo.sum_s_k / kBlockN + nb;
         uint32_t taddr = static_cast<uint32_t>(__cvta_generic_to_shared(tma_mbar_ptr[load_stage]));
         asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"

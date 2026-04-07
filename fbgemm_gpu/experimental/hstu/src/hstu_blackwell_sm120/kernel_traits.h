@@ -477,10 +477,10 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
       Is_causal_, Is_target_, Is_context_, Is_local_, Is_arbitrary_, kNFunc_, Has_rab_,
       Is_Q_in_regs_, Share_Q_K_smem_, out_type>;
 
-  // Warp roles: warp 0 = load warp; warps 1..kNWarps_ = math warps.
+  // Warp roles: warps 0..kNWarps_-1 = math warps; warp kNWarps_ = load warp.
   static constexpr int kNMathWarps   = kNWarps_;     // 8 math warps
-  static constexpr int kNLoadWarps   = 1;            // 1 load warp (warp 0)
-  static constexpr int kLoadWarpIdx  = 0;            // warp 0 is the load warp
+  static constexpr int kNLoadWarps   = 1;            // 1 load warp
+  static constexpr int kLoadWarpIdx  = kNWarps_;     // warp 8 is the load warp
 
   // kNThreads overrides Base::kNThreads: total = math warps + load warp = 9 × 32 = 288.
   static constexpr int kNThreads     = (kNMathWarps + kNLoadWarps) * cutlass::NumThreadsPerWarp;  // 288
