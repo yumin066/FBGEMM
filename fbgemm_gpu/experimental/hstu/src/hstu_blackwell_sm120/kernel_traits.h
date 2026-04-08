@@ -477,13 +477,18 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
       Is_causal_, Is_target_, Is_context_, Is_local_, Is_arbitrary_, kNFunc_, Has_rab_,
       Is_Q_in_regs_, Share_Q_K_smem_, out_type>;
 
-  // Warp roles: warps 0..kNWarps_-1 = math warps; warp kNWarps_ = load warp.
+  // Warp roles:
+  //   warps 0..kNWarps_-1  = math warps  (WG0: warps 0-3, WG1: warps 4-7)
+  //   warps kNWarps_..+3   = load warpgroup WG2 (warps 8-11, 4 warps = 1 complete warpgroup)
+  //     warp kNWarps_      = active load warp (issues TMA)
+  //     warps kNWarps_+1..3 = idle warps (dec registers then spin; needed to complete WG2)
+  // Having a complete WG2 allows setmaxnreg WARPSYNC.ALL retry loop to function correctly.
   static constexpr int kNMathWarps   = kNWarps_;     // 8 math warps
-  static constexpr int kNLoadWarps   = 1;            // 1 load warp
-  static constexpr int kLoadWarpIdx  = kNWarps_;     // warp 8 is the load warp
+  static constexpr int kNLoadWarps   = 4;            // 1 active load warp + 3 idle (WG2 complete)
+  static constexpr int kLoadWarpIdx  = kNWarps_;     // warp 8 is the active load warp
 
-  // kNThreads overrides Base::kNThreads: total = math warps + load warp = 9 × 32 = 288.
-  static constexpr int kNThreads     = (kNMathWarps + kNLoadWarps) * cutlass::NumThreadsPerWarp;  // 288
+  // kNThreads overrides Base::kNThreads: total = 8 math + 4 load = 12 warps × 32 = 384.
+  static constexpr int kNThreads     = (kNMathWarps + kNLoadWarps) * cutlass::NumThreadsPerWarp;  // 384
   // kNMathThreads: math-warp-only thread count used for per-warp layout arithmetic.
   static constexpr int kNMathThreads = kNMathWarps * cutlass::NumThreadsPerWarp;  // 256
 
@@ -525,7 +530,7 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
   static_assert(kNMathWarps * 16 == Base::kBlockM,
       "kNMathWarps * 16 must equal kBlockM (8 warps × 16 rows = 128)");
   static_assert(kNThreads == (kNMathWarps + kNLoadWarps) * 32,
-      "kNThreads == (kNMathWarps + kNLoadWarps) * 32");
+      "kNThreads == (kNMathWarps + kNLoadWarps) * 32");  // 384
   static_assert(kSmemMbarSize == 32,
       "kSmemMbarSize must be 32 (four 8-byte mbarriers: tma_mbar[2] + math_mbar[2])");
 };
