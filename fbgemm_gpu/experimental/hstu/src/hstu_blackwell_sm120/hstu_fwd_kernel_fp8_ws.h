@@ -184,13 +184,14 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     // SF SMEM pointers.
     static constexpr int kSmemSFOffset_WS = Kernel_traits::kSmemWsDataSizePadded;
     int32_t* smem_sfa_ptr = reinterpret_cast<int32_t*>(smem_ + kSmemSFOffset_WS);
+    int32_t* smem_sfp_ptr = smem_sfa_ptr + kBlockM;
     int32_t* const smem_sfb_ptr[2] = {
-        smem_sfa_ptr + kBlockM,
-        smem_sfa_ptr + kBlockM + kBlockN
+        smem_sfa_ptr + 2 * kBlockM,
+        smem_sfa_ptr + 2 * kBlockM + kBlockN
     };
     int32_t* const smem_sfv_ptr[2] = {
-        smem_sfa_ptr + kBlockM + 2 * kBlockN,
-        smem_sfa_ptr + kBlockM + 3 * kBlockN
+        smem_sfa_ptr + 2 * kBlockM + 2 * kBlockN,
+        smem_sfa_ptr + 2 * kBlockM + 3 * kBlockN
     };
 
     // Barrier init: only thread kNMathThreads (load warp's first thread).
@@ -303,7 +304,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         make_smem_ptr(reinterpret_cast<int*>(smem_ + Kernel_traits::kSmemWsValidBlockIdsOffset)),
         typename Kernel_traits::SmemLayoutValidBlockIds{});
 
-    __syncthreads();  // S3: before main loop; math warps have completed s2r Q.
+    __syncthreads();  // S3: before main loop; math warps finished Q→persist SMEM copy.
 
     // ===== LOAD WARP DOUBLE-BUFFER TMA PRODUCER =====
     // Only active load warp (warp 8) participates.
@@ -587,19 +588,22 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     // SF SMEM pointers.
     static constexpr int kSmemSFOffset_WS = Kernel_traits::kSmemWsDataSizePadded;
     int32_t* smem_sfa_ptr = reinterpret_cast<int32_t*>(smem_ + kSmemSFOffset_WS);
+    int32_t* smem_sfp_ptr = smem_sfa_ptr + kBlockM;
     int32_t* const smem_sfb_ptr[2] = {
-        smem_sfa_ptr + kBlockM,
-        smem_sfa_ptr + kBlockM + kBlockN
+        smem_sfa_ptr + 2 * kBlockM,
+        smem_sfa_ptr + 2 * kBlockM + kBlockN
     };
     int32_t* const smem_sfv_ptr[2] = {
-        smem_sfa_ptr + kBlockM + 2 * kBlockN,
-        smem_sfa_ptr + kBlockM + 3 * kBlockN
+        smem_sfa_ptr + 2 * kBlockM + 2 * kBlockN,
+        smem_sfa_ptr + 2 * kBlockM + 3 * kBlockN
     };
 
     using SmemLayoutSFA = typename BS1::SmemLayoutSFA;
     using SmemLayoutSFB = typename BS1::SmemLayoutSFB;
     Tensor sSFA_ = make_tensor(make_smem_ptr(smem_sfa_ptr), SmemLayoutSFA{});
     auto sSFA = as_position_independent_swizzle_tensor(sSFA_);
+    Tensor sSFP_ = make_tensor(make_smem_ptr(smem_sfp_ptr), SmemLayoutSFA{});
+    auto sSFP = as_position_independent_swizzle_tensor(sSFP_);
 
     // MMA tiled objects (use tidx_math = tidx for math warps).
     typename BS1::TiledMma tiled_mma_g1;
@@ -634,27 +638,30 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
 
     __syncthreads();  // S1: barriers initialized by load warp; math warps can now use them.
 
-    // Declare Q fragment; will be loaded after S2.
-    auto sQ_pi = as_position_independent_swizzle_tensor(sQ_sw128);
-    Tensor tCrQ = thr_mma_g1.partition_fragment_A(sQ_pi);
+    Tensor sQ_persist = make_tensor(
+        make_smem_ptr(reinterpret_cast<FP8Elem*>(
+            reinterpret_cast<char*>(smem_) + Kernel_traits::kSmemWsQPersistOffset)),
+        SmemLayoutQ_SW128{});
+    auto sQ_persist_pi = as_position_independent_swizzle_tensor(sQ_persist);
 
-    __syncthreads();  // S2: Q+SFA TMA complete (load warp waited); Q visible to math warps.
+    __syncthreads();  // S2: Q+SFA TMA complete (load warp waited); Q visible at sK_base[0].
 
-    // s2r Q from SMEM.
+    // Copy Q out of the K/V double-buffer slot before load warp overwrites it with K TMA.
+    // IMPORTANT: write via sQ_persist_pi (position-independent swizzle) to match the
+    // physical addresses that LDSM will read via sQ_persist_pi in the main loop.
+    // sQ_persist base (67712 for Is_arbitrary) is NOT aligned to the SW128 swizzle period
+    // (2048B), so sQ_persist(r,c) and sQ_persist_pi(r,c) map to different physical locations.
+    // Using sQ_persist (non-PI) here while LDSM reads sQ_persist_pi causes element misplacement
+    // for Is_arbitrary but not Is_causal (65536 % 2048 == 0, so PI == non-PI for Is_causal).
     {
-      auto tXsQ = s2r_thr_A.partition_S(sQ_pi);
-      auto tXrQ = s2r_thr_A.retile_D(tCrQ);
-      cute::copy(s2r_copy_A, tXsQ, tXrQ);
+      for (int i = tidx_math; i < kBlockM * kHeadDim; i += kNMathThreads) {
+        const int r = i / kHeadDim;
+        const int c = i % kHeadDim;
+        sQ_persist_pi(r, c) = sQ_sw128(r, c);
+      }
     }
-
-    // s2r SFA.
-    Tensor tCrSFA = BS1::partition_fragment_SFA(sSFA(_,_,_0{}), thr_mma_g1);
-    {
-      auto tXsSFA = s2r_thr_SFA.partition_S(sSFA);
-      auto tXrSFA = s2r_thr_SFA.retile_D(tCrSFA);
-      cute::copy(s2r_copy_SFA, tXsSFA(_,_,_,_0{}), tXrSFA);
-    }
-    auto tCrSFA_frg = BS1::transform_fragment_for_qmma(tCrSFA);
+    // Math-only rendezvous; do NOT use __syncthreads() here (would desync load path's S3/S5).
+    asm volatile("bar.sync 1, 256;\n" : : : "memory");
 
     // Mask lambda (captures variables from math warp scope).
     auto col_limit_right = [&](int row) {
@@ -726,10 +733,9 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
 
     __syncthreads();  // S3: before main loop; load warp ready to issue K/Vt TMA preamble.
 
-    // SFP (unit scale for P) — written once to SMEM before loop.
-    // smem_sfa_ptr was used for real SFA (already s2r'd into tCrSFA_frg); now reuse for SFP.
+    // SFP (unit scale for P) — separate buffer so real SFA SMEM stays valid for per-tile GEMM1 s2r.
     for (int i = tidx_math; i < kBlockM; i += kNMathThreads)
-      smem_sfa_ptr[i] = 0x7f7f7f7f;
+      smem_sfp_ptr[i] = 0x7f7f7f7f;
 
     // ===== MATH WARP DOUBLE-BUFFER QMMA CONSUMER LOOP =====
     using SmemLayoutVt_K_SW128 = decltype(tile_to_shape(typename BS2::SmemLayoutAtomB{},
@@ -762,7 +768,26 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       FP8Elem* sK_cur  = sK_base[math_stage];
       FP8Elem* sVt_cur = sVt_base[math_stage];
 
-      // s2r K.
+      // GEMM1: acc_s += Q × K^T (block-scaled).
+      // acc_s declared outside the K/SFB scope so it outlives tCrK/tCrSFB.
+      Tensor acc_s = partition_fragment_C(tiled_mma_g1, Shape<Int<kBlockM>, Int<kBlockN>>{});
+      clear(acc_s);
+      { // Per-tile s2r Q+SFA (short lifetime) + K/SFB + GEMM1.
+      Tensor tCrQ = thr_mma_g1.partition_fragment_A(sQ_persist_pi);
+      {
+        auto tXsQ = s2r_thr_A.partition_S(sQ_persist_pi);
+        auto tXrQ = s2r_thr_A.retile_D(tCrQ);
+        cute::copy(s2r_copy_A, tXsQ, tXrQ);
+      }
+      Tensor tCrSFA = BS1::partition_fragment_SFA(sSFA(_,_,_0{}), thr_mma_g1);
+      {
+        auto tXsSFA = s2r_thr_SFA.partition_S(sSFA);
+        auto tXrSFA = s2r_thr_SFA.retile_D(tCrSFA);
+        cute::copy(s2r_copy_SFA, tXsSFA(_,_,_,_0{}), tXrSFA);
+      }
+      auto tCrSFA_frg = BS1::transform_fragment_for_qmma(tCrSFA);
+
+      { // tCrK and tCrSFB scoped: freed before silu / P path.
       auto sK_cur_pi = as_position_independent_swizzle_tensor(
           make_tensor(make_smem_ptr(sK_cur), SmemLayoutK_SW128{}));
       Tensor tCrK = thr_mma_g1.partition_fragment_B(sK_cur_pi);
@@ -772,7 +797,6 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         cute::copy(s2r_copy_B, tXsK, tXrK);
       }
 
-      // s2r SFB.
       Tensor tCrSFB = BS1::partition_fragment_SFB(sSFB(_,_,_0{}), thr_mma_g1);
       {
         auto tXsSFB = s2r_thr_SFB.partition_S(sSFB);
@@ -781,13 +805,12 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       }
       auto tCrSFB_frg = BS1::transform_fragment_for_qmma(tCrSFB);
 
-      // GEMM1: acc_s += Q × K^T (block-scaled).
-      Tensor acc_s = partition_fragment_C(tiled_mma_g1, Shape<Int<kBlockM>, Int<kBlockN>>{});
-      clear(acc_s);
       cute::gemm(tiled_mma_g1,
           make_zip_tensor(tCrQ, tCrSFA_frg(_,_,_,_0{})),
           make_zip_tensor(tCrK, tCrSFB_frg(_,_,_,_0{})),
           acc_s);
+      } // tCrK, tCrSFB
+      } // tCrQ, tCrSFA
 
       if (params.debug_gemm1_only) {
         for (int i = 0; i < size(acc_s); ++i) acc_o(i) += acc_s(i);
@@ -849,6 +872,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       }
       asm volatile("bar.sync 1, 256;\n" : : : "memory");
 
+      { // tCrV, tCrSFV, tCrSFP scoped here: compiler can reuse registers freed by tCrK/tCrSFB.
       // s2r V^T from K_SW128 SMEM.
       auto sVt_k_pi = as_position_independent_swizzle_tensor(
           make_tensor(make_smem_ptr(sK_cur), SmemLayoutVt_K_SW128{}));
@@ -860,9 +884,9 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       }
 
       // s2r SFP (unit) and SFV.
-      Tensor tCrSFP = BS2::partition_fragment_SFA(sSFA(_,_,_0{}), thr_mma_g2);
+      Tensor tCrSFP = BS2::partition_fragment_SFA(sSFP(_,_,_0{}), thr_mma_g2);
       {
-        auto tXsSFP = s2r_thr_SFP.partition_S(sSFA);
+        auto tXsSFP = s2r_thr_SFP.partition_S(sSFP);
         auto tXrSFP = s2r_thr_SFP.retile_D(tCrSFP);
         cute::copy(s2r_copy_SFP, tXsSFP(_,_,_,_0{}), tXrSFP);
       }
@@ -888,6 +912,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
           make_zip_tensor(tCrP, tCrSFP_frg(_,_,_,_0{})),
           make_zip_tensor(tCrV, tCrSFV_frg(_,_,_,_0{})),
           acc_o);
+      } // tCrV, tCrSFV, tCrSFP freed here.
 
       if (is_jump && masking_step == n_masking_steps - 1)
         n_valid = std::min(n_valid, n_block_history);

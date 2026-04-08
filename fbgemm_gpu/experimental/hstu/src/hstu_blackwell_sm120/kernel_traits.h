@@ -518,12 +518,17 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
   static constexpr int kSmemWsFuncEnd = kSmemWsFuncOffset +
       (Is_arbitrary_ ? (int)((Base::kNFunc/2 + 1 + Base::kNFunc/2 + 1 + 1) * (int)sizeof(int)) : 0);
 
-  // Override kSmemSize: WS data (padded to 128B for TMA alignment) + SF + 4 mbarriers.
-  // TMA destination SMEM address must be 128-byte aligned.
-  static constexpr int kSmemWsDataSizePadded = ((kSmemWsFuncEnd + 127) / 128) * 128;
-  // WS SF SMEM: SFA(512B) + SFB[0](512B) + SFB[1](512B) + SFV[0](512B) + SFV[1](512B) = 2560B.
-  // SFB and SFV are both double-buffered, each loaded by TMA in load warp.
-  static constexpr int kSmemWsSFSize = Base::kSmemSFSize + 3 * Base::kBlockN * (int)sizeof(int32_t);
+  // Persistent Q tile after KV/func: K TMA reuses sK_base[0]; math reloads Q from here each GEMM1.
+  static constexpr int kSmemQPersistBytes =
+      kBlockM_ * kHeadDim_ * (int)sizeof(typename Base::Element);
+  static constexpr int kSmemWsQPersistOffset = ((kSmemWsFuncEnd + 127) / 128) * 128;
+  static constexpr int kSmemWsAfterQPersist = kSmemWsQPersistOffset + kSmemQPersistBytes;
+  // WS data region padded to 128B; SF (TMA targets) starts at this offset from smem_.
+  static constexpr int kSmemWsDataSizePadded = ((kSmemWsAfterQPersist + 127) / 128) * 128;
+  // WS SF SMEM: SFA(512B) + SFP unit(512B) + SFB[0]+[1] + SFV[0]+[1] (each 512B @ 128) = 3072B.
+  // SFP is separate so real SFA SMEM is never clobbered — enables per-tile s2r of SFA for GEMM1.
+  static constexpr int kSmemWsSFSize =
+      (kBlockM_ * 2 + kBlockN_ * 4) * (int)sizeof(int32_t);
   static constexpr int kSmemSize = kSmemWsDataSizePadded + kSmemWsSFSize + kSmemMbarSize;
 
   // Invariant checks
