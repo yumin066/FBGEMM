@@ -828,26 +828,26 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       for (int i = 0; i < size(acc_s); ++i) acc_s(i) *= params.alpha;
       fast_silu(acc_s);
 
-      // Convert acc_s → FP8 rP.
-      Tensor rP = make_tensor_like<FP8Elem>(acc_s);
-      flash::convert_type_safe(acc_s, rP);
-
-      // P SMEM roundtrip: write rP to sK[math_stage] (K already in registers, buffer free).
+      // Convert/store P: write quantized acc_s directly into sPbuf (avoid full rP RF tensor).
+      // NOTE: We still need SMEM roundtrip because tCrP register layout is produced by
+      //       LDSM_N from K_SW128 SMEM; acc_s fragment layout is not directly compatible.
       asm volatile("bar.sync 1, 256;\n" : : : "memory");
       Tensor sPbuf    = make_tensor(make_smem_ptr(sK_cur), SmemLayoutQ_SW128{});
       auto sPbuf_pi   = as_position_independent_swizzle_tensor(sPbuf);
       {
+        cutlass::NumericConverter<FP8Elem, float> fp32_to_fp8;
         Tensor cP_id    = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
         Tensor tPcP_raw = thr_mma_g1.partition_C(cP_id);
         Tensor tPcP_v   = make_tensor(tPcP_raw.data(),
             group<1,3>(group<0,2>(select<1,2,0,3>(flatten(tPcP_raw.layout())))));
-        Tensor rP_v     = make_tensor(rP.data(),
-            group<1,3>(group<0,2>(select<1,2,0,3>(flatten(rP.layout())))));
+        Tensor acc_s_v  = make_tensor(acc_s.data(),
+            group<1,3>(group<0,2>(select<1,2,0,3>(flatten(acc_s.layout())))));
         CUTE_UNROLL
-        for (int r = 0; r < size<0>(rP_v); ++r) {
+        for (int r = 0; r < size<0>(acc_s_v); ++r) {
           CUTE_UNROLL
-          for (int c = 0; c < size<1>(rP_v); ++c) {
-            sPbuf_pi(int(get<0>(tPcP_v(r,c))), int(get<1>(tPcP_v(r,c)))) = rP_v(r,c);
+          for (int c = 0; c < size<1>(acc_s_v); ++c) {
+            sPbuf_pi(int(get<0>(tPcP_v(r,c))), int(get<1>(tPcP_v(r,c)))) =
+                fp32_to_fp8(static_cast<float>(acc_s_v(r,c)));
           }
         }
       }
