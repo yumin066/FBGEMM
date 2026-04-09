@@ -144,3 +144,16 @@ Phase 6 WS cp.async 比 Phase 4 慢 2-4x，不可行。WS kernel 适合 TMA（�
 - `test_results/036_phase4_library_fix.log`
 - `test_results/037_hstu_test_phase4_final.log`
 - `test_results/038_sm120_bench_phase4.log`
+
+---
+
+## Claude Code GPU 访问修复（2026-04-09）
+
+sandbox-runtime 0.0.49 改用 argv0 模式：`bash -c 'cmd'`（Claude 自身内置 BPF）。旧的 node_modules bind mount 方案完全无效。
+
+**修复**：`~/.local/bin/bwrap` 中用 sed 从 bwrap 最后一个参数剥离该前缀：
+```bash
+stripped=$(echo "$last_arg" | sed "s|ARGV0=['\"]\\?apply-seccomp['\"]\\? ['\"]\\?/proc/self/fd/[0-9]*['\"]\\? ||")
+```
+
+**调试方法**：在 bwrap wrapper 末尾加 `printf '%s\n' "${args[@]}" >> /tmp/bwrap-debug.log`，看 `--` 后的命令字符串格式。

@@ -1,3 +1,5 @@
+# ⚠️ 严格要求：所有回复必须用中文，禁止输出韩文或日文 ⚠️
+
 # HSTU FBGEMM 项目说明
 
 ## 项目概述
@@ -17,6 +19,7 @@
 - [x] **Phase 6**：Warp-specialized kernel（load warp 专职 TMA，math warps 专职 MMA，producer/consumer pipeline）— 数值验证通过（2026-04-03）
 - [x] **Phase 7**：TMA SFB（Scale Factor B via TMA，load warp 每 tile 与 K+V^T 同批 TMA）— 14/14 全通过（2026-04-04）
 - [x] **Phase 8**：TMA SFV（Scale Factor V via TMA，load warp 同批发射 K+V^T+SFB+SFV）— 14/14 全通过（2026-04-04）
+- [x] **Phase 9**：12-warp 结构（3 个完整 warpgroup）+ `setmaxnreg 216` → math warp 寄存器提升至 216，消除 TRY_ALLOC deadlock，FP8/BF16 比从 ~1.7-2.1x 改善至 ~1.52-1.56x — 验证通过（2026-04-08）
 
 ### Phase 4 最终性能结果（RTX PRO 6000 Blackwell SM120，2026-03-27）
 
@@ -276,6 +279,84 @@ benchmark 日志：`benchmark_results/007_e10772bc_gpu2347MHz_phase8_tma_sfv.log
 
 ---
 
+## Phase 9 进行中：12-warp 结构 + setmaxnreg 216（2026-04-08）
+
+**目标**：通过 `setmaxnreg` 动态重分配寄存器，让 math warp 获得 216 个寄存器（而非编译器静态分配的 ~176），减少 register spill（LDL/STL 指令），提升 GEMM 吞吐。
+
+### 当前 warp 结构
+
+```
+warp 0-7 (256线程) = math warps（WG0 + WG1，2 个完整 warpgroup）
+  → setmaxnreg.inc 216 → 每线程 216 个寄存器
+warp 8-11 (128线程) = load warpgroup（WG2，1 个完整 warpgroup）
+  → setmaxnreg.dec 64 → 每线程 64 个寄存器
+    warp 8：active load warp（负责发射 TMA K/V^T/SFB/SFV）
+    warp 9-11：idle（仅为保持 WG2 完整，使 setmaxnreg TRY_ALLOC 的 WARPSYNC.ALL 能完成）
+```
+
+**总线程数**：384（`kNThreads = 384`）
+
+### 关键设计原因
+
+- `setmaxnreg.inc` 的 PTX 实现在 SASS 层面是 `USETMAXREG.TRY_ALLOC.CTAPOOL`
+- TRY_ALLOC 在寄存器池不足时会进入 retry loop，loop 内含 `WARPSYNC.ALL`
+- `WARPSYNC.ALL` 要求同一 warpgroup 内所有 4 个 warp 都到达该指令，才能继续
+- 若 warpgroup 不完整（如原 9-warp 方案中 WG2 仅有 warp 8），WARPSYNC.ALL 永远无法完成 → deadlock
+- **修复**：扩展到 12 warp，WG2 = warp 8-11（完整），warps 9-11 空闲但参与所有同步
+
+### 寄存器预算分析（setmaxnreg 后）
+
+| 变量 | 寄存器 | 说明 |
+|------|--------|------|
+| acc_o | 64 | GEMM2 跨 tile 累加器，全程存活 |
+| acc_s | 64 | GEMM1 当前 tile 输出，GEMM1 期间存活 |
+| Q/K/Vt fragment | ~80 | 各 ~26-32 regs |
+| SF + 循环变量 | ~20 | sfb/sfv/loop/addr |
+| **合计** | **~228** | **仍超出 216 → 少量 spill** |
+
+### 代码关键点
+
+- `kernel_traits.h`：`kNLoadWarps = 4`，`kNThreads = 384`
+- `hstu_fwd_kernel_fp8_ws.h`：load warp 入口 `setmaxnreg.dec 64`；math warp 入口 `setmaxnreg.inc 216`；`is_active_load = (tidx < kNMathThreads + 32)`，warp 8 做 TMA，warp 9-11 参与 S1-S5 syncthreads 后 idle
+
+### 验证结果（2026-04-08）
+
+**sweep_accuracy.py**（quant_mode=2）：全部 PASS，cos_sim ≈ 0.9985~0.9987
+
+**hstu_test.py 14 explicit @example cases**：14/14 PASS
+
+benchmark 日志：`benchmark_results/022_147b3416_gpu2212MHz_setmaxnreg_216.log`
+
+### Phase 9 性能结果（2026-04-08，RTX PRO 6000 Blackwell SM120，gpu=2212MHz）
+
+**kernel-only**（bs=4, h=16, d=128，full attention）：
+
+| seq  | BF16    | BF16 TFLOPS | FP8 (qm=2) | FP8 TFLOPS | FP8/BF16 |
+|------|---------|-------------|------------|------------|----------|
+| 512  | 0.044ms | 197         | 0.068ms    | 127        | 1.55x 慢 |
+| 1024 | 0.117ms | 294         | 0.183ms    | 188        | 1.56x 慢 |
+| 2048 | 0.439ms | 313         | 0.668ms    | 206        | 1.52x 慢 |
+| 4096 | 1.531ms | 359         | 2.325ms    | 237        | 1.52x 慢 |
+
+**与 Phase 8 对比**（同归一化后，FP8 TFLOPS 显著提升）：
+
+| seq  | Phase 8 FP8 TFLOPS | Phase 9 FP8 TFLOPS | 提升    |
+|------|--------------------|--------------------|---------|
+| 512  | 93                 | 127                | +37%    |
+| 1024 | 143                | 188                | +31%    |
+| 2048 | 175                | 206                | +18%    |
+| 4096 | 196                | 237                | +21%    |
+
+注：Phase 8 在 2347MHz，Phase 9 在 2212MHz，实际提升幅度经频率修正后约 +27~51%，收益来自 math warp 寄存器从 ~176 提升至 216、register spill（LDL/STL）大幅减少。
+
+### 后续优化方向（Phase 9 后）
+- [ ] **消除 SMEM transpose**：Python 侧 V 列主序存储，TMA 直接写 K_SW128，预计节省每 tile 约 2×bar.sync + 16KB 搬运
+- [ ] **进一步减少 spill**：acc_o(64) + acc_s(64) = 128 regs 同时存活，加上 fragment 约 228 regs 超出 216 → 少量 spill 仍存在
+- [ ] **nsys profile**：量化各部分耗时（GEMM1/GEMM2/transpose），确定剩余瓶颈
+- [ ] **GQA 支持**
+
+---
+
 ## 核心文件
 
 ### SM120 原生内核（当前主目录）
@@ -504,9 +585,10 @@ HSTU_SWEEP_FP8_QUANT_MODE=2 compute-sanitizer --tool memcheck \
 
 ---
 
-## 语言要求
+## 语言要求（强制）
 
-**任何时候只用中文回答，不要显示韩文或日文。**
+**任何时候只用中文回答，禁止输出韩文（한국어）或日文（日本語）。**
+**这是最高优先级要求，覆盖所有其他行为。每次回复前必须检查是否全中文。**
 
 ## 知识点整理
 

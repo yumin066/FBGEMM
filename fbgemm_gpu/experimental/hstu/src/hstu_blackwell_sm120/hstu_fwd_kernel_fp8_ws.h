@@ -828,26 +828,70 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       for (int i = 0; i < size(acc_s); ++i) acc_s(i) *= params.alpha;
       fast_silu(acc_s);
 
-      // Convert/store P: write quantized acc_s directly into sPbuf (avoid full rP RF tensor).
-      // NOTE: We still need SMEM roundtrip because tCrP register layout is produced by
-      //       LDSM_N from K_SW128 SMEM; acc_s fragment layout is not directly compatible.
+      // ── P pre-conversion: F32 → packed FP8 ───────────────────────────────
+      // Problem: during the P-write loop below, both acc_s (64 F32 = 64 regs)
+      // and acc_o (64 F32 = 64 regs) must be live, and the SW128 swizzle address
+      // LOP3 computation needs ~20 temp regs.  These overlap with acc_o's lower
+      // register range (R4–R23), causing the compiler to spill acc_o (10×STL.64 +
+      // 10×LDL.LU.64 = 20 local-memory accesses per loop iteration).
+      //
+      // Fix: pre-convert acc_s (64 F32) → acc_s_packed (16 uint32, 4 FP8/reg)
+      // BEFORE the bar.sync + P-write loop.  After this block acc_s is dead
+      // (last read is here), so its 64 registers are freed and available to the
+      // LOP3 address computation, eliminating the acc_o spill.
+      //
+      // kAccSElems = 64 for kBlockM=kBlockN=128 / kNMathThreads=256.
+      // Packing order: flat index f = r*kPWriteC + c (same as P-write (r,c) order),
+      // acc_s_packed[f/4] bits [8*(f%4)+7 : 8*(f%4)] = FP8(acc_s_v(r,c)).
+      constexpr int kAccSElems = kBlockM * kBlockN / kNMathThreads;  // = 64
+      static_assert(kAccSElems % 4 == 0, "kAccSElems must be a multiple of 4");
+      uint32_t acc_s_packed[kAccSElems / 4];  // 16 registers (vs. 64 for F32)
+      {
+        cutlass::NumericConverter<FP8Elem, float> fp32_to_fp8;
+        auto acc_s_v_pre = make_tensor(acc_s.data(),
+            group<1,3>(group<0,2>(select<1,2,0,3>(flatten(acc_s.layout())))));
+        // size<1>(acc_s_v_pre) is a compile-time Int<C>; with CUTE_UNROLL all
+        // loop variables are compile-time so flat/4 and flat%4 fold to constants.
+        constexpr int kC = decltype(size<1>(acc_s_v_pre))::value;
+        static_assert(kAccSElems % kC == 0, "kAccSElems must be divisible by kC");
+        CUTE_UNROLL
+        for (int flat = 0; flat < kAccSElems; flat += 4) {
+          auto get_fp8 = [&](int f) -> uint8_t {
+            FP8Elem v = fp32_to_fp8(static_cast<float>(acc_s_v_pre(f / kC, f % kC)));
+            return *reinterpret_cast<const uint8_t*>(&v);
+          };
+          acc_s_packed[flat / 4] =
+              (uint32_t)get_fp8(flat)            |
+              ((uint32_t)get_fp8(flat + 1) <<  8) |
+              ((uint32_t)get_fp8(flat + 2) << 16) |
+              ((uint32_t)get_fp8(flat + 3) << 24);
+        }
+      }
+      // acc_s (64 F32 regs) is now DEAD — freed for LOP3 in P-write below.
+
+      // Convert/store P: write packed FP8 (from acc_s_packed) into sPbuf via CuTe API.
+      // acc_s (64 F32 regs) was already converted → acc_s_packed (16 uint32) above,
+      // freeing ~48 registers before this write.  We use the CuTe position-independent
+      // API (guaranteed correct address) instead of a manual swizzle formula.
       asm volatile("bar.sync 1, 256;\n" : : : "memory");
       Tensor sPbuf    = make_tensor(make_smem_ptr(sK_cur), SmemLayoutQ_SW128{});
       auto sPbuf_pi   = as_position_independent_swizzle_tensor(sPbuf);
       {
-        cutlass::NumericConverter<FP8Elem, float> fp32_to_fp8;
         Tensor cP_id    = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
         Tensor tPcP_raw = thr_mma_g1.partition_C(cP_id);
         Tensor tPcP_v   = make_tensor(tPcP_raw.data(),
             group<1,3>(group<0,2>(select<1,2,0,3>(flatten(tPcP_raw.layout())))));
-        Tensor acc_s_v  = make_tensor(acc_s.data(),
-            group<1,3>(group<0,2>(select<1,2,0,3>(flatten(acc_s.layout())))));
+        constexpr int kC2 = decltype(size<1>(tPcP_v))::value;
+        constexpr int kR = kAccSElems / kC2;
         CUTE_UNROLL
-        for (int r = 0; r < size<0>(acc_s_v); ++r) {
+        for (int r = 0; r < kR; ++r) {
           CUTE_UNROLL
-          for (int c = 0; c < size<1>(acc_s_v); ++c) {
-            sPbuf_pi(int(get<0>(tPcP_v(r,c))), int(get<1>(tPcP_v(r,c)))) =
-                fp32_to_fp8(static_cast<float>(acc_s_v(r,c)));
+          for (int c = 0; c < kC2; ++c) {
+            int flat = r * kC2 + c;  // compile-time with CUTE_UNROLL
+            uint8_t fp8_byte = (acc_s_packed[flat / 4] >> ((flat % 4) * 8)) & 0xFF;
+            FP8Elem fp8_val;
+            *reinterpret_cast<uint8_t*>(&fp8_val) = fp8_byte;
+            sPbuf_pi(get<0>(tPcP_v(r, c)), get<1>(tPcP_v(r, c))) = fp8_val;
           }
         }
       }

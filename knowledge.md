@@ -4,6 +4,67 @@
 
 ---
 
+## 18. WS 分支同步死锁排查（`__syncthreads` vs `bar.sync`）
+
+**场景**：在 FP8 WS kernel 中，为了做 Q 持久化复制，在 math 分支新增了一个 `__syncthreads()`，结果 `seq=128/256` 可跑，`seq=512` 卡死。
+
+**根因**：
+- `__syncthreads()` 是 **CTA 级** barrier，要求所有 warps（包括 load warps）参与。
+- load/math 两个分支原本约定了固定的 CTA barrier 序列（S1/S2/S3/S5）。
+- 在 math 分支额外插入 CTA barrier 后，序列错位：短序列时可能“偶然对齐”，长序列进入 producer/consumer 循环后会稳定死锁。
+
+**修复原则**：
+- 只需 math warps 同步时，用 `bar.sync 1, 256`（或等价 warpgroup/子集同步），不要额外加 `__syncthreads()`。
+- 保持 load 和 math 分支的 CTA 级 barrier 数量与顺序严格一致。
+
+---
+
+## 19. `fast_silu` / FP8 pack 的寄存器降峰值策略
+
+**背景**：在 WS FP8 内核里，`acc_s` 的 `silu + F32->E4M3 pack` 段常出现大量 `MUFU.TANH + F2FP`，并伴随 `LDL/STL`。即使 Q/SFQ 生命周期缩短后，这一段仍可能是 spill 主来源。
+
+**策略**：
+- 保持数学语义不变，新增 `fast_silu_no_unroll()` 与 `convert_type_safe_no_unroll()`；
+- 用 `#pragma unroll 1` 限制该段完全展开，降低单个 basic block 的峰值临时寄存器数量；
+- 仅在 WS 路径切换到 no-unroll 版本，减少对其他路径的影响。
+
+**预期**：
+- Spill（`LDL/STL`）下降；
+- 可能牺牲少量 ILP，需要通过 kernel-only benchmark 验证净收益（尤其 full vs causal 差异）。
+
+---
+
+## 20. 为什么 `acc_s` 不能直接变成 `tCrP`
+
+**关键区别**：
+- `acc_s`：GEMM1 的 C fragment（按 MMA-C 片段布局分发到线程寄存器）
+- `tCrP`：GEMM2 的 A fragment（由 K_SW128 + LDSM_N 路径定义的寄存器布局）
+
+两者的线程内/线程间元素映射不同，不能简单“同寄存器重解释”。
+
+**可行优化**：
+- 去掉 `rP` 全量中间寄存器 tensor（避免 `acc_s` 与 `rP` 长时间重叠）；
+- 改为 `acc_s` 元素直接量化后写入 `sPbuf`；
+- 再通过既有 `s2r P` 路径（LDSM_N）生成正确布局的 `tCrP`。
+
+这属于“减少 RF 峰值”的低风险优化，不改变 `tCrP` 的正确布局来源。
+
+---
+
+## 21. FP8 量化回归：`static_cast` vs CUTLASS NumericConverter
+
+**现象**：去掉 `rP` 中间 tensor 后，若逐元素用 `static_cast<FP8Elem>` 写入 `sPbuf`，`arbitrary` case 出现明显数值回归（target/arbitrary 失败）。
+
+**原因**：
+- `arbitrary/local/causal` 路径会对 `acc_s` 注入大量 `-INF`（mask）；
+- `static_cast` 的 FP8 转换语义与原先 `convert_type_safe`（CUTLASS `NumericArrayConverter`）不一致，尤其在极值/特殊值处理上。
+
+**修复**：
+- 保留“无 `rP` 中间 tensor”的优化；
+- 逐元素转换改用 `cutlass::NumericConverter<FP8Elem, float>`，保持与 CUTLASS 量化语义一致。
+
+---
+
 ## 15. Context Parallel（CP）原理与梯度缩放
 
 **定义**：Context Parallel（CP）是把序列维度（context/tokens）切分到多个 rank 上，每个 rank 只处理该序列的一段 token。与 TP（切 hidden 维）和 PP（切层）不同，CP 主要切的是 `seq_len` 维度。
@@ -1586,5 +1647,21 @@ HSTU FP8 的 V-operand bug 根因：
 > `SmemLayoutAtom` = SMEM 的地图（决定每个元素住哪里）
 > `SmemCopyAtom` = 读 SMEM 的交通工具（决定用什么指令去取元素）
 > 地图和交通工具必须匹配，否则取到错误的元素。
+
+---
+
+## 17. `setmaxnreg` 与 nvcc 寄存器分配 / spill
+
+**现象**：`setmaxnreg.inc` 在运行时提高某 warp 可用的硬件寄存器上限，但 `ptxas -v` 仍显示约 96 个 GPR，且出现严重 spill；SASS 中可能出现较大寄存器编号区间却未承载编译器分配的变量。
+
+**原因**：
+- **静态分配**（nvcc/ptxas）决定在指令里实际用多少寄存器、是否 spill；**`setmaxnreg` 不替代**这一步。
+- 单参数 `__launch_bounds__(N)` 等价于第二参数为 0，可能仍让编译器用**其它启发式**（追求 occupancy）压低每线程寄存器并选择 spill。
+- 同一线程块内**所有线程共享同一套**编译期寄存器分配；load/math 分叉会迫使编译器做折中。
+
+**常用手段**：
+- `__launch_bounds__(maxThreadsPerBlock, 1)`：明确「每 SM 至少常驻 1 个 block」，通常**抬高**允许的每线程寄存器上限、有利于减少 spill（与 `setmaxnreg` 目标一致时需再结合实测）。
+- 编译选项：`--maxrregcount=224`（或 255）作为**上限**与硬件预算对齐；必要时尝试 `-Xptxas --register-usage-level=...`（依 CUDA 版本文档）。
+- 代码侧：缩短 live range（`__syncthreads`/作用域拆分）、减少大块模板同时存活，比单纯依赖 `setmaxnreg` 更直接。
 
 ---
