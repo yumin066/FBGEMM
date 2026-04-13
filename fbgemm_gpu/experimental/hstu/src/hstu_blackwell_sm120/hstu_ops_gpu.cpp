@@ -85,6 +85,7 @@ void set_params_fprop_sm120(
   params->q_head_stride = q.stride(-2);
   params->k_head_stride = k.stride(-2);
   params->v_head_stride = v.stride(-2);
+  params->v_d_stride = v.stride(-1);
 
   if (out.numel() > 0) {
     params->o_ptr = out.data_ptr();
@@ -383,7 +384,10 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_120(
       "SM120 supports head_size 64 or 128, got ", head_size);
   TORCH_CHECK(q.stride(-1) == 1, "q must have contiguous last dimension");
   TORCH_CHECK(k.stride(-1) == 1, "k must have contiguous last dimension");
-  TORCH_CHECK(v.stride(-1) == 1, "v must have contiguous last dimension");
+  // V may be row-major (d-fast, stride(-1)==1) or col-major (n-fast, stride(-3)==1).
+  // Col-major is used for the FP8 WS TMA path to eliminate the SMEM transpose.
+  TORCH_CHECK(v.stride(-1) == 1 || v.stride(-3) == 1,
+      "v must have either contiguous last dimension (row-major) or contiguous first dimension (col-major)");
 
   // FP8 mode: output is float16 (matches q_raw dtype from which q was quantized).
   // float16 has 10 mantissa bits (step=0.0625 at 64) vs BF16's 7 (step=0.5 at 64),

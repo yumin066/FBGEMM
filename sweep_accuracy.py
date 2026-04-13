@@ -229,6 +229,10 @@ for D in [128]:  # D=64 disabled in this build (HSTU_DISABLE_HDIM64=TRUE)
                     k_raw, cu, fp8_type=torch.float8_e4m3fn)
                 v_fp8, v_descale, cu_v_blk = quantize_for_block_scale_v_along_n(
                     v_raw, cu, block_size=128, fp8_type=torch.float8_e4m3fn)
+                # Col-major V: make token dim (dim0) contiguous in memory so v_row_stride=1.
+                # This allows TMA to use K_SW128[kHeadDim, kBlockN] (token-inner) and
+                # eliminates the SMEM transpose in the WS kernel.
+                v_fp8 = v_fp8.permute(2, 1, 0).contiguous().permute(2, 1, 0)
                 sf_q = pack_descale_to_e8m0x4_int32(q_descale)
                 sf_k = pack_descale_to_e8m0x4_int32(k_descale)
                 # TMA SFV requires sf_v expanded from [H, total_blocks] to [H, total_tokens]
