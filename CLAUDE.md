@@ -20,6 +20,7 @@
 - [x] **Phase 7**：TMA SFB（Scale Factor B via TMA，load warp 每 tile 与 K+V^T 同批 TMA）— 14/14 全通过（2026-04-04）
 - [x] **Phase 8**：TMA SFV（Scale Factor V via TMA，load warp 同批发射 K+V^T+SFB+SFV）— 14/14 全通过（2026-04-04）
 - [x] **Phase 9**：12-warp 结构（3 个完整 warpgroup）+ `setmaxnreg 216` → math warp 寄存器提升至 216，消除 TRY_ALLOC deadlock，FP8/BF16 比从 ~1.7-2.1x 改善至 ~1.52-1.56x — 验证通过（2026-04-08）
+- [x] **Phase 10**：消除 SMEM transpose（Python 侧 V 列主序 + kernel SmemLayoutVt_TMA 改为 K_SW128）→ seq≥2048 时 FP8 超过 BF16，seq=1024 基本持平 — 验证通过（2026-04-13）
 
 ### Phase 4 最终性能结果（RTX PRO 6000 Blackwell SM120，2026-03-27）
 
@@ -91,21 +92,19 @@ kernel-only（bs=4, h=16, d=128, full attention）：
 
 ---
 
-### ⚠️ 已知性能问题：SMEM→SMEM 手动 transpose（待优化）
+### ~~已知性能问题：SMEM→SMEM 手动 transpose~~ ✅ Phase 10 已消除
 
-**当前 V^T 数据路径**：
+**Phase 6 时的 V^T 数据路径（已废弃）**：
 ```
 GMEM V → TMA → MN_SW128 SMEM → [256线程手动transpose] → K_SW128 SMEM → LDSM_N → 寄存器
 ```
 
-**为什么需要手动 transpose**：TMA 和 LDSM_N 对 SMEM layout 的要求互相冲突：
-- TMA 要求：SMEM 内层维 = GMEM stride-1 维。GMEM 中 V^T 的 stride-1 维是 d=kHeadDim，因此 SMEM 内层必须是 kHeadDim → 只能用 **MN_SW128**
-- LDSM_N 要求：SMEM 内层维 = K-dim（kBlockN）→ 只能用 **K_SW128**
-- 两者不兼容，中间必须加一次 transpose
+**Phase 10 后的 V^T 数据路径**：
+```
+GMEM V（列主序，token stride-1）→ TMA → K_SW128 SMEM → LDSM_N → 寄存器
+```
 
-**transpose 开销**：每次 N-block 迭代中，256 个 math warp 线程各搬 64 字节（共 16KB），加 2 次 `bar.sync 1, 256`。此部分开销未被 double-buffer overlap 覆盖，是 FP8 仍比 BF16 慢的主要原因之一。
-
-**消除 transpose 的方案**：Python 侧将 V 改为列主序存储，strides 从 `[v_row_stride, 1]` 改为 `[1, v_col_stride]`，使 kBlockN 维成为 stride-1，则 TMA 可直接写入 K_SW128 SMEM，无需 transpose。代价是修改量化+存储 API。
+消除方案：Python 侧 `v_fp8.permute(2,1,0).contiguous().permute(2,1,0)` 使 token 轴 stride-1，K_SW128 TMA 直接写入正确 layout，无需 transpose。详见 Phase 10。
 
 ---
 
@@ -154,7 +153,7 @@ GMEM V → TMA → MN_SW128 SMEM → [256线程手动transpose] → K_SW128 SMEM
 **hstu_test.py 14 explicit @example cases**（quant_mode=2，seq=128/256，causal/rab/drab/local/context/target/arbitrary）：**14/14 PASS**
 
 测试脚本：`run_hstu8_examples.sh`（项目根目录）
-测试日志：`test_results/011_ws_phase6_final.log`（Phase 6），`test_results/021_hstu8_examples_qm2.log`（Phase 7）
+测试日志：`1test_results/011_ws_phase6_final.log`（Phase 6），`1test_results/021_hstu8_examples_qm2.log`（Phase 7）
 
 ### Phase 6 性能结果（2026-04-03，RTX PRO 6000 Blackwell SM120，bs=4, h=16, d=128）
 
@@ -205,7 +204,7 @@ FP8 仍比 BF16 慢的主要原因：SMEM transpose 开销（每 tile 16KB + 2×
 
 **hstu_test.py 14 explicit @example cases**（quant_mode=2，seq=128/256，causal/rab/drab/local/context/target/arbitrary）：**14/14 PASS**
 
-测试日志：`test_results/021_hstu8_examples_qm2.log`
+测试日志：`1test_results/021_hstu8_examples_qm2.log`
 
 ### Phase 7 性能结果（2026-04-04，RTX PRO 6000 Blackwell SM120）
 
@@ -224,7 +223,7 @@ FP8 仍比 BF16 慢的主要原因：SMEM transpose 开销（每 tile 16KB + 2×
 
 **end-to-end**：Python 侧量化开销约 0.78~1.8ms（随 bs 线性增长），远超 kernel 本身，FP8 端到端仍显著劣于 BF16。
 
-benchmark 日志：`benchmark_results/006_709899ce_gpu2430MHz_phase7_tma_sfb.log`
+benchmark 日志：`2benchmark_results/006_709899ce_gpu2430MHz_phase7_tma_sfb.log`
 
 ---
 
@@ -255,7 +254,7 @@ benchmark 日志：`benchmark_results/006_709899ce_gpu2430MHz_phase7_tma_sfb.log
 
 **hstu_test.py 14 explicit @example cases**：14/14 PASS
 
-测试日志：`test_results/024_hstu8_examples_qm2.log`
+测试日志：`1test_results/024_hstu8_examples_qm2.log`
 
 ### Phase 8 性能结果（2026-04-04，RTX PRO 6000 Blackwell SM120）
 
@@ -270,7 +269,7 @@ benchmark 日志：`benchmark_results/006_709899ce_gpu2430MHz_phase7_tma_sfb.log
 
 **与 Phase 7 对比**（FP8/BF16 比值改善）：Phase 7 约 1.72~2.0x，Phase 8 约 1.73~2.07x（同 GPU boost clock 下比值略有波动，属测量噪声范围，总体基本持平）。
 
-benchmark 日志：`benchmark_results/007_e10772bc_gpu2347MHz_phase8_tma_sfv.log`
+benchmark 日志：`2benchmark_results/007_e10772bc_gpu2347MHz_phase8_tma_sfv.log`
 
 ### 后续优化方向（更新）
 - [ ] **消除 SMEM transpose**：Python 侧 V 列主序存储，TMA 直接写 K_SW128，预计节省每 tile 约 2×bar.sync + 16KB 搬运
@@ -325,7 +324,7 @@ warp 8-11 (128线程) = load warpgroup（WG2，1 个完整 warpgroup）
 
 **hstu_test.py 14 explicit @example cases**：14/14 PASS
 
-benchmark 日志：`benchmark_results/022_147b3416_gpu2212MHz_setmaxnreg_216.log`
+benchmark 日志：`2benchmark_results/022_147b3416_gpu2212MHz_setmaxnreg_216.log`
 
 ### Phase 9 性能结果（2026-04-08，RTX PRO 6000 Blackwell SM120，gpu=2212MHz）
 
@@ -350,10 +349,69 @@ benchmark 日志：`benchmark_results/022_147b3416_gpu2212MHz_setmaxnreg_216.log
 注：Phase 8 在 2347MHz，Phase 9 在 2212MHz，实际提升幅度经频率修正后约 +27~51%，收益来自 math warp 寄存器从 ~176 提升至 216、register spill（LDL/STL）大幅减少。
 
 ### 后续优化方向（Phase 9 后）
-- [ ] **消除 SMEM transpose**：Python 侧 V 列主序存储，TMA 直接写 K_SW128，预计节省每 tile 约 2×bar.sync + 16KB 搬运
+- [x] **消除 SMEM transpose**：Python 侧 V 列主序存储，TMA 直接写 K_SW128（Phase 10 完成）
 - [ ] **进一步减少 spill**：acc_o(64) + acc_s(64) = 128 regs 同时存活，加上 fragment 约 228 regs 超出 216 → 少量 spill 仍存在
-- [ ] **nsys profile**：量化各部分耗时（GEMM1/GEMM2/transpose），确定剩余瓶颈
+- [ ] **nsys profile**：量化各部分耗时（GEMM1/GEMM2），确定剩余瓶颈
 - [ ] **GQA 支持**
+
+---
+
+## Phase 10 完成：消除 SMEM Transpose（col-major V，2026-04-13）
+
+**目标**：通过 Python 侧将 V 改为列主序（token 轴 stride-1）+ kernel 侧 `SmemLayoutVt_TMA` 改为 K_SW128，使 TMA 直接写入 GEMM2 兼容的 SMEM layout，彻底消除每 N-block 迭代中的 SMEM→SMEM transpose（2×`bar.sync 1,256` + 16KB copy）。
+
+### 关键原理
+
+| layout | SMEM fast axis | GMEM 要求 |
+|--------|---------------|-----------|
+| MN_SW128（旧） | kHeadDim | V d 轴 stride-1（行主序）|
+| K_SW128（新） | kBlockN | V token 轴 stride-1（列主序）|
+
+Python 侧 `v_fp8.permute(2,1,0).contiguous().permute(2,1,0)` → shape `[n,h,d]` strides `[1, n, h*n]`，token 轴 stride-1，满足 K_SW128 TMA 要求。
+
+### 实现内容
+
+- **`kernel_traits.h`**：`SmemLayoutVt_TMA` 从 `GMMA::Layout_MN_SW128_Atom<Element>{}` 改为 `SmemLayoutAtomSW128{}`（即 K_SW128）
+- **`hstu_fwd_kernel_fp8_ws.h`**：删除 SMEM transpose（`bar.sync B` + 16KB copy loop + `bar.sync C`），s2r V^T 直接从 `sVt_cur`（K_SW128）读取
+- **`hstu.h`**：新增 `v_d_stride` 字段（V 的 d 轴 stride；行主序=1，列主序=h*total_k）
+- **`hstu_ops_gpu.cpp`**：`v_d_stride = v.stride(-1)`，`v_row_stride = v.stride(-3)`；支持 `[n,h,d]` 和 `[d,h,n]` 两种 V 布局检测
+- **`hstu_fwd_kernel.h`**：TMA descriptor 从硬编码 `_1{}` 改为 `params.v_d_stride`
+- **Python（4 处）**：`v_fp8 = v_fp8.permute(2,1,0).contiguous().permute(2,1,0)`（sweep_accuracy.py、bench_hstu_attn_sm120.py、ncu_hstu_attn.py、cuda_hstu_attention.py）
+
+### 验证结果（2026-04-13）
+
+**sweep_accuracy.py**（quant_mode=2）：6/6 PASS，fp8_gt_cos ≈ 0.9985~0.9987
+
+**hstu_test.py 14 explicit @example cases**：14/14 PASS
+
+测试日志：`1test_results/072_hstu8_examples_qm2.log`
+
+### Phase 10 性能结果（RTX PRO 6000 Blackwell SM120，bs=4, h=16, d=128，full attention）
+
+kernel-only（2benchmark_results/029_1e241bfff_py_v_transpose.log）：
+
+| seq  | BF16 TFLOPS | FP8 TFLOPS | FP8/BF16 |
+|------|-------------|------------|----------|
+| 512  | 191         | 180        | -5.9%    |
+| 1024 | 287         | 281        | -1.9%    |
+| 2048 | 306         | 310        | **+1.4%** |
+| 4096 | 357         | 370        | **+3.5%** |
+
+**与 Phase 9 对比**（Phase 9 gpu=2212MHz）：
+
+| seq  | Phase 9 FP8 TFLOPS | Phase 10 FP8 TFLOPS | 提升   |
+|------|--------------------|--------------------|--------|
+| 512  | 127                | 180                | +42%   |
+| 1024 | 188                | 281                | +49%   |
+| 2048 | 206                | 310                | +50%   |
+| 4096 | 237                | 370                | +56%   |
+
+**关键结论**：seq≥2048 时 FP8 已超过 BF16，seq=1024 基本持平（-2%）。消除 SMEM transpose 是迄今最大的单项性能提升。
+
+### 后续优化方向（Phase 10 后）
+- [ ] **进一步减少 spill**：acc_o(64) + acc_s(64) = 128 regs 同时存活，加上 fragment 约 228 regs 超出 216 → 少量 spill 仍存在
+- [ ] **nsys profile**：量化 GEMM1/GEMM2/SFB+SFV load 各部分耗时，确定剩余瓶颈
+- [ ] **GQA 支持**：SFV 目前假设 h=h_k（非 GQA）
 
 ---
 
@@ -363,7 +421,7 @@ benchmark 日志：`benchmark_results/022_147b3416_gpu2212MHz_setmaxnreg_216.log
 `fbgemm_gpu/experimental/hstu/src/hstu_blackwell_sm120/`
 - `hstu_fwd_kernel.h` — 前向内核（BF16 + FP8 非WS路径 + include WS文件）★核心
 - `hstu_fwd_kernel_fp8_ws.h` — Phase 6 WS FP8 内核主体（由 hstu_fwd_kernel.h include）★
-- `kernel_traits.h` — BF16 + FP8 内核 traits（含 SmemLayoutVt_TMA = MN_SW128）
+- `kernel_traits.h` — BF16 + FP8 内核 traits（SmemLayoutVt_TMA = K_SW128，Phase 10 后）
 - `hstu_ops_gpu.cpp` — PyTorch 入口（`hstu_varlen_fwd_120`）
 - `hstu.h` — Params 结构体（含 FP8 descale 字段）
 - `utils.h` — tile 大小、类型转换、silu 辅助
@@ -419,38 +477,54 @@ pip install --no-build-isolation --config-settings editable_mode=compat -e .
 
 注：`mkdir -p /tmp/claude` 必须先执行（sandbox 将 TMPDIR 设为该路径，nvcc 编译需要它存在）。
 
-**运行准确度测试**：
-```bash
-HSTU_SWEEP_FP8_QUANT_MODE=2 python /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/sweep_accuracy.py \
-  2>&1 | tee /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/test_results/NNN_xxx.log
-```
-
-**测试日志命名规范**：文件名格式 `NNN_<修改内容简述>.log`，NNN 为三位数字顺序编号。
-
 **环境版本**：PyTorch 2.10.0（nvcr.io/nvidia/pytorch:26.01-py3）；CUDA 13.1。
 
 ---
 
-## 性能分析流程（每轮优化后必须执行）
+## 功能验证流程
 
-每次跑完 benchmark 之后，必须按以下步骤做 nsys profile 分析，找到性能瓶颈并制定下一步优化方向。
+每次代码修改后必须依次执行以下两步验证。
 
-**文件命名规范**：所有 benchmark 产物（bench log、nsys trace、stats log）统一存放在 `benchmark_results/` 目录，文件名格式与 `test_results/` 相同：`NNN_<内容简述>.<ext>`，NNN 为三位数字顺序编号。
+**日志命名规范**：`1test_results/NNN_<修改内容简述>.log`，NNN 为三位数字顺序编号。
 
-**Log 文件名必须包含 commit id 和 GPU 频率**，格式：`NNN_<commit_short>_gpu<MHz>MHz_<描述>.log`，例如 `009_ab6f6a3c_gpu2407MHz_phase9_col_major_v.log`。
+### 步骤 1：sweep_accuracy.py（数值正确性）
+
+```bash
+HSTU_SWEEP_FP8_QUANT_MODE=2 \
+python /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/sweep_accuracy.py \
+  2>&1 | tee /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/1test_results/NNN_xxx.log
+```
+
+检查各配置的 `fp8_gt_cos` ≥ 0.995。
+
+### 步骤 2：run_hstu8_examples.sh（14 个 example case）
+
+```bash
+bash /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/run_hstu8_examples.sh
+```
+
+检查输出为 `14/14 passed`，覆盖 causal/rab/drab/local/context/target/arbitrary 等所有掩码类型。
+
+---
+
+## 性能分析流程
+
+每次优化后按以下三步分析，定位瓶颈并制定下一步方向。
+
+**文件命名规范**：
+- benchmark log：`2benchmark_results/NNN_<commit_short>_gpu<MHz>MHz_<描述>.log`
+- profile 产物：`3profile_results/NNN_<描述>.*`（nsys-rep、ncu-rep、csv、stats.log）
+- SASS：`4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full.sass`
 
 ### 前置：锁定 GPU 频率
 
 跑 benchmark 前必须锁频，保证结果可复现、跨 session 可比较。
 
 ```bash
-# 查询当前最大可用 graphics clock
-nvidia-smi -q -d SUPPORTED_CLOCKS | grep "Graphics" | head -3
-
 # 锁定（需要 sudo 或 persistence mode 已开启）
 sudo nvidia-smi -lgc 2407   # 2407 = RTX PRO 6000 Blackwell 的最大 boost clock
 
-# 验证锁频是否生效
+# 验证
 nvidia-smi --query-gpu=clocks.current.graphics,clocks.max.graphics \
   --format=csv,noheader,nounits
 
@@ -458,50 +532,66 @@ nvidia-smi --query-gpu=clocks.current.graphics,clocks.max.graphics \
 sudo nvidia-smi -rgc
 ```
 
-### 步骤 1：运行 benchmark
+### 步骤 1：bench_hstu_attn_sm120.py（整体延迟 / TFLOPS）
+
 ```bash
 REPO=/home/scratch.minyu_gpu/project/shopee/fbgemm-hstu
 COMMIT=$(git -C ${REPO} rev-parse --short HEAD)
 CLOCK=$(nvidia-smi --query-gpu=clocks.current.graphics --format=csv,noheader,nounits | head -1 | tr -d ' ')
+PYTHONUSERBASE=/home/scratch.minyu_gpu/project/.cache/pip-user \
 python ${REPO}/fbgemm_gpu/experimental/hstu/benchmark/bench_hstu_attn_sm120.py \
-  2>&1 | tee ${REPO}/benchmark_results/NNN_${COMMIT}_gpu${CLOCK}MHz_<描述>.log
+  2>&1 | tee ${REPO}/2benchmark_results/NNN_${COMMIT}_gpu${CLOCK}MHz_<描述>.log
 ```
 
-### 步骤 2：nsys profile 抓取 trace
+关注 FP8/BF16 延迟比值和 TFLOPS，与上一版本对比。
+
+### 步骤 2：run_profile.sh（nsys + ncu）
+
 ```bash
-REPO=/home/scratch.minyu_gpu/project/shopee/fbgemm-hstu
-TRACE=${REPO}/benchmark_results/NNN_profile
-nsys profile \
-  --output ${TRACE} \
-  --trace cuda,nvtx \
-  --force-overwrite true \
-  python ${REPO}/fbgemm_gpu/experimental/hstu/benchmark/profile_hstu_attn.py
+cd /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu
+./run_profile.sh NNN <描述>
+# 例如：./run_profile.sh 031 phase10
 ```
 
-### 步骤 3：nsys stats 分析 trace
+**输出产物**（均在 `3profile_results/`）：
+
+| 产物 | 说明 |
+|------|------|
+| `NNN_<desc>.nsys-rep` | nsys timeline trace |
+| `NNN_<desc>_stats.log` | nsys stats CSV（kernel 耗时汇总） |
+| `NNN_<desc>_ncu_fp8.ncu-rep` | FP8 WS kernel ncu full profile |
+| `NNN_<desc>_ncu_bf16.ncu-rep` | BF16 kernel ncu full profile |
+| `NNN_<desc>_ncu_fp8.csv` | FP8 ncu 指标 CSV |
+| `NNN_<desc>_ncu_bf16.csv` | BF16 ncu 指标 CSV |
+
+脚本结束后自动打印关键指标摘要：寄存器数、LDL/STL spill、warp stall 分布、SM 吞吐。
+
+profile 目标脚本：`benchmark/ncu_hstu_attn.py`（固定 seq=512, bs=1/4, h=16, d=128）。
+
+注：nsys 2025.6.1 report 名称为 `cuda_gpu_kern_sum,cuda_api_sum,nvtx_pushpop_sum`。
+
+**分析重点**（ncu CSV / 摘要）：
+- `launch__registers_per_thread`：实际寄存器分配（math warp 目标 216）
+- `l1tex__t_sectors_pipe_lsu_mem_local_op_ld/st.sum`：LDL/STL spill 次数，越低越好
+- `smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct`：GMEM/SMEM 依赖 stall
+- `smsp__warp_issue_stalled_math_throttle_per_warp_active.pct`：MMA pipe 压力
+- `sm__throughput.avg.pct_of_peak_sustained_elapsed`：SM 利用率
+
+### 步骤 3：dump_sass_fp8_ws.sh（SASS / reg spill）
+
 ```bash
-nsys stats \
-  --report cuda_gpu_kern_sum,cuda_api_sum,nvtx_pushpop_sum \
-  --force-export true \
-  --format csv \
-  ${TRACE}.nsys-rep \
-  2>&1 | tee ${REPO}/benchmark_results/NNN_stats.log
+cd /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu
+./dump_sass_fp8_ws.sh
+# 输出：4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full.sass
 ```
 
-注：nsys 2025.6.1 的 report 名称为 `cuda_gpu_kern_sum,cuda_api_sum,nvtx_pushpop_sum`（非旧版的 `gputrace,cudaapisum,nvtxsum`）。
+脚本输出 MaxReg（最大寄存器号），直接反映编译器实际寄存器分配。SASS 中搜索 `LDL`/`STL` 指令可定位 spill 热点。
 
-### 步骤 4：分析瓶颈并制定优化方向
-
-看 `cuda_gpu_kern_sum` 输出，重点关注：
-- **HSTU kernel 耗时占比**：是否 compute-bound 还是 memory-bound
-- **kernel 内部 stall**：通过 duration 与理论 FLOP/s 对比判断
-- **量化 kernel 耗时**：`quant_mode=2` 时 Python 侧量化 kernel 的开销（出现在 CUDA API 调用中）
-- **SM 利用率**：kernel duration × SM count vs 理论峰值
-
-分析完成后，根据瓶颈类型制定下一步优化方向：
-- 若 compute-bound → 考虑 instruction-level 优化（减少 SF 加载、register spill）
-- 若 memory-bound → 考虑增加 prefetch stage 数、TMA multicast
-- 若量化开销主导 → 考虑将量化融合进 kernel
+**分析方向**：
+- spill 多（LDL/STL > 0）→ 减少同时存活寄存器（acc_o 64 + acc_s 64 是主要压力）
+- Long Scoreboard stall 高 → 增加 prefetch 距离或减少 SMEM 依赖
+- Math Throttle 高 → 接近 compute bound，减少非 MMA 指令
+- 量化开销主导 → 考虑将量化融合进 kernel
 
 ---
 
@@ -512,7 +602,8 @@ fbgemm_gpu/experimental/hstu/
 ├── benchmark/
 │   ├── bench_hstu_attn.py               # 吞吐量基准测试（通用）
 │   ├── bench_hstu_attn_sm120.py         # SM120 专用 benchmark ★
-│   └── profile_hstu_attn.py             # nsys 性能分析脚本
+│   ├── ncu_hstu_attn.py                 # ncu profile 目标脚本（固定 seq/bs/h/d）★
+│   └── profile_hstu_attn.py             # nsys 性能分析脚本（旧版，已被 run_profile.sh 覆盖）
 ├── hstu/
 │   ├── cuda_hstu_attention.py           # Python 入口，SM 版本分发
 │   └── library.py                       # 命名空间包检测（已修复）
@@ -520,8 +611,9 @@ fbgemm_gpu/experimental/hstu/
 │   ├── generate_kernels.py              # 生成 Hopper/Blackwell .cu 文件
 │   ├── hstu_ampere/                     # Ampere (SM80) 原生内核（upstream）
 │   ├── hstu_blackwell/                  # SM100 原生内核（upstream，CuTe-DSL 实现）
-│   ├── hstu_blackwell_sm120/            # SM120 最终版本（Phase 4，当前主目录）★
-│   │   ├── hstu_fwd_kernel.h            # 前向内核（BF16 + FP8 block-scale + K/V 预取）★
+│   ├── hstu_blackwell_sm120/            # SM120 最终版本（当前主目录）★
+│   │   ├── hstu_fwd_kernel.h            # 前向内核（BF16 + FP8 block-scale + include WS文件）★
+│   │   ├── hstu_fwd_kernel_fp8_ws.h     # FP8 WS 内核主体（Phase 6+）★
 │   │   ├── kernel_traits.h
 │   │   ├── hstu_ops_gpu.cpp
 │   │   ├── hstu.h
@@ -540,9 +632,17 @@ fbgemm_gpu/experimental/hstu/
     └── sm120_blockscaled_utils.cuh      # 类型定义（tile/MMA/SMEM/Barrier）
 
 （项目根目录）
+├── run_profile.sh                       # nsys + ncu 一键 profile 脚本 ★
+│                                        # 用法：./run_profile.sh NNN <描述>
+│                                        # 产物：3profile_results/NNN_<描述>.*
+├── dump_sass_fp8_ws.sh                  # 从 .so 提取 FP8 WS kernel SASS ★
+│                                        # 用法：./dump_sass_fp8_ws.sh
+│                                        # 产物：4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full.sass
+
+（项目根目录）
 ├── sweep_accuracy.py                    # FP8 vs BF16 准确度扫描 ★
 ├── memory.md                            # Claude 对话记忆（跨会话）
-└── test_results/
+└── 1test_results/
     └── NNN_*.log                        # 编号调试日志
 ```
 
