@@ -1579,15 +1579,13 @@ void run_hstu_fwd_sm120_fp8_tma_impl(Hstu_fwd_params& params, cudaStream_t strea
       cute::make_shape(cute::Int<kBlockN>{}, cute::Int<kHeadDim>{}),
       cute::_1{});
 
-  // V^T TMA: GMEM [d, total_k, h_k] strides [v_d_stride, v_row_stride, v_head_stride].
-  // Row-major V: v_d_stride=1, v_row_stride=h*d → d-axis is stride-1 → MN_SW128 (d inner).
-  // Col-major V: v_d_stride=h*total_k, v_row_stride=1 → token-axis is stride-1 → K_SW128 (token inner).
-  // SmemLayoutVt_TMA = K_SW128[kHeadDim, kBlockN] requires col-major V (v_row_stride=1).
+  // V^T TMA: GMEM [d, total_k, h_k] strides [1, v_row_stride, v_head_stride].
+  // Tile [kHeadDim, kBlockN]: unambiguous 1:1 dim mapping when kHeadDim==kBlockN==128.
   auto tensor_Vt_full = cute::make_tensor(
       cute::make_gmem_ptr(static_cast<FP8Elem*>(params.v_ptr)),
       cute::make_layout(
           cute::make_shape(params.d, params.total_k, params.h_k),
-          cute::make_stride(params.v_d_stride, params.v_row_stride, params.v_head_stride)));
+          cute::make_stride(cute::_1{}, params.v_row_stride, params.v_head_stride)));
   auto tma_vt = cute::make_tma_copy(
       cute::SM90_TMA_LOAD{},
       tensor_Vt_full,
@@ -1673,13 +1671,15 @@ void run_hstu_fwd_sm120_fp8_ws_tma_impl(Hstu_fwd_params& params, cudaStream_t st
       cute::make_shape(cute::Int<kBlockN>{}, cute::Int<kHeadDim>{}),
       cute::_1{});
 
-  // V^T TMA: GMEM [d, total_k, h_k] strides [v_d_stride, v_row_stride, v_head_stride].
-  // Col-major V: v_d_stride=h*total_k, v_row_stride=1 → token-axis stride-1 → K_SW128 (token inner).
+  // V^T TMA: GMEM described as [d, total_k, h_k] strides [1, v_row_stride, v_head_stride].
+  // Tile = [kHeadDim, kBlockN]: dim 0 = d (kHeadDim), dim 1 = k (kBlockN).
+  // Unambiguous 1:1 dim mapping even when kHeadDim == kBlockN == 128.
+  // SmemLayoutVt_TMA uses MN_SW128 → kHeadDim (d, stride-1 in GMEM) is SMEM inner axis.
   auto tensor_Vt_full = cute::make_tensor(
       cute::make_gmem_ptr(static_cast<FP8Elem*>(params.v_ptr)),
       cute::make_layout(
           cute::make_shape(params.d, params.total_k, params.h_k),
-          cute::make_stride(params.v_d_stride, params.v_row_stride, params.v_head_stride)));
+          cute::make_stride(cute::_1{}, params.v_row_stride, params.v_head_stride)));
   auto tma_vt = cute::make_tma_copy(
       cute::SM90_TMA_LOAD{},
       tensor_Vt_full,

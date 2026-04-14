@@ -108,3 +108,24 @@ fbgemm_gpu/experimental/hstu/src/hstu_blackwell_sm120/instantiations/*.cu
 *.log
 .humanize*
 ls
+1test_results
+2benchmark_results
+3profile_results
+4sass_dump_ws
+
+# Phase 11 working files
+PLAN.md
+PLAN_phase11.md
+plan_phase11_ldsmt.md
+docker-entrypoint.sh.bak
+sass_dump.txt
+sass_dump_1.txt
+sass_dump_216.txt
+sass_dump_224.txt
+tmp_ncu/
+unit_test/
+unit_test_cursor/
+ws_sync_flow.drawio
+knowledge.md
+memory.md
+.codex

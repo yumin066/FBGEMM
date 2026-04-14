@@ -21,6 +21,8 @@
 - [x] **Phase 8**：TMA SFV（Scale Factor V via TMA，load warp 同批发射 K+V^T+SFB+SFV）— 14/14 全通过（2026-04-04）
 - [x] **Phase 9**：12-warp 结构（3 个完整 warpgroup）+ `setmaxnreg 216` → math warp 寄存器提升至 216，消除 TRY_ALLOC deadlock，FP8/BF16 比从 ~1.7-2.1x 改善至 ~1.52-1.56x — 验证通过（2026-04-08）
 - [x] **Phase 10**：消除 SMEM transpose（Python 侧 V 列主序 + kernel SmemLayoutVt_TMA 改为 K_SW128）→ seq≥2048 时 FP8 超过 BF16，seq=1024 基本持平 — 验证通过（2026-04-13）
+- [ ] **Phase 11**：替换为原生 SM120 CuTe 类型——用 `cute/arch/copy_sm100.hpp`、`cute/arch/mma_sm120.hpp`、`cute/atom/copy_traits_sm100.hpp`、`cute/atom/mma_traits_sm120.hpp` 替换当前 `mma_sm89.hpp`/`mma_traits_sm89.hpp`/`mma_traits_sm90_gmma.hpp`
+- [ ] **Phase 12**：消除 kernel 内 SMEM transpose（MN_SW128→K_SW128，256 线程 + 2×`bar.sync 1,256`）— 使用 `SM100_U8x16_LDSM_T`（`ldmatrix.m16n16.x2.trans.b8`），在 LDSM 从 SMEM 拷贝到寄存器时同步完成转置
 
 ### Phase 4 最终性能结果（RTX PRO 6000 Blackwell SM120，2026-03-27）
 
@@ -409,9 +411,40 @@ kernel-only（2benchmark_results/029_1e241bfff_py_v_transpose.log）：
 **关键结论**：seq≥2048 时 FP8 已超过 BF16，seq=1024 基本持平（-2%）。消除 SMEM transpose 是迄今最大的单项性能提升。
 
 ### 后续优化方向（Phase 10 后）
+- [ ] **Phase 11 - 原生 SM120 CuTe 类型**：用 `cute/arch/copy_sm100.hpp`、`cute/arch/mma_sm120.hpp`、`cute/atom/copy_traits_sm100.hpp`、`cute/atom/mma_traits_sm120.hpp` 替换当前 `mma_sm89.hpp`/`mma_traits_sm89.hpp`/`mma_traits_sm90_gmma.hpp`
+- [ ] **Phase 12 - 消除 SMEM transpose**：使用 `SM100_U8x16_LDSM_T`（`ldmatrix.m16n16.x2.trans.b8`），在 LDSM 从 SMEM 拷贝到寄存器时同步完成转置，省掉 MN_SW128→K_SW128 的协作转置循环（2×`bar.sync 1,256` + 16KB copy）
 - [ ] **进一步减少 spill**：acc_o(64) + acc_s(64) = 128 regs 同时存活，加上 fragment 约 228 regs 超出 216 → 少量 spill 仍存在
 - [ ] **nsys profile**：量化 GEMM1/GEMM2/SFB+SFV load 各部分耗时，确定剩余瓶颈
 - [ ] **GQA 支持**：SFV 目前假设 h=h_k（非 GQA）
+
+---
+
+## Phase 11 进行中：SM100_U8x16_LDSM_T 替代 SMEM Transpose
+
+**目标**：用 `ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8` 在 SMEM→寄存器搬运时完成转置，消除每个 N-block 迭代中的协作 SMEM 转置开销。
+
+### 背景
+
+当前 FP8 WS kernel 中，TMA 将 V^T 写入 `sVt_cur`（MN_SW128，[kHeadDim, kBlockN]，d-axis fast）。在 GEMM2 之前，256 个 math 线程必须将 `sVt_cur`（MN_SW128）逐元素搬运到 `sK_cur`（K_SW128），这是一次 16KB SMEM→SMEM 拷贝，前后各需一个 `bar.sync 1, 256`。
+
+**Phase 11 数据路径**：
+```
+GMEM V（d stride-1）→ TMA → MN_SW128 SMEM [kHeadDim, kBlockN]
+  → ldmatrix.m16n16.x2.trans.b8（LDSM_T）→ 寄存器（QMMA B 格式）
+```
+
+省去：256 线程 SMEM transpose 循环 + 2×`bar.sync 1,256`。
+
+### 实现要点
+
+- **SM100_U8x16_LDSM_T**：CUTLASS 现有 struct，定义于 `cute/arch/copy_sm100.hpp`，`Copy_Traits` 定义于 `cute/atom/copy_traits_sm100.hpp`；`cute/tensor.hpp` include 链已覆盖，无需额外 include
+- **guard 风险**：`SM100_U8x16_LDSM_T` 的 PTX guard 为 `CUTE_ARCH_LDSM_SM100A_ENABLED`，覆盖 SM100A/SM120A，**不覆盖 SM120 消费级**（RTX PRO 6000）。在 SM120 消费级上运行会触发 `CUTE_INVALID_CONTROL_PATH`；需通过运行时测试验证该指令是否实际可用，否则走 Fallback 方案
+- **byte interleave**：SM100_U8x16_LDSM_T 内含 byte interleave（为 SM100A WGMMA B operand 设计），是否匹配 SM89 QMMA B register layout（K stride=8 within register bytes）需由 `sweep_accuracy.py` 数值验证；若 cos_sim < 0.99，尝试去掉 interleave（令 dst0=tmp0 等）
+- **替换位置**：`hstu_fwd_kernel_fp8_ws.h` 主循环中，删除 SMEM transpose loop + bar.sync，修改 s2r 段（从 sK_cur 改为 sVt_cur + SM100_U8x16_LDSM_T copy atom）
+
+### Fallback 方案
+
+若 SM120 消费级不支持该指令，可用**等效 K_SW128 重解释**（无需新 PTX）：对于 kHeadDim = kBlockN = 128 的正方形 tile，MN_SW128 和 K_SW128 物理字节相同（同一个 128-byte swizzle pattern），可直接将 `sVt_cur` 指针以 K_SW128 view 传给现有 LDSM_N（`s2r_copy_B2`），同样省去 SMEM transpose loop。
 
 ---
 

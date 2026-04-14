@@ -32,8 +32,6 @@ struct Hstu_params {
   index_t q_head_stride;
   index_t k_head_stride;
   index_t v_head_stride;
-  index_t v_d_stride = 1;  // stride along d-axis: 1 for row-major V, h*total_k for col-major V
-
   int h, h_k, h_rab;
   int h_h_k_ratio;
 

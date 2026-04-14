@@ -336,10 +336,6 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
                     k, cu_seqlens_k, fp8_type=torch.float8_e4m3fn)
                 v, v_descale, cu_seqlens_v_block_descale = quantize_for_block_scale_v_along_n(
                     v, cu_seqlens_k, block_size=bn, fp8_type=torch.float8_e4m3fn)
-                # Col-major V: only for WS TMA path (!has_rab).
-                # Has_rab=True falls back to cp.async which requires row-major V.
-                if rab is None:
-                    v = v.permute(2, 1, 0).contiguous().permute(2, 1, 0)
                 sf_q_packed = pack_descale_to_e8m0x4_int32(q_descale)
                 sf_k_packed = pack_descale_to_e8m0x4_int32(k_descale)
                 # v_descale has shape [H, total_blocks]; expand to [H, total_tokens] so

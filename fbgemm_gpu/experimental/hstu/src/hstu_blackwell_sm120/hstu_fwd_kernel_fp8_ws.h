@@ -904,10 +904,22 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         auto tXrP = s2r_thr_A2.retile_D(tCrP);
         cute::copy(s2r_copy_A2, tXsP, tXrP);
       }
+      asm volatile("bar.sync 1, 256;\n" : : : "memory");
+
+      // Cooperative SMEM transpose: Vt MN_SW128 → sK[math_stage] K_SW128.
+      {
+        Tensor sVt_mn = make_tensor(make_smem_ptr(sVt_cur), SmemLayoutVt_SW128{});
+        Tensor sVt_k  = make_tensor(make_smem_ptr(sK_cur),  SmemLayoutVt_K_SW128{});
+        for (int i = tidx_math; i < kHeadDim * kBlockN; i += kNMathThreads) {
+          sVt_k(i / kBlockN, i % kBlockN) = sVt_mn(i / kBlockN, i % kBlockN);
+        }
+      }
+      asm volatile("bar.sync 1, 256;\n" : : : "memory");
+
       { // tCrV, tCrSFV, tCrSFP scoped here: compiler can reuse registers freed by tCrK/tCrSFB.
-      // s2r V^T directly from sVt_cur (now K_SW128 format written by TMA — no SMEM transpose needed).
+      // s2r V^T from K_SW128 SMEM.
       auto sVt_k_pi = as_position_independent_swizzle_tensor(
-          make_tensor(make_smem_ptr(sVt_cur), SmemLayoutVt_K_SW128{}));
+          make_tensor(make_smem_ptr(sK_cur), SmemLayoutVt_K_SW128{}));
       Tensor tCrV = thr_mma_g2.partition_fragment_B(sVt_k_pi);
       {
         auto tXsVt = s2r_thr_B2.partition_S(sVt_k_pi);
