@@ -914,13 +914,14 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       }
 
       { // tCrV, tCrSFV, tCrSFP scoped here: compiler can reuse registers freed by tCrK/tCrSFB.
-      // s2r V^T — Phase 11 LDSM_T from non-swizzled D-major SMEM.
+      // s2r V^T — Phase 11 LDSM_T from MN_SW128-swizzled SMEM.
       //
-      // sVt_cur layout: SmemLayoutVt_TMA = Layout<[kHeadDim, kBlockN], [1, kHeadDim]> (no swizzle).
-      // TMA wrote V^T: elem[d, n_k] at byte offset n_k*kHeadDim + d.
+      // sVt_cur layout: SmemLayoutVt_TMA = tile_to_shape(MN_SW128_Atom<Element>, [kHeadDim, kBlockN]).
+      //   Swizzle<3,4,3>: physical_byte(d, n_k) = n_k * kHeadDim + (d ^ ((n_k & 7) << 4)).
+      //   TMA writes swizzled bytes automatically via the descriptor's swizzle mode.
       //
       // BS2 TiledMMA: AtomLayout<_2,_4,_1>, PermMmaTileN=Layout<_8,_4,_4, Stride<_1,_32,_8>>.
-      // → 4 N-warps (ThrN=0..3), each covering 32 N-columns: d ∈ [ThrN*32, ThrN*32+32).
+      // → 4 N-warps (ThrN=0..3), each covering 32 N-columns (d-direction): d ∈ [ThrN*32, ThrN*32+32).
       // n_warp = (tidx_math / 32) % 4  (= ThrN = warp_id % 4 from Stride<_4,_1,_0> AtomLayout).
       //
       // Fragment tXrV = recast<uint32_t>(tCrV): shape (2, 4, 4) = (reg, N_atom_in_warp, K_step).
@@ -929,11 +930,13 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       // ldmatrix.m16n16.x2.trans.b8 at iteration ni (ni=0..7):
       //   Covers n_k ∈ [ni*16, ni*16+16) and d ∈ [n_warp*32, n_warp*32+32).
       //   Thread lane provides row address for M0 (lanes 0..15, d_mat=0) or M1 (lanes 16..31, d_mat=16).
-      //   Each source address = vt_base + (ni*16 + n_off)*kHeadDim + n_warp*32 + d_mat.
-      //   With kHeadDim=128: (ni*16+n_off)*128 is 128-aligned, n_warp*32 ∈ {0,32,64,96},
-      //   d_mat ∈ {0,16} → every address is a multiple of 16 → 16B-aligned for ldmatrix. ✓
+      //   n_k_row = ni*16 + n_off; d_start = n_warp*32 + d_mat.
+      //   swizzle_xor = (n_k_row & 7) << 4 = (n_off & 7) << 4  (ni*16 contributes 0 mod 8).
+      //   Physical address = vt_base + n_k_row * kHeadDim + (d_start ^ swizzle_xor).
+      //   16B alignment: d_start ∈ {0,16,32,...,112}, swizzle_xor ∈ {0,16,...,112}
+      //   → (d_start ^ swizzle_xor) is always a multiple of 16. ✓
       //
-      //   After .trans, thread t gets:
+      //   After .trans, thread t gets (same logical element mapping as non-swizzled):
       //     r0: M0[4*(t&3)..+3][t>>2]   → d = n_warp*32      + (t>>2), K = ni*16+{4*(t&3),..,+3}
       //     r1: M0[4*(t&3)..+3][t>>2+8] → d = n_warp*32 +  8 + (t>>2), same K
       //     r2: M1[4*(t&3)..+3][t>>2]   → d = n_warp*32 + 16 + (t>>2), same K
@@ -954,7 +957,12 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         constexpr int kNTiles = kBlockN / 16;    // 8 (K-axis: 16 n_k values per LDSM_T call)
         CUTE_UNROLL
         for (int ni = 0; ni < kNTiles; ++ni) {
-          uint32_t addr = vt_base + (uint32_t)((ni * 16 + n_off) * kHeadDim + n_warp * 32 + d_mat);
+          // MN_SW128 swizzle: physical_byte(d, n_k) = n_k * kHeadDim + (d ^ ((n_k & 7) << 4)).
+          // n_k_row & 7 == n_off & 7 (since ni * 16 contributes 0 mod 8).
+          const int n_k_row     = ni * 16 + n_off;
+          const int d_start     = n_warp * 32 + d_mat;
+          const int swizzle_xor = (n_off & 7) << 4;
+          uint32_t addr = vt_base + (uint32_t)(n_k_row * kHeadDim + (d_start ^ swizzle_xor));
           uint32_t r0, r1, r2, r3;
           asm volatile(
               "ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0,%1,%2,%3},[%4];\n"

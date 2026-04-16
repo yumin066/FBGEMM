@@ -329,13 +329,15 @@ struct Hstu_fwd_kernel_traits_sm120_fp8 {
   using SmemLayoutQ_TMA  = decltype(tile_to_shape(SmemLayoutAtomSW128{}, Shape<Int<kBlockM>, Int<kHeadDim>>{}));
   using SmemLayoutK_TMA  = decltype(tile_to_shape(SmemLayoutAtomSW128{}, Shape<Int<kBlockN>, Int<kHeadDim>>{}));
   // V^T [kHeadDim, kBlockN] in SMEM, loaded via TMA from GMEM [d, total_k] (stride-1 on d axis).
-  // Phase 11: use non-swizzled D-major layout so that ldmatrix.m16n16.x2.trans.b8 source addresses
-  // are always 16B-aligned.  MN_SW128 swizzle shifts row starts by (n&7)*8 bytes, which breaks the
-  // 16B alignment required by ldmatrix on every other row (when (n&7) is odd, shift = 8 bytes ≡ 0 mod 16?
-  // No: (n&7)<<3 ∈ {0,8,16,24,...} — values 8,24,40,56 are NOT multiples of 16, so MN_SW128 does break
-  // alignment for those rows).  With a plain row-major layout every row start is a multiple of kHeadDim=128,
-  // which is 16B-aligned, so every LDSM_T source pointer is valid.
-  using SmemLayoutVt_TMA = Layout<Shape<Int<kHeadDim>, Int<kBlockN>>, Stride<_1, Int<kHeadDim>>>;
+  // Phase 11 swizzle: MN_SW128_Atom (Swizzle<3,4,3>) applied to [kHeadDim, kBlockN].
+  //   Physical byte(d, n_k) = n_k * kHeadDim + (d ^ ((n_k & 7) << 4))
+  // All LDSM_T source addresses remain 16B-aligned because:
+  //   d_start ∈ {0, 16, 32, ..., 112} and swizzle_xor = (n_off & 7) << 4 ∈ {0, 16, 32, ..., 112}
+  //   → (d_start ^ swizzle_xor) is always a multiple of 16. ✓
+  // TMA descriptor uses the swizzle natively, so TMA writes swizzled bytes automatically.
+  using SmemLayoutVt_TMA = decltype(tile_to_shape(
+      GMMA::Layout_MN_SW128_Atom<Element>{},
+      Shape<Int<kHeadDim>, Int<kBlockN>>{}));
 
   // Output layout: BF16 written to sO (reuses smem_ base), then copied to GMEM.
   // SM120 QMMA output uses PermMmaTileN = Layout<_8,_4,_4>, Stride<_1,_32,_8>, which
