@@ -623,6 +623,11 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     auto s2r_thr_A2   = s2r_copy_A2.get_thread_slice(tidx_math);
     auto s2r_copy_B2  = make_tiled_copy_B(typename BS2::SmemCopyAtomB{}, tiled_mma_g2);
     auto s2r_thr_B2   = s2r_copy_B2.get_thread_slice(tidx_math);
+    // LDSM_T tiled copy: construction succeeds; cute::copy is bypassed (static_assert in copy_unpack
+    // trips on MN_SW128 source). We use partition_S only to compute per-thread SMEM addresses, then
+    // issue the PTX and byte-reorder manually — matching SM100_U8x16_LDSM_T::copy() exactly.
+    auto s2r_copy_Vt  = make_tiled_copy_B(Copy_Atom<SM100_U8x16_LDSM_T, FP8Elem>{}, tiled_mma_g2);
+    auto s2r_thr_Vt   = s2r_copy_Vt.get_thread_slice(tidx_math);
     auto s2r_copy_SFA = make_tiled_copy_impl(typename BS1::SmemCopyAtomSF{},
         BS1::get_layoutSFA_TV(tiled_mma_g1), make_shape(size<0>(tile_shape(tiled_mma_g1)), _1{}));
     auto s2r_thr_SFA  = s2r_copy_SFA.get_thread_slice(tidx_math);
@@ -738,9 +743,12 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       smem_sfp_ptr[i] = 0x7f7f7f7f;
 
     // ===== MATH WARP DOUBLE-BUFFER QMMA CONSUMER LOOP =====
-    using SmemLayoutVt_K_SW128 = decltype(tile_to_shape(typename BS2::SmemLayoutAtomB{},
-        Shape<Int<kHeadDim>, Int<kBlockN>>{}));
-
+    // Phase 11: s2r V^T uses ldmatrix.m16n16.x2.trans.b8 (LDSM_T) directly from non-swizzled
+    // D-major SMEM (SmemLayoutVt_TMA = Layout<[kHeadDim,kBlockN],[1,kHeadDim]>).
+    // Source addressing: CuTe partition_S on s2r_thr_Vt gives 16B-aligned row pointers because
+    // every row start = n*kHeadDim + d_base with kHeadDim=128 (128-aligned) and d_base a multiple of 16.
+    static_assert(kHeadDim % 32 == 0 && kBlockN % 16 == 0,
+        "LDSM_T requires kHeadDim divisible by 32 and kBlockN divisible by 16.");
     int tma_wait_parity[2] = {1, 0};
     int math_stage = 0;
 
@@ -904,27 +912,61 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         auto tXrP = s2r_thr_A2.retile_D(tCrP);
         cute::copy(s2r_copy_A2, tXsP, tXrP);
       }
-      asm volatile("bar.sync 1, 256;\n" : : : "memory");
-
-      // Cooperative SMEM transpose: Vt MN_SW128 → sK[math_stage] K_SW128.
-      {
-        Tensor sVt_mn = make_tensor(make_smem_ptr(sVt_cur), SmemLayoutVt_SW128{});
-        Tensor sVt_k  = make_tensor(make_smem_ptr(sK_cur),  SmemLayoutVt_K_SW128{});
-        for (int i = tidx_math; i < kHeadDim * kBlockN; i += kNMathThreads) {
-          sVt_k(i / kBlockN, i % kBlockN) = sVt_mn(i / kBlockN, i % kBlockN);
-        }
-      }
-      asm volatile("bar.sync 1, 256;\n" : : : "memory");
 
       { // tCrV, tCrSFV, tCrSFP scoped here: compiler can reuse registers freed by tCrK/tCrSFB.
-      // s2r V^T from K_SW128 SMEM.
-      auto sVt_k_pi = as_position_independent_swizzle_tensor(
-          make_tensor(make_smem_ptr(sK_cur), SmemLayoutVt_K_SW128{}));
-      Tensor tCrV = thr_mma_g2.partition_fragment_B(sVt_k_pi);
+      // s2r V^T — Phase 11 LDSM_T from non-swizzled D-major SMEM.
+      //
+      // sVt_cur layout: SmemLayoutVt_TMA = Layout<[kHeadDim, kBlockN], [1, kHeadDim]> (no swizzle).
+      // TMA wrote V^T: elem[d, n_k] at byte offset n_k*kHeadDim + d.
+      //
+      // BS2 TiledMMA: AtomLayout<_2,_4,_1>, PermMmaTileN=Layout<_8,_4,_4, Stride<_1,_32,_8>>.
+      // → 4 N-warps (ThrN=0..3), each covering 32 N-columns: d ∈ [ThrN*32, ThrN*32+32).
+      // n_warp = (tidx_math / 32) % 4  (= ThrN = warp_id % 4 from Stride<_4,_1,_0> AtomLayout).
+      //
+      // Fragment tXrV = recast<uint32_t>(tCrV): shape (2, 4, 4) = (reg, N_atom_in_warp, K_step).
+      //   linear_idx = reg + 2*N_atom + 8*K_step.  Total = 32 uint32 per thread.
+      //
+      // ldmatrix.m16n16.x2.trans.b8 at iteration ni (ni=0..7):
+      //   Covers n_k ∈ [ni*16, ni*16+16) and d ∈ [n_warp*32, n_warp*32+32).
+      //   Thread lane provides row address for M0 (lanes 0..15, d_mat=0) or M1 (lanes 16..31, d_mat=16).
+      //   Each source address = vt_base + (ni*16 + n_off)*kHeadDim + n_warp*32 + d_mat.
+      //   With kHeadDim=128: (ni*16+n_off)*128 is 128-aligned, n_warp*32 ∈ {0,32,64,96},
+      //   d_mat ∈ {0,16} → every address is a multiple of 16 → 16B-aligned for ldmatrix. ✓
+      //
+      //   After .trans, thread t gets:
+      //     r0: M0[4*(t&3)..+3][t>>2]   → d = n_warp*32      + (t>>2), K = ni*16+{4*(t&3),..,+3}
+      //     r1: M0[4*(t&3)..+3][t>>2+8] → d = n_warp*32 +  8 + (t>>2), same K
+      //     r2: M1[4*(t&3)..+3][t>>2]   → d = n_warp*32 + 16 + (t>>2), same K
+      //     r3: M1[4*(t&3)..+3][t>>2+8] → d = n_warp*32 + 24 + (t>>2), same K
+      //   → r0..r3 fill N_atoms 0..3 of this warp (8 d-values each).
+      //   K mapping: K_step = ni>>1, reg = ni&1 → base = (ni&1) + 8*(ni>>1).
+      auto sVt_ns = make_tensor(make_smem_ptr(sVt_cur), SmemLayoutVt_SW128{});
+      Tensor tCrV = thr_mma_g2.partition_fragment_B(sVt_ns);
       {
-        auto tXsVt = s2r_thr_B2.partition_S(sVt_k_pi);
-        auto tXrV  = s2r_thr_B2.retile_D(tCrV);
-        cute::copy(s2r_copy_B2, tXsVt, tXrV);
+        const uint32_t vt_base = static_cast<uint32_t>(__cvta_generic_to_shared(sVt_cur));
+        const int lane   = tidx_math & 31;
+        const int n_off  = lane & 15;          // row index within 16-row group (for M0 or M1)
+        const int d_mat  = (lane >> 4) << 4;  // d-offset: 0 for M0 (lanes 0..15), 16 for M1 (16..31)
+        // n_warp: this warp's N-tile index (0..3). AtomLayout Stride<_4,_1,_0> → ThrN = warp_id % 4.
+        const int n_warp = (tidx_math / 32) % 4;
+
+        auto tXrV = recast<uint32_t>(tCrV);
+        constexpr int kNTiles = kBlockN / 16;    // 8 (K-axis: 16 n_k values per LDSM_T call)
+        CUTE_UNROLL
+        for (int ni = 0; ni < kNTiles; ++ni) {
+          uint32_t addr = vt_base + (uint32_t)((ni * 16 + n_off) * kHeadDim + n_warp * 32 + d_mat);
+          uint32_t r0, r1, r2, r3;
+          asm volatile(
+              "ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0,%1,%2,%3},[%4];\n"
+              : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+              : "r"(addr));
+          // K_step = ni>>1, reg = ni&1 → base = (ni&1) + 8*(ni>>1)
+          const int base = (ni & 1) + (8 * (ni >> 1));
+          tXrV(base + 0) = r0;   // N_atom=0: d ∈ [n_warp*32,    n_warp*32+8)
+          tXrV(base + 2) = r1;   // N_atom=1: d ∈ [n_warp*32+8,  n_warp*32+16)
+          tXrV(base + 4) = r2;   // N_atom=2: d ∈ [n_warp*32+16, n_warp*32+24)
+          tXrV(base + 6) = r3;   // N_atom=3: d ∈ [n_warp*32+24, n_warp*32+32)
+        }
       }
 
       // s2r SFP (unit) and SFV.
