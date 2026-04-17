@@ -46,9 +46,9 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
   static_assert(Kernel_traits::Is_fp8, "Phase 6 WS: FP8 path only");
   static_assert(!Kernel_traits::Has_rab, "Phase 6 WS: Has_rab not yet supported");
 
-  using BS1 = sm120_blockscaled_gemm::SM120BlockScaledBuilder<
+  using BS1 = hstu::SM120QmmaBuilder<
       Kernel_traits::kBlockM, Kernel_traits::kBlockN, 4>;
-  using BS2 = sm120_blockscaled_gemm::SM120BlockScaledBuilder<
+  using BS2 = hstu::SM120QmmaBuilder<
       Kernel_traits::kBlockM, Kernel_traits::kHeadDim, 4>;
   using FP8Elem = typename Kernel_traits::Element;
 

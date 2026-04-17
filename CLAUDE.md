@@ -98,7 +98,7 @@
 - [x] **Phase 9**：12-warp 结构（3 个完整 warpgroup）+ `setmaxnreg 216` → math warp 寄存器提升至 216，消除 TRY_ALLOC deadlock，FP8/BF16 比从 ~1.7-2.1x 改善至 ~1.52-1.56x — 验证通过（2026-04-08）
 - [x] **Phase 10**：消除 SMEM transpose（Python 侧 V 列主序 + kernel SmemLayoutVt_TMA 改为 K_SW128）→ seq≥2048 时 FP8 超过 BF16，seq=1024 基本持平 — 验证通过（2026-04-13）
 - [x] **Phase 11**：直接 PTX LDSM_T（`ldmatrix.m16n16.x2.trans.b8`）+ 手算 swizzle 地址，从 MN_SW128 SMEM 加载 V^T 到寄存器，消除 2×bar.sync + 16KB cooperative copy — 数值通过（fp8_gt_cos ≈ 0.9996，14/14 PASS）；附 MN_SW128 swizzle 优化，seq≥1024 FP8 全面超越 BF16（2026-04-16）
-- [ ] **Phase 12**：替换为原生 SM120 CuTe 类型——用 `cute/arch/copy_sm100.hpp`、`cute/arch/mma_sm120.hpp`、`cute/atom/copy_traits_sm100.hpp`、`cute/atom/mma_traits_sm120.hpp` 替换当前 `mma_sm89.hpp`/`mma_traits_sm89.hpp`/`mma_traits_sm90_gmma.hpp`
+- [x] **Phase 12**：代码整洁化——消除 6KD 绝对路径依赖、删除死代码（Phase 5 遗留 impl + Phase 4 generic FP8 body）、新建本地 `sm120_qmma_builder.h`、清理废弃 MMA 定义 — 完成（2026-04-17）
 
 ### Phase 4 最终性能结果（RTX PRO 6000 Blackwell SM120，2026-03-27）
 
@@ -548,9 +548,139 @@ kernel-only（2benchmark_results/029_1e241bfff_py_v_transpose.log）：
 
 seq≥1024 FP8 全面超越 BF16；seq=4096 causal 领先 15.2%。
 
-### 后续方向（Phase 12）
+### 后续方向（Phase 13+）
 
-替换为原生 SM120 CuTe 类型：用 `mma_sm120.hpp`/`mma_traits_sm120.hpp` 的 `SM120::BLOCKSCALED::SM120_16x8x32_TN_VS` 替换 SM89 MMA atom，实现真正的 block-scale 内置 MMA。
+详见 PLAN.md Phase 13 章节。
+
+---
+
+## Phase 12：代码整洁化（已完成，2026-04-17）
+
+**目标**：消除历史积累的代码腐化，使 `hstu_blackwell_sm120/` 目录结构清晰、自包含、可维护。不涉及任何功能修改或性能优化，纯代码质量改善。
+
+### 背景与现状问题
+
+| # | 问题 | 影响 |
+|---|------|------|
+| 1 | `hstu_fwd_kernel.h:60` 使用绝对路径 include 6KD 目录 | 代码不可移植，依赖外部目录结构 |
+| 2 | FP8 调用链含死代码 `run_hstu_fwd_sm120_fp8_tma_impl`（Phase 5 遗留，无调用入口） | 代码体积膨胀，误导阅读者 |
+| 3 | `cute` include 散落在 `hstu_fwd_kernel.h`、`utils.h`、6KD header 中 | include 顺序隐式依赖，难以维护 |
+| 4 | `kernel_traits.h` 混用 SM80/SM89/SM120 三套 MMA 定义，其中 SM89 的 `MMA_Atom_Arch` 和 `TiledMma` 对 WS FP8 路径是死代码 | 读者无法判断哪套定义实际在用 |
+
+### 关键发现（经 Codex 二次确认）
+
+- **WS FP8 路径已在用 SM120 原生 QMMA**：`SM120BlockScaledBuilder::TiledMma` 使用 `SM120::BLOCKSCALED::SM120_16x8x32_TN_VS`，Phase 12 的实质是把这个定义从 6KD 搬进本地 header，消除外部依赖
+- **SM89 MMA_Atom_Arch 在 WS 路径是死代码**：WS 内核完全不用 `Kernel_traits::MMA_Atom_Arch/TiledMma`，全程直接用 `BS1/BS2::TiledMma`；SM89 trait 只在 Has_rab=true 的非 WS 回退路径中仍然使用
+- **`run_hstu_fwd_sm120_fp8_tma_impl` 是纯死代码**：`run_hstu_fwd_sm120` dispatcher 只走 WS 或 Has_rab 回退，Phase 5 的 TMA-only（非 WS）impl 没有任何调用入口
+
+### 实施子步骤（按顺序，每步独立可验证）
+
+**Step 1：删除死代码** — `run_hstu_fwd_sm120_fp8_tma_impl`
+
+- 删除 `hstu_fwd_kernel.h:1539-1617` 的 `run_hstu_fwd_sm120_fp8_tma_impl` 函数及相关 TMA params struct
+- 同时删除 `hstu_fwd_kernel.h` 中 FP8 非 WS generic kernel body（`else{}` 分支内的 Phase 4 路径，约 800 行）
+- 风险：确认 `run_hstu_fwd_sm120_fp8_tma_impl` 在全仓无调用后方可删除
+- 验证：编译通过 + 14/14 examples PASS
+
+**Step 2：新建 `sm120_qmma_builder.h`，迁移 SM120BlockScaledBuilder 最小必要子集**
+
+- 在 `hstu_blackwell_sm120/` 目录新建 `sm120_qmma_builder.h`
+- 仅迁移 WS 内核实际使用的部分：
+  - `TiledMma`（= `SM120::BLOCKSCALED::SM120_16x8x32_TN_VS` + AtomLayout + PermMmaTileN）
+  - `SmemCopyAtomA/B`（= `Copy_Atom<SM75_U32x4_LDSM_N, float_e4m3_t>`）
+  - `SmemLayoutAtomA/B`（= `GMMA::Layout_K_SW128_Atom<float_e4m3_t>`）
+  - `SmemLayoutSFA/SFB`
+  - 静态方法：`partition_fragment_SFA/SFB`、`transform_fragment_for_qmma`、`get_layoutSFA/SFB_TV`
+- 不迁移：store/TMA/shared-storage 等 6KD 用于 GEMM standalone 的其他部分
+- 风险：静态方法的 CuTe layout 计算必须保持二进制语义一致；迁移后需跑 sweep_accuracy.py 验证
+- 验证：编译通过 + sweep_accuracy.py 6/6 PASS + 14/14 examples PASS
+
+**Step 3：删除 6KD include，改用本地 `sm120_qmma_builder.h`**
+
+- `hstu_fwd_kernel.h:57-60`：删除注释+绝对路径 include，改为 `#include "sm120_qmma_builder.h"`
+- 同步在 `kernel_traits.h` 中添加 `#include <cute/atom/mma_traits_sm120.hpp>`（SM120 QMMA 所需）
+- 风险：`CUTE_ARCH_TMA_SM120_ENABLED` 宏必须在 `copy_sm90_tma.hpp` 之前定义（当前在 `hstu_fwd_kernel.h:45`），收口时需保住此顺序
+- 验证：同 Step 2
+
+**Step 4：收口 CuTe includes 到 `kernel_traits.h`**
+
+- `hstu_fwd_kernel.h:51-52` 删除 `cute/tensor.hpp` 和 `cute/arch/copy_sm90_tma.hpp`，确认已通过 `kernel_traits.h` 间接引入
+- `utils.h` 中的 cute include 转为依赖 `kernel_traits.h` 的间接传递（utils.h 是私有 header，`kernel_traits.h` → `utils.h` 顺序保证）
+- 风险：include 传递顺序变化可能导致某些前向声明失效
+- 验证：编译通过
+
+**Step 5：清理 `kernel_traits.h` 死 MMA 定义**
+
+- 删除 `Hstu_fwd_kernel_traits_sm120_fp8` struct 中的 `MMA_Atom_Arch = SM89` 和对应 `TiledMma` 定义
+- 删除 `kernel_traits.h` 中 `cute/arch/mma_sm89.hpp` 和 `cute/atom/mma_traits_sm89.hpp` 的 include（前提：Has_rab 回退路径也已切换到 SM120 QMMA，或接受保留 SM89 include 仅用于 BF16 base struct）
+- 保留：BF16 base struct 的 `SM80 MMA_Atom_Arch`（BF16 活路径在用）
+- 风险：Has_rab 回退路径 `run_hstu_fwd_sm120_impl<..., Is_fp8=true>` 仍使用 `Hstu_fwd_kernel_traits_sm120_fp8::TiledMma`（SM89），该路径若仍保留则不能删 SM89 定义
+- 验证：编译通过 + 14/14 examples PASS（含 Has_rab case）
+
+### 文件改动汇总
+
+| 文件 | 改动 |
+|------|------|
+| `hstu_blackwell_sm120/sm120_qmma_builder.h` | **新建**：SM120BlockScaledBuilder 最小子集 |
+| `kernel_traits.h` | 新增 `mma_traits_sm120.hpp` include；删除 SM89 include（Step 5 后）；删除 FP8 traits 中 SM89 dead defs |
+| `hstu_fwd_kernel.h` | 删除 6KD 绝对路径 include；删除死代码（Phase 5 impl + Phase 4 generic FP8 body）；删除 cute includes（已在 kernel_traits.h 引入） |
+| `hstu_fwd_kernel_fp8_ws.h` | 无需改动（已经直接用 BS1/BS2） |
+
+### 完成结果（2026-04-17）
+
+commit `0aa00eca Refactor code`：
+- `sm120_qmma_builder.h` 新建 296 行，SM120BlockScaledBuilder 最小子集本地化，消除 6KD 绝对路径依赖
+- `hstu_fwd_kernel.h` 净删除 437 行：`run_hstu_fwd_sm120_fp8_tma_impl` 死代码 + Phase 4 generic FP8 kernel body 全部清除
+- `kernel_traits.h` 精简 56 行：SM89 废弃 MMA 定义清理，FP8 traits 添加注释说明 WS 路径直接用 BS1/BS2
+
+---
+
+## Phase 13：P staging 同步优化（规划中）
+
+**目标**：减少每个 N-block 迭代中 GEMM1→GEMM2 P 矩阵中转的 barrier 开销。
+
+### 当前 P staging 路径及开销
+
+每个 N-block（N_total 次）：
+```
+acc_s (F32, D-layout) → F32→FP8 convert → bar.sync 1,256 → SMEM write (16 STS/thread)
+  → bar.sync 1,256 → LDSM (16 LDS/thread) → tCrP (FP8, A-layout)
+```
+
+- 2×`bar.sync 1,256`（256线程全局同步，代价高）
+- 16 STS.128 + 16 LDS.128 per thread（32 SMEM 操作）
+
+### 为什么 warp shuffle 无法完全替代 SMEM
+
+**技术根因**（经 Codex 双重确认）：
+
+- `Stages_=4`（BS1/BS2 的 `AB_Stages=4`）对应 GEMM1 的 **HeadDim-K inner dimension** 的 4 个累积步骤（K=32 × 4 = 128），与 N 方向（P 的列）**正交**
+- GEMM1 K-step s 对 **所有** N-warp 的 P 列都有贡献，即 `P[m,n] = Σ_{s=0}^{3} Σ_{k∈[32s,32s+32)} Q[m,k]·K[n,k]`——P[:,j\*32:(j+1)\*32) 的最终值需等全部 4 个 K-step 完成
+- 与此同时，N-warp j 持有 P[:,j\*32:(j+1)\*32) 的 D 格式数据，但 GEMM2 同一 M-half 的其他 N-warp 也需要该数据→需要 1→4 跨 warp 广播
+- `__shfl_sync` 只在 32-lane warp 内工作，跨 warp 广播必须通过 SMEM
+
+**能做的 within-warp D→A 转换**（仅限 own K-slice）：
+- N-warp j 持有 P[:,j\*32:(j+1)\*32) 的 4 个 D atom（各 8 N-col），可用 group-of-4 内的 `__shfl_sync` 将 D 格式重排为 A 格式
+- A-lane (q,t_A=0) 需 D-lane t_D=0（own）和 t_D=1 的 FP8 数据；A-lane t_A=1 需 D-lane t_D=2 和 t_D=3 的数据（均 within-warp）
+- 但这只覆盖 1/4 GEMM2 K-step，其余 3/4 仍需 SMEM → 无法消除 bar.sync
+
+### 可行优化方案
+
+**方案 A（主要）：256-thread → 2×128-thread barrier**
+- 各 M-half（warps 0-3 / warps 4-7）的 P rows 不重叠（P[0..63] 和 P[64..127]）
+- 两个 M-half 可独立同步，各自用 128-thread barrier
+- `bar.sync 1,256 × 2` → `bar.sync A,128 + bar.sync B,128`（可并发）
+- 预期收益：同步代价减半
+
+**方案 B（可选）：消除第一个 bar.sync**
+- 第一个 `bar.sync` 的目的：等 sK（SMEM）被 GEMM1 消费完，再覆盖写 P
+- `sPbuf = sK_cur`（alias）是原因
+- 若给 P 分配独立 SMEM 区域（不与 sK 共用），第一个 bar.sync 可消除
+- 代价：需额外 16KB SMEM（128×128 FP8），需检查 SMEM 预算
+- 当前 kSmemSize 已很紧，可能不可行
+
+### 验证流程
+编译通过 + sweep_accuracy.py 6/6 PASS + run_hstu8_examples.sh 14/14 PASS + benchmark 对比 Phase 12 基线。
 
 ---
 

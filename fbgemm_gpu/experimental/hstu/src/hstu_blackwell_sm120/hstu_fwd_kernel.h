@@ -29,9 +29,7 @@
 #include "hstu.h"
 
 #include <cutlass/array.h>
-#include <cutlass/cutlass.h>
 #include <cutlass/numeric_conversion.h>
-#include <cutlass/numeric_types.h>
 
 // Force SM120-specific TMA path in cute/arch/copy_sm90_tma.hpp.
 // SM90_TMA_LOAD_xD::copy has two paths:
@@ -54,10 +52,7 @@
 #include "block_info.h"
 #include "kernel_traits.h"
 #include "static_switch.h"
-// Ensure cutlass::gemm namespace exists before sm120_blockscaled_utils.cuh tries
-// "using namespace cutlass::gemm" (some CUTLASS versions omit this sub-namespace).
-namespace cutlass { namespace gemm {} }
-#include "/home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/6KD_fp8_block_scale/kernels/include/sm120_blockscaled_gemm/sm120_blockscaled_utils.cuh"
+#include "sm120_qmma_builder.h"
 #include "utils.h"
 
 namespace flash {
@@ -68,7 +63,7 @@ using namespace cute;
 
 // Main HSTU forward attention kernel for SM120.
 // Supports both BF16 (Is_fp8=false) and FP8 (Is_fp8=true).
-template <typename Kernel_traits, bool Use_TMA_KV = false, typename Params>
+template <typename Kernel_traits, typename Params>
 inline __device__ void hstu_compute_attn_1rowblock_sm120(
     const Params& params,
     const int bidb,
@@ -708,8 +703,8 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
   } else {
     // Phase 1: FP8 block-scale (quant_mode=2), cp.async + unit SF (0x7f7f7f7f).
     // Uses SM120 QMMA (SM120_16x8x32_TN_VS block-scaled FP8 MMA).
-    using BS1 = sm120_blockscaled_gemm::SM120BlockScaledBuilder<kBlockM, kBlockN, 4>;
-    using BS2 = sm120_blockscaled_gemm::SM120BlockScaledBuilder<kBlockM, kHeadDim, 4>;
+    using BS1 = hstu::SM120QmmaBuilder<kBlockM, kBlockN, 4>;
+    using BS2 = hstu::SM120QmmaBuilder<kBlockM, kHeadDim, 4>;
 
     // SW128 SMEM layouts (required by SM120 block-scaled ldmatrix).
     using SmemLayoutQ_SW128 = decltype(tile_to_shape(
@@ -775,41 +770,6 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
     auto sSFA = as_position_independent_swizzle_tensor(sSFA_);
     auto sSFB = as_position_independent_swizzle_tensor(sSFB_);
 
-    // Phase 5 TMA: raw uint64_t mbarrier in SMEM.
-    // kv_mbar is used for both K and V^T TMA transfers (arrive_and_expect_tx counts both).
-    // We use a raw uint64_t* because CuTe's SM90_TMA_LOAD::with() takes uint64_t&.
-    uint64_t* kv_mbar_ptr = nullptr;
-    int kv_phase = 0;  // phase bit toggles each iteration (odd/even)
-    if constexpr (Use_TMA_KV) {
-        // Prefetch TMA descriptors from GMEM into L2/TDC before cp.async.bulk.tensor instructions.
-        // Required: without this prefetch, cp.async.bulk.tensor gives "Illegal instruction".
-        if (tidx == 0) {
-            cute::prefetch_tma_descriptor(params.tma_k.get_tma_descriptor());
-            cute::prefetch_tma_descriptor(params.tma_vt.get_tma_descriptor());
-        }
-        __syncthreads();
-
-        // Barrier placed at the last 8 bytes of kSmemSize (already reserved by kSmemMbarSize=8).
-        static constexpr int kSmemMbarOffset =
-            Kernel_traits::kSmemSize - Kernel_traits::kSmemMbarSize;
-        kv_mbar_ptr = reinterpret_cast<uint64_t*>(smem_ + kSmemMbarOffset);
-        if (tidx == 0) {
-            // Init mbarrier with 1 expected arrival (thread-0 issues arrive_and_expect_tx).
-            uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(kv_mbar_ptr));
-            asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n"
-                         : : "r"(smem_addr), "r"(1));
-        }
-        // fence.proxy.async.shared::cta: makes mbarrier init visible to async proxy (TMA).
-        asm volatile("fence.proxy.async.shared::cta;\n" : : : "memory");
-        __syncthreads();
-    }
-    // sVt_tma: V^T destination in SMEM at smem_q[kSmemQSize] (SmemLayoutVt_TMA layout).
-    // TMA loads V^T = [kHeadDim, kBlockN] directly here — no kernel-side transpose.
-    using SmemLayoutVt_TMA_t = typename Kernel_traits::SmemLayoutVt_TMA;
-    Tensor sVt_tma = make_tensor(
-        make_smem_ptr(
-            reinterpret_cast<FP8Elem*>(smem_q) + size(SmemLayoutK_SW128{})),
-        SmemLayoutVt_TMA_t{});
 
     // GMEM→SMEM copy for SW128 FP8 SMEM:
     // 8 threads/row × 16 FP8/thread = 128 FP8 per row (128-byte row = SW128 atom).
@@ -974,82 +934,17 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
       }
     };
 
-    // Phase 5 TMA issue lambda: issues TMA for K[nb] and V^T[nb] into SMEM,
-    // then calls arrive_and_expect_tx so kv_mbar opens when both DMAs complete.
-    // nb is the *relative* K-block index (0..n_block_max-1).
-    // Requires Use_TMA_KV=true AND binfo.sum_s_k % kBlockN == 0.
-    auto issue_tma_kv = [&](int nb) {
-        if constexpr (Use_TMA_KV) {
-            // Absolute tile index in the concatenated K/V tensor.
-            const int nb_abs = binfo.sum_s_k / kBlockN + nb;
-            const int bidh_kv = bidh / params.h_h_k_ratio;
-
-            // K: described as [total_k, d, h_k] with strides [k_row_stride, 1, k_head_stride].
-            // TMA inner mode = d (stride=1). Tile = [kBlockN, kHeadDim] to match SmemLayoutK_TMA.
-            auto mK_tma = params.tma_k.get_tma_tensor(
-                make_shape(params.total_k, params.d, params.h_k));
-            // Slice head dimension; result: [total_k, d]
-            auto gK_head = mK_tma(_, _, bidh_kv);
-            // local_tile with wildcard → (kBlockN, kHeadDim, 1, n_k_tiles)
-            auto gK_tiles = local_tile(gK_head,
-                Shape<Int<kBlockN>, Int<kHeadDim>>{},
-                make_coord(_, _));
-            auto tma_slice_K = params.tma_k.get_slice(0);
-            auto tKsK_d = tma_slice_K.partition_D(sK_sw128);
-            // gK_tiles: (kBlockN, kHeadDim, n_k_tiles, n_d_tiles=1). Fix mode 3 (n_d_tiles=0), vary mode 2 (n_k_tiles).
-            auto tKgK = tma_slice_K.partition_S(gK_tiles(_, _, _, Int<0>{}));
-
-            // Vt: transposed view [d, total_k, h_k] with strides [1, v_row_stride, v_head_stride].
-            // Tile = [kHeadDim, kBlockN] → gVt_tiles: (kHeadDim, kBlockN, n_d_tiles=1, n_k_tiles).
-            // Fix mode 2 (d-tile=0), vary mode 3 (n_k_tiles).
-            auto mVt_tma = params.tma_vt.get_tma_tensor(
-                make_shape(params.d, params.total_k, params.h_k));
-            auto gVt_head = mVt_tma(_, _, bidh_kv);
-            auto gVt_tiles = local_tile(gVt_head,
-                Shape<Int<kHeadDim>, Int<kBlockN>>{},
-                make_coord(_, _));
-            auto tma_slice_Vt = params.tma_vt.get_slice(0);
-            auto tVtsVt_d = tma_slice_Vt.partition_D(sVt_tma);
-            // partition_S(rank-3 input: kHeadDim, kBlockN, n_k_tiles) → rank-4.
-            auto tVtgVt = tma_slice_Vt.partition_S(gVt_tiles(_, _, Int<0>{}, _));
-
-            // Thread 0 issues both TMA copies then commits expected byte count.
-            // Indexing: partition_S(rank-3) → rank-4 (extra TMA mode). Use (_, _, _, nb_abs) to
-            // select tile nb_abs from the last (n_k_tiles) mode.
-            if (tidx == 0) {
-                cute::copy(params.tma_k.with(*kv_mbar_ptr), tKgK(_, _, _, nb_abs), tKsK_d);
-                cute::copy(params.tma_vt.with(*kv_mbar_ptr), tVtgVt(_, _, _, nb_abs), tVtsVt_d);
-                constexpr int kKBytes = kBlockN * kHeadDim * sizeof(FP8Elem);
-                constexpr int kVtBytes = kHeadDim * kBlockN * sizeof(FP8Elem);
-                uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(kv_mbar_ptr));
-                asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"
-                             : : "r"(smem_addr), "r"(kKBytes + kVtBytes));
-            }
-        }
-    };
-
-    // Phase 4/5 preamble: prefetch K[n0] AND V[n0]/V^T[n0] (and RAB[n0] if Has_rab).
-    if constexpr (!Use_TMA_KV) {
-        // Phase 4: cp.async K[n0] + V[n0] (V is [kBlockN, kHeadDim], transposed in kernel).
-        flash::copy<false, true>(gmem_tiled_copy_sw128,
-            tKgK(_,_,_, n_block), tKsK, tKVcKV,
-            actual_seqlen_k - n_block * kBlockN);
-        flash::copy<false, true>(gmem_tiled_copy_sw128,
-            tVgV(_,_,_, n_block), tVsV, tKVcKV,
-            actual_seqlen_k - n_block * kBlockN);
-        if constexpr (Has_rab) {
-            copy_g2s_rab(n_block, 0);
-        }
-        cute::cp_async_fence();
-    } else {
-        // Phase 5: TMA K[n0] + V^T[n0] directly into SMEM (no transpose needed).
-        issue_tma_kv(n_block);
-        if constexpr (Has_rab) {
-            copy_g2s_rab(n_block, 0);
-            cute::cp_async_fence();
-        }
-        // fwd_step_fp8bs will wait on kv_mbar before consuming K/Vt.
+    // Preamble: prefetch K[n0] + V[n0] (V transposed in fwd_step) and RAB[n0] if needed.
+    flash::copy<false, true>(gmem_tiled_copy_sw128,
+        tKgK(_,_,_, n_block), tKsK, tKVcKV,
+        actual_seqlen_k - n_block * kBlockN);
+    flash::copy<false, true>(gmem_tiled_copy_sw128,
+        tVgV(_,_,_, n_block), tVsV, tKVcKV,
+        actual_seqlen_k - n_block * kBlockN);
+    if constexpr (Has_rab) {
+        copy_g2s_rab(n_block, 0);
     }
+    cute::cp_async_fence();
 
     // nb       = actual K-block index for this iteration
     // nb_next  = actual K-block index to prefetch at end (-1 = no prefetch)
@@ -1072,31 +967,10 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
           smem_sfb_ptr[i] = 0x7f7f7f7f;
       }
 
-      // Phase 4/5 pipeline: K[nb] AND V[nb]/V^T[nb] were prefetched at end of
-      // previous iteration (or in the initial preamble).  Wait for completion and sync.
-      if constexpr (!Use_TMA_KV) {
-          // Phase 4: cp.async → one cp_async_wait<0> covers both K and V.
-          flash::cp_async_wait<0>();
-          __syncthreads();
-      } else {
-          // Phase 5: TMA → wait on mbarrier using try_wait (yields warp, avoids busy-spin stall).
-          // Use try_wait.parity with 0x989680 (~10M cycle) timeout per CUTLASS ClusterTransactionBarrier.
-          {
-              uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(kv_mbar_ptr));
-              uint32_t done = 0;
-              do {
-                  asm volatile(
-                      "{\n"
-                      ".reg .pred p;\n"
-                      "mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2, 0x989680;\n"
-                      "selp.u32 %0, 1, 0, p;\n"
-                      "}\n"
-                      : "=r"(done) : "r"(smem_addr), "r"((uint32_t)kv_phase));
-              } while (!done);
-          }
-          kv_phase ^= 1;
-          __syncthreads();
-      }
+      // K[nb] and V[nb] were prefetched at end of previous iteration (or in preamble).
+      // Wait for cp.async completion then sync so SMEM is visible to all threads.
+      flash::cp_async_wait<0>();
+      __syncthreads();
       auto sK_pi = as_position_independent_swizzle_tensor(sK_sw128);
       Tensor tCrK = thr_mma_g1.partition_fragment_B(sK_pi);
       {
@@ -1151,23 +1025,18 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
       }
 
       // GEMM1 bypass: accumulate raw Q×K^T into acc_o, skip mask/silu/GEMM2.
-      // No pending V cp.async (we skipped the V load above).
-      // Issue K prefetch for next iter so the pipeline keeps moving, then return.
+      // Issue K+V prefetch for next iter so the pipeline keeps moving, then return.
       if (params.debug_gemm1_only) {
         for (int i = 0; i < size(acc_s); ++i) acc_o(i) += acc_s(i);
         __syncthreads();
         if (nb_next >= 0) {
-          if constexpr (!Use_TMA_KV) {
-            flash::copy<false, true>(gmem_tiled_copy_sw128,
-                tKgK(_,_,_, nb_next), tKsK, tKVcKV,
-                actual_seqlen_k - nb_next * kBlockN);
-            flash::copy<false, true>(gmem_tiled_copy_sw128,
-                tVgV(_,_,_, nb_next), tVsV, tKVcKV,
-                actual_seqlen_k - nb_next * kBlockN);
-            cute::cp_async_fence();
-          } else {
-            issue_tma_kv(nb_next);
-          }
+          flash::copy<false, true>(gmem_tiled_copy_sw128,
+              tKgK(_,_,_, nb_next), tKsK, tKVcKV,
+              actual_seqlen_k - nb_next * kBlockN);
+          flash::copy<false, true>(gmem_tiled_copy_sw128,
+              tVgV(_,_,_, nb_next), tVsV, tKVcKV,
+              actual_seqlen_k - nb_next * kBlockN);
+          cute::cp_async_fence();
         }
         return;
       }
@@ -1248,36 +1117,25 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
           smem_sfb_ptr[i] = 0x7f7f7f7f;
       }
 
-      // Phase 4 (non-TMA): element-wise V^T transpose then s2r from smem_q[0].
-      // Phase 5 (TMA): V^T already loaded into sVt_tma at smem_q[kSmemQSize] by TMA.
-      //   Skip transpose; just sync before next TMA issue overwrites smem_q[kSmemQSize].
-      if constexpr (!Use_TMA_KV) {
-          // Sync to protect smem_q[0] between s2r P done and Vt transpose writes.
-          __syncthreads();
-          Tensor sVt_buf = make_tensor(
-              make_smem_ptr(reinterpret_cast<FP8Elem*>(smem_q)),
-              SmemLayoutVt_SW128{});
-          {
-              FP8Elem* sV_curr_ptr = reinterpret_cast<FP8Elem*>(smem_q) + size(SmemLayoutK_SW128{});
-              Tensor sV_curr = make_tensor(make_smem_ptr(sV_curr_ptr), SmemLayoutV_SW128{});
-              for (int idx = tidx; idx < kBlockN * kHeadDim; idx += Kernel_traits::kNThreads) {
-                  int k = idx / kHeadDim;
-                  int d = idx % kHeadDim;
-                  sVt_buf(d, k) = sV_curr(k, d);
-              }
+      // V^T transpose: cooperatively transpose V from SMEM into sVt_buf (smem_q[0]).
+      // Sync to protect smem_q[0] between s2r P done and Vt transpose writes.
+      __syncthreads();
+      Tensor sVt_buf = make_tensor(
+          make_smem_ptr(reinterpret_cast<FP8Elem*>(smem_q)),
+          SmemLayoutVt_SW128{});
+      {
+          FP8Elem* sV_curr_ptr = reinterpret_cast<FP8Elem*>(smem_q) + size(SmemLayoutK_SW128{});
+          Tensor sV_curr = make_tensor(make_smem_ptr(sV_curr_ptr), SmemLayoutV_SW128{});
+          for (int idx = tidx; idx < kBlockN * kHeadDim; idx += Kernel_traits::kNThreads) {
+              int k = idx / kHeadDim;
+              int d = idx % kHeadDim;
+              sVt_buf(d, k) = sV_curr(k, d);
           }
-          __syncthreads();
       }
+      __syncthreads();
 
       // s2r Vt: [kHeadDim, kBlockN] → tCrV registers (GEMM2 B operand).
-      // Non-TMA: from sVt_buf at smem_q[0] (after element-wise transpose).
-      // TMA: from sVt_tma at smem_q[kSmemQSize] (TMA loaded V^T directly, no transpose).
-      FP8Elem* sVt_read_ptr;
-      if constexpr (!Use_TMA_KV) {
-          sVt_read_ptr = reinterpret_cast<FP8Elem*>(smem_q);
-      } else {
-          sVt_read_ptr = reinterpret_cast<FP8Elem*>(smem_q) + size(SmemLayoutK_SW128{});
-      }
+      FP8Elem* sVt_read_ptr = reinterpret_cast<FP8Elem*>(smem_q);
       Tensor sVt_read = make_tensor(make_smem_ptr(sVt_read_ptr), SmemLayoutVt_SW128{});
       auto sVt_pi = as_position_independent_swizzle_tensor(sVt_read);
       Tensor tCrV = thr_mma_g2.partition_fragment_B(sVt_pi);
@@ -1289,28 +1147,16 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
 
       // Prefetch K[nb_next] + V[nb_next] for next iteration.
       if (nb_next >= 0) {
-          if constexpr (!Use_TMA_KV) {
-              // Phase 4: cp.async K + V (V transposed in next fwd_step).
-              flash::copy<false, true>(gmem_tiled_copy_sw128,
-                  tKgK(_,_,_, nb_next), tKsK, tKVcKV,
-                  actual_seqlen_k - nb_next * kBlockN);
-              flash::copy<false, true>(gmem_tiled_copy_sw128,
-                  tVgV(_,_,_, nb_next), tVsV, tKVcKV,
-                  actual_seqlen_k - nb_next * kBlockN);
-              if constexpr (Has_rab) {
-                  copy_g2s_rab(nb_next, 0);
-              }
-              cute::cp_async_fence();
-          } else {
-              // Phase 5: TMA K + V^T directly. Must sync first so s2r Vt (from
-              // smem_q[kSmemQSize]) is complete before TMA overwrites it.
-              __syncthreads();
-              issue_tma_kv(nb_next);
-              if constexpr (Has_rab) {
-                  copy_g2s_rab(nb_next, 0);
-                  cute::cp_async_fence();
-              }
+          flash::copy<false, true>(gmem_tiled_copy_sw128,
+              tKgK(_,_,_, nb_next), tKsK, tKVcKV,
+              actual_seqlen_k - nb_next * kBlockN);
+          flash::copy<false, true>(gmem_tiled_copy_sw128,
+              tVgV(_,_,_, nb_next), tVsV, tKVcKV,
+              actual_seqlen_k - nb_next * kBlockN);
+          if constexpr (Has_rab) {
+              copy_g2s_rab(nb_next, 0);
           }
+          cute::cp_async_fence();
       }
 
       // Load SFP (P scale) and SFV (V scale): both unit, reuse sSFA/sSFB.
@@ -1449,14 +1295,6 @@ __global__ void hstu_fwd_kernel_sm120(Params params) {
 
 } // temporarily close flash namespace to define global struct
 
-// Phase 5 TMA params: extends Hstu_fwd_params with TMA K and V^T descriptors.
-// TMA_K_t / TMA_Vt_t are the CuTe TMA copy atom types returned by make_tma_copy.
-template <typename TMA_K_t, typename TMA_Vt_t>
-struct Hstu_fwd_params_fp8_tma : public Hstu_fwd_params {
-    TMA_K_t tma_k;    // TMA descriptor for K: [total_k, d, h_k]
-    TMA_Vt_t tma_vt;  // TMA descriptor for V^T: [d, total_v, h_k] (pre-transposed)
-};
-
 // Phase 6 WS TMA params: extends Hstu_fwd_params with TMA Q, K, V^T, and SF descriptors.
 // TMA_Q_t / TMA_K_t / TMA_Vt_t are TMA copy atoms for FP8 data.
 // TMA_SFA_t / TMA_SFB_t are TMA copy atoms for int32 SF data.
@@ -1473,148 +1311,9 @@ struct Hstu_fwd_params_fp8_ws_tma : public Hstu_fwd_params {
 
 namespace flash {  // reopen flash namespace for kernel
 
-// Phase 5 TMA kernel: takes extended params with TMA descriptors.
-// Uses Use_TMA_KV=true to route to TMA code path in hstu_compute_attn_1rowblock_sm120.
-template <typename Kernel_traits, typename TMA_K_t, typename TMA_Vt_t>
-__global__ void __launch_bounds__(Kernel_traits::kNThreads)
-hstu_fwd_kernel_sm120_fp8_tma(
-    Hstu_fwd_params_fp8_tma<TMA_K_t, TMA_Vt_t> params) {
-  int m_block = gridDim.x - blockIdx.x - 1;
-  int bidh = blockIdx.y;
-  int bidb = blockIdx.z;
-  hstu_compute_attn_1rowblock_sm120<Kernel_traits, /*Use_TMA_KV=*/true>(
-      params, bidb, bidh, m_block);
-}
-
 #include "hstu_fwd_kernel_fp8_ws.h"  // Phase 6 WS kernel
 
 } // namespace flash
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <
-    typename elem_type,
-    int kHeadDim,
-    int kBlockM,
-    int kBlockN,
-    int kNWarps,
-    bool Is_causal,
-    bool Is_target,
-    bool Is_context,
-    bool Is_local,
-    bool Is_arbitrary,
-    int kNFunc,
-    bool Has_rab,
-    bool Is_fp8 = false,
-    bool Is_Q_in_regs = false,
-    bool Share_Q_K_smem = false>
-void run_hstu_fwd_sm120_impl(Hstu_fwd_params& params, cudaStream_t stream) {
-  using Kernel_traits = std::conditional_t<
-      Is_fp8,
-      Hstu_fwd_kernel_traits_sm120_fp8<
-          kHeadDim, kBlockM, kBlockN, kNWarps,
-          Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc, Has_rab,
-          Is_Q_in_regs, Share_Q_K_smem, cutlass::half_t>,  // FP16 output: matches q_raw dtype
-      Hstu_fwd_kernel_traits_sm120<
-          kHeadDim, kBlockM, kBlockN, kNWarps,
-          Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc, Has_rab,
-          Is_Q_in_regs, Share_Q_K_smem, elem_type>>;
-
-  size_t smem_size = Kernel_traits::kSmemSize;
-  const int num_m_block = (params.seqlen_q + kBlockM - 1) / kBlockM;
-  dim3 grid = dim3(num_m_block, params.h, params.b);
-  auto kernel = &flash::hstu_fwd_kernel_sm120<Kernel_traits, Hstu_fwd_params>;
-
-  if (smem_size >= 48 * 1024) {
-    C10_CUDA_CHECK(cudaFuncSetAttribute(
-        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-  }
-
-  kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-// Phase 5 TMA impl: creates TMA K and V^T descriptors on host, launches TMA kernel.
-// Requires all batch seqlens_k to be multiples of kBlockN=128 for correct tile addressing.
-template <
-    typename elem_type,
-    int kHeadDim,
-    int kBlockM,
-    int kBlockN,
-    int kNWarps,
-    bool Is_causal,
-    bool Is_target,
-    bool Is_context,
-    bool Is_local,
-    bool Is_arbitrary,
-    int kNFunc,
-    bool Has_rab,
-    bool Is_Q_in_regs = false,
-    bool Share_Q_K_smem = false>
-void run_hstu_fwd_sm120_fp8_tma_impl(Hstu_fwd_params& params, cudaStream_t stream) {
-  using Kernel_traits = Hstu_fwd_kernel_traits_sm120_fp8<
-      kHeadDim, kBlockM, kBlockN, kNWarps,
-      Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc, Has_rab,
-      Is_Q_in_regs, Share_Q_K_smem, cutlass::half_t>;
-
-  using FP8Elem = typename Kernel_traits::Element;
-  using SmemLayoutK_TMA  = typename Kernel_traits::SmemLayoutK_TMA;
-  using SmemLayoutVt_TMA = typename Kernel_traits::SmemLayoutVt_TMA;
-
-  // K TMA descriptor: K described as [total_k, d, h_k] with strides
-  // [k_row_stride, _1{}, k_head_stride].  TMA inner mode = d (stride=1),
-  // globalStrides[0] = k_row_stride * sizeof(FP8Elem) >= 16 bytes.
-  // Tile = [kBlockN, kHeadDim] to match SmemLayoutK_TMA layout.
-  auto tensor_K_full = cute::make_tensor(
-      cute::make_gmem_ptr(static_cast<FP8Elem*>(params.k_ptr)),
-      cute::make_layout(
-          cute::make_shape(params.total_k, params.d, params.h_k),
-          cute::make_stride(params.k_row_stride, cute::_1{}, params.k_head_stride)));
-  auto tma_k = cute::make_tma_copy(
-      cute::SM90_TMA_LOAD{},
-      tensor_K_full,
-      SmemLayoutK_TMA{},
-      cute::make_shape(cute::Int<kBlockN>{}, cute::Int<kHeadDim>{}),
-      cute::_1{});
-
-  // V^T TMA: GMEM [d, total_k, h_k] strides [1, v_row_stride, v_head_stride].
-  // Tile [kHeadDim, kBlockN]: unambiguous 1:1 dim mapping when kHeadDim==kBlockN==128.
-  auto tensor_Vt_full = cute::make_tensor(
-      cute::make_gmem_ptr(static_cast<FP8Elem*>(params.v_ptr)),
-      cute::make_layout(
-          cute::make_shape(params.d, params.total_k, params.h_k),
-          cute::make_stride(cute::_1{}, params.v_row_stride, params.v_head_stride)));
-  auto tma_vt = cute::make_tma_copy(
-      cute::SM90_TMA_LOAD{},
-      tensor_Vt_full,
-      SmemLayoutVt_TMA{},
-      cute::make_shape(cute::Int<kHeadDim>{}, cute::Int<kBlockN>{}),
-      cute::_1{});
-
-  using TMA_K_t  = decltype(tma_k);
-  using TMA_Vt_t = decltype(tma_vt);
-
-  // Build TMA params: copy base params then attach TMA descriptors.
-  Hstu_fwd_params_fp8_tma<TMA_K_t, TMA_Vt_t> tma_params;
-  static_cast<Hstu_fwd_params&>(tma_params) = params;
-  tma_params.tma_k  = tma_k;
-  tma_params.tma_vt = tma_vt;
-
-  size_t smem_size = Kernel_traits::kSmemSize;
-  const int num_m_block = (params.seqlen_q + kBlockM - 1) / kBlockM;
-  dim3 grid = dim3(num_m_block, params.h, params.b);
-  auto kernel = &flash::hstu_fwd_kernel_sm120_fp8_tma<Kernel_traits, TMA_K_t, TMA_Vt_t>;
-
-  if (smem_size >= 48 * 1024) {
-    C10_CUDA_CHECK(cudaFuncSetAttribute(
-        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-  }
-
-  kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(tma_params);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -1802,22 +1501,36 @@ void run_hstu_fwd_sm120(Hstu_fwd_params& params, cudaStream_t stream) {
   static constexpr bool Is_Q_in_regs = kHeadDim <= 128;
   static constexpr bool Share_Q_K_smem = kHeadDim <= 128;
 
+  const int num_m_block = (params.seqlen_q + kBlockM - 1) / kBlockM;
+  dim3 grid = dim3(num_m_block, params.h, params.b);
+
+  // Shared launch helper: sets smem attribute if needed, launches kernel, checks error.
+  auto launch_kernel = [&](auto kernel, int n_threads, size_t smem_size) {
+    if (smem_size >= 48 * 1024) {
+      C10_CUDA_CHECK(cudaFuncSetAttribute(
+          kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    }
+    kernel<<<grid, n_threads, smem_size, stream>>>(params);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  };
+
   if constexpr (Is_fp8_type) {
     if constexpr ((kBlockN % 128) == 0) {
       if constexpr (!Has_rab) {
-        // Phase 6 WS TMA: Q+K via TMA (load warp, thread 0), V via cp.async (load warp, 32 threads).
-        // No load/math overlap — sequential TMA→compute per tile.
-        // Has_rab not yet supported in WS kernel; fall through to Phase 4 impl for that case.
+        // WS TMA kernel: load warp issues TMA for Q/K/V^T/SFB/SFV; math warps do QMMA.
+        // Has_rab=true is not supported in WS kernel; handled by cp.async fallback below.
         run_hstu_fwd_sm120_fp8_ws_tma_impl<
             elem_type, kHeadDim, kBlockM, kBlockN, kNWarps,
             Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc, Has_rab,
             Is_Q_in_regs, Share_Q_K_smem>(params, stream);
       } else {
-        // Phase 4 cp.async fallback for Has_rab=true (WS kernel does not support RAB yet).
-        run_hstu_fwd_sm120_impl<
-            elem_type, kHeadDim, kBlockM, kBlockN, kNWarps,
+        // cp.async fallback for Has_rab=true (WS kernel does not support RAB).
+        using Kernel_traits = Hstu_fwd_kernel_traits_sm120_fp8<
+            kHeadDim, kBlockM, kBlockN, kNWarps,
             Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc, Has_rab,
-            /*Is_fp8=*/true, Is_Q_in_regs, Share_Q_K_smem>(params, stream);
+            Is_Q_in_regs, Share_Q_K_smem, cutlass::half_t>;
+        auto kernel = &flash::hstu_fwd_kernel_sm120<Kernel_traits, Hstu_fwd_params>;
+        launch_kernel(kernel, Kernel_traits::kNThreads, Kernel_traits::kSmemSize);
       }
     } else {
       // Compile-time gate: do not instantiate FP8 blockscaled kernel for unsupported N tiles.
@@ -1827,9 +1540,11 @@ void run_hstu_fwd_sm120(Hstu_fwd_params& params, cudaStream_t stream) {
           kBlockN);
     }
   } else {
-    run_hstu_fwd_sm120_impl<
-        elem_type, kHeadDim, kBlockM, kBlockN, kNWarps,
+    using Kernel_traits = Hstu_fwd_kernel_traits_sm120<
+        kHeadDim, kBlockM, kBlockN, kNWarps,
         Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc, Has_rab,
-        /*Is_fp8=*/false, Is_Q_in_regs, Share_Q_K_smem>(params, stream);
+        Is_Q_in_regs, Share_Q_K_smem, elem_type>;
+    auto kernel = &flash::hstu_fwd_kernel_sm120<Kernel_traits, Hstu_fwd_params>;
+    launch_kernel(kernel, Kernel_traits::kNThreads, Kernel_traits::kSmemSize);
   }
 }

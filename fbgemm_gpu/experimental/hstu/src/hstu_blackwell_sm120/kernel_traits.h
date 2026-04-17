@@ -19,13 +19,7 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/layout/layout.h"
 
-// SM89 FP8 MMA: mma.m16n8k32.e4m3.e4m3.f32 (supported on SM89+, including SM120 consumer)
-// Note: SM120 consumer (RTX Pro) uses SM89-style FP8 MMA (works on __CUDA_ARCH__ >= 890).
-//       SM120A (datacenter B100/B200) supports a different 'kind::f8f6f4' variant,
-//       but that variant is NOT available on SM120 consumer hardware.
-#include "cute/arch/mma_sm89.hpp"
-#include "cute/atom/mma_traits_sm89.hpp"
-#include "cute/atom/mma_traits_sm90_gmma.hpp"  // for GMMA::Layout_K_SW128_Atom (Phase 5 TMA)
+#include "cute/atom/mma_traits_sm90_gmma.hpp"  // for GMMA::Layout_K_SW128_Atom / Layout_MN_SW128_Atom
 
 using namespace cute;
 
@@ -204,13 +198,12 @@ struct Hstu_fwd_kernel_traits_sm120 : public Base {
       Layout<Shape<_1, _8>>{}));
 };
 
-// SM120 FP8 forward kernel traits (Phase 2).
+// SM120 FP8 forward kernel traits.
 // Q, K, V are FP8 (e4m3) in both GMEM and SMEM.
-// GEMM1 (Q×K): uses SM89_16x8x32_F32E4M3E4M3F32_TN (mma.m16n8k32, K=32 per step).
-//   SM120 consumer supports SM89-style FP8 but NOT SM120A 'kind::f8f6f4' variant.
-// GEMM2 (P×V): uses the same FP8 MMA after converting float acc_s → FP8.
+// WS path (Has_rab=false): SM120 QMMA (SM120_16x8x32_TN_VS via SM120QmmaBuilder).
+// Non-WS path (Has_rab=true): same SM120 QMMA via BS1/BS2 in hstu_compute_attn_1rowblock_sm120.
 // Descale factors applied after GEMM1 (S *= descale_q * descale_k) and epilogue (O *= descale_v).
-// FP8 SMEM halves SMEM usage vs BF16 → allows kNWarps=8 (vs Phase 1 kNWarps=4).
+// FP8 SMEM halves SMEM usage vs BF16 → allows kNWarps=8 (vs BF16 kNWarps=4).
 template <
     int kHeadDim_,
     int kBlockM_,
@@ -245,21 +238,10 @@ struct Hstu_fwd_kernel_traits_sm120_fp8 {
   static constexpr bool Paged_KV = false;
   static constexpr bool Is_fp8 = true;
 
-  // FP8 MMA: M16×N8×K32, FP8 inputs, FP32 accumulator.
-  // Uses SM89_16x8x32_F32E4M3E4M3F32_TN which is supported on all SM89+ including SM120.
-  // SM120 consumer (RTX Pro) does NOT support the SM120A 'kind::f8f6f4' variant.
-  // SM89 FP8 MMA uses: mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32
-  using MMA_Atom_Arch = MMA_Atom<SM89_16x8x32_F32E4M3E4M3F32_TN>;
-
-  // For FP8 SMEM→regs: use DefaultCopy (element-by-element) for both Q/K and V^T.
-  // SM75_U32x4_LDSM_N uses ldmatrix.x4 in b16-mode (16-bit words). With FP8 (8-bit elements),
-  // two FP8 are packed per b16 slot, but the resulting register arrangement does NOT match what
-  // SM89_16x8x32_F32E4M3E4M3F32_TN expects for the A operand → wrong GEMM1 → cos_sim ≈ 0.36.
-  // DefaultCopy loads elements one-by-one, always producing the correct per-thread register
-  // layout as dictated by make_tiled_copy_A/B + TiledMma, at the cost of vectorization.
-  using SmemCopyAtom = Copy_Atom<DefaultCopy, Element>;
-  // For V-transposed (B operand of GEMM2): same reasoning — use DefaultCopy.
-  using SmemCopyAtomTransposed = Copy_Atom<DefaultCopy, Element>;
+  // Note: MMA_Atom_Arch / TiledMma / SmemCopyAtom are intentionally absent from this FP8
+  // traits struct. The FP8 kernel path (both WS and Has_rab non-WS) uses SM120QmmaBuilder
+  // (BS1/BS2) for MMA and s2r copies directly; Kernel_traits::TiledMma is only referenced
+  // in the if constexpr (!Is_fp8) BF16 branch which is discarded at compile time.
 
   static constexpr bool Share_Q_K_smem = Share_Q_K_smem_;
   static constexpr bool Is_Q_in_regs = Is_Q_in_regs_ || Share_Q_K_smem;
@@ -271,11 +253,7 @@ struct Hstu_fwd_kernel_traits_sm120_fp8 {
   static constexpr int kBlockN = kBlockN_;
   static constexpr int kHeadDim = kHeadDim_;
   static_assert(kHeadDim % 32 == 0);
-  // FP8 SMEM: flat 16×32 atom, aligned with one MMA A-tile (m16×k32).
-  // kBlockKSmem=32 ensures each MMA K-step sub-tile is self-contained: the 32-column atom
-  // maps exactly to the k=32 dimension of SM89_16x8x32 FP8 MMA. With kBlockKSmem=64
-  // (8×64 atom), one 16×32 MMA A-tile spans two atom rows causing incorrect element
-  // mapping when DefaultCopy partitions the SMEM via make_tiled_copy_A + TiledMma.
+  // kBlockKSmem=32: one 16×32 FP8 atom aligns with SM120 QMMA K=32 per step.
   static constexpr int kBlockKSmem = 32;
   static constexpr int kBlockKSmemRab = kBlockN % 64 == 0 ? 64 : 32;
   static constexpr int kBlockKGmem =
@@ -285,18 +263,8 @@ struct Hstu_fwd_kernel_traits_sm120_fp8 {
   static constexpr int kSwizzleRab = kBlockKSmemRab == 32 ? 2 : 3;
   static constexpr int kStages = 1;
 
-  // TiledMma: K=32 per step for FP8 MMA (vs K=16 for BF16).
-  using TiledMma = TiledMMA<
-      MMA_Atom_Arch,
-      Layout<Shape<Int<kNWarps>, _1, _1>>,
-      Tile<Int<16 * kNWarps>, _16, _32>>;
-  static_assert(16 * kNWarps <= kBlockM);
-
-  // SMEM layout for Q/K/V: flat 16×32 atom, aligned with one SM89_16x8x32 MMA A-tile.
-  // A single 16-row × 32-col FP8 tile is 512 bytes; with 32 threads per warp each loading
-  // 16 bytes (128 bits), the warp covers the tile at stride T×16 as expected by DefaultCopy.
-  // The 8×64 atom (kBlockKSmem=64) spans TWO atom rows per MMA tile, breaking this alignment
-  // and causing incorrect element assignment during make_tiled_copy_A partitioning.
+  // SMEM layout for Q/K/V: flat 16×32 atom (kBlockKSmem=32).
+  // 16-row × 32-col FP8 tile = 512 bytes; aligns with SM120 QMMA K=32 per step.
   using SmemLayoutAtomQ =
       Layout<Shape<_16, _32>, Stride<_32, _1>>;
 
