@@ -809,50 +809,61 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
     auto s2r_copy_B2 = make_tiled_copy_B(typename BS2::SmemCopyAtomB{}, tiled_mma_g2);
     auto s2r_thr_copy_B2 = s2r_copy_B2.get_thread_slice(tidx);
 
-    // A-operand Z-pattern loader for SM120_16x8x32_TN AtomLayout <_8,_1,_1>.
-    // See matching implementation in hstu_fwd_kernel_fp8_ws.h for full comment.
-    // Uses individual uint32 loads (not ldmatrix.x4) to correctly implement Z-pattern
-    // from K_SW128 SMEM (ldmatrix.x4 fails for odd rows due to Swizzle<3,4,3> non-contiguity).
+    // A-operand loader using ldmatrix.sync.aligned.m8n8.x4.shared.b16.
+    // See hstu_fwd_kernel_fp8_ws.h for full derivation; uses tidx instead of tidx_math.
     auto load_a_z_pattern = [&](auto&& sA_pi, auto& tCrA, int k_block_base, int k_block_count) {
-      const int lane   = tidx & 31;
-      const int warp_m = tidx / 32;
-      const int m_row0 = warp_m * 16 + (lane >> 2);
-      const int m_row1 = m_row0 + 8;
-      const int k_col  = (lane & 3) * 4;
+      const int lane    = tidx & 31;
+      const int warp_m  = tidx / 32;
+      const int mat_num = lane >> 3;
+      const int mat_row = lane & 7;
+      const int M_abs   = warp_m * 16 + ((mat_num & 1) << 3) + mat_row;
+      const int K_half  = mat_num >> 1;
+      const uint32_t smem_base =
+          static_cast<uint32_t>(__cvta_generic_to_shared(&sA_pi(0, 0)));
+      const uint32_t row_base = smem_base + static_cast<uint32_t>(M_abs * 128);
       auto tXrA = recast<uint32_t>(tCrA);
       CUTE_UNROLL
       for (int kb = 0; kb < k_block_count; ++kb) {
-        const int K0 = k_col + (k_block_base + kb) * 32;
-        const int K1 = K0 + 16;
-        tXrA(4*kb+0) = *reinterpret_cast<const uint32_t*>(&sA_pi(m_row0, K0));
-        tXrA(4*kb+1) = *reinterpret_cast<const uint32_t*>(&sA_pi(m_row1, K0));
-        tXrA(4*kb+2) = *reinterpret_cast<const uint32_t*>(&sA_pi(m_row0, K1));
-        tXrA(4*kb+3) = *reinterpret_cast<const uint32_t*>(&sA_pi(m_row1, K1));
+        const int K_start = (k_block_base + kb) * 32 + (K_half << 4);
+        const uint32_t addr =
+            row_base + static_cast<uint32_t>(K_start ^ (mat_row << 4));
+        asm volatile(
+            "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3},[%4];\n"
+            : "=r"(tXrA(4*kb+0)), "=r"(tXrA(4*kb+1)),
+              "=r"(tXrA(4*kb+2)), "=r"(tXrA(4*kb+3))
+            : "r"(addr));
       }
     };
 
-    // B-operand Z-pattern loader.  Mirrors load_b_z_pattern in hstu_fwd_kernel_fp8_ws.h.
-    // make_tiled_copy_B(SM75_U32x4_LDSM_N) is incompatible with AtomLayout <_8,_1,_1>
-    // (ThrN=1) because ldmatrix.x4 expects 16-byte-aligned addresses derived from the
-    // N-partition, which the new layout cannot guarantee.  Direct uint32 reads bypass this.
-    // PermMmaTileN = Layout<Shape<_8,_4,_4>, Stride<_1,_32,_8>>:
-    //   N_base[nr] = (nr % 4)*32 + (nr / 4)*8; linear_idx = 2*nr + 32*kb.
+    // B-operand loader using ldmatrix.sync.aligned.m8n8.x4.shared.b16.
+    // See hstu_fwd_kernel_fp8_ws.h for full derivation; uses tidx instead of tidx_math.
     auto load_b_z_pattern = [&](auto&& sB_pi, auto& tCrB, int k_block_base, int k_block_count) {
-      const int lane  = tidx & 31;
-      const int n_row = lane >> 2;
-      const int k_col = (lane & 3) * 4;
+      const int lane    = tidx & 31;
+      const int mat_num = lane >> 3;
+      const int mat_row = lane & 7;
+      const uint32_t smem_base =
+          static_cast<uint32_t>(__cvta_generic_to_shared(&sB_pi(0, 0)));
       auto tXrB = recast<uint32_t>(tCrB);
-      constexpr int kNReps = kBlockN / 8;
+      constexpr int kNGroups = kBlockN / 32;  // 4
       CUTE_UNROLL
       for (int kb = 0; kb < k_block_count; ++kb) {
-        const int K0 = k_col + (k_block_base + kb) * 32;
-        const int K1 = K0 + 16;
         CUTE_UNROLL
-        for (int nr = 0; nr < kNReps; ++nr) {
-          const int N    = (nr % 4) * 32 + (nr / 4) * 8 + n_row;
-          const int base = 32 * kb + 2 * nr;
-          tXrB(base + 0) = *reinterpret_cast<const uint32_t*>(&sB_pi(N, K0));
-          tXrB(base + 1) = *reinterpret_cast<const uint32_t*>(&sB_pi(N, K1));
+        for (int g = 0; g < kNGroups; ++g) {
+          const uint32_t N_row  = static_cast<uint32_t>(g * 32 + mat_num * 8 + mat_row);
+          const int frag_base   = 32 * kb + 2 * g;
+          CUTE_UNROLL
+          for (int K_half = 0; K_half < 2; ++K_half) {
+            const int K_start  = (k_block_base + kb) * 32 + K_half * 16;
+            const uint32_t addr =
+                smem_base + N_row * 128 + static_cast<uint32_t>(K_start ^ (mat_row << 4));
+            asm volatile(
+                "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3},[%4];\n"
+                : "=r"(tXrB(frag_base + K_half +  0)),
+                  "=r"(tXrB(frag_base + K_half +  8)),
+                  "=r"(tXrB(frag_base + K_half + 16)),
+                  "=r"(tXrB(frag_base + K_half + 24))
+                : "r"(addr));
+          }
         }
       }
     };

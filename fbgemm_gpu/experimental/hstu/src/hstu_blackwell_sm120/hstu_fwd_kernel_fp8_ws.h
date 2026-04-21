@@ -627,75 +627,80 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         BS2::get_layoutSFA_TV(tiled_mma_g2), make_shape(size<0>(tile_shape(tiled_mma_g2)), _1{}));
     auto s2r_thr_SFP  = s2r_copy_SFP.get_thread_slice(tidx_math);
 
-    // A-operand Z-pattern loader for SM120_16x8x32_TN AtomLayout <_8,_1,_1>.
+    // A-operand loader using ldmatrix.sync.aligned.m8n8.x4.shared.b16.
     //
-    // ALayout from SM80_16x8x32_S32S8S8S32_TN (same for SM89/SM120):
-    //   Layout<Shape<Shape<_4,_8>,Shape<_4,_2,_2>>, Stride<Stride<_64,_1>,Stride<_16,_8,_256>>>
+    // The 4-matrix 2×2 arrangement covers exactly 16M × 32K FP8 = one QMMA A-tile:
+    //   mat 0: M[warp_m*16+0..7 ], K[kb*32+0..15 ]  → r0 → Ra+0
+    //   mat 1: M[warp_m*16+8..15], K[kb*32+0..15 ]  → r1 → Ra+1
+    //   mat 2: M[warp_m*16+0..7 ], K[kb*32+16..31]  → r2 → Ra+2
+    //   mat 3: M[warp_m*16+8..15], K[kb*32+16..31]  → r3 → Ra+3
+    // Thread (mat_num=lane>>3) provides addr for row (mat_row=lane&7) of its matrix.
     //
-    // ALayout uses K-major linearization (A_lin = k*M_atom + m, M_atom=16):
-    //   T_contrib = 64*t0 + t1  where t0=lane%4, t1=lane/4
-    //   For A_lin = k*16 + m:  m = t1 (=lane/4), k_start = 4*t0 (=4*(lane%4))
-    //
-    // Thread lane in warp warp_m holds 4 uint32 per K=32 atom:
-    //   m_row0 = warp_m*16 + lane/4,  m_row1 = m_row0+8
-    //   k_col  = 4*(lane%4)  (K offset within 32-K block)
-    //   r0 = {A[m_row0][k_col+kb*32    .. +3]}  (4 consecutive K bytes, low-K half)
-    //   r1 = {A[m_row1][k_col+kb*32    .. +3]}
-    //   r2 = {A[m_row0][k_col+kb*32 +16..+19]}  (4 consecutive K bytes, high-K half)
-    //   r3 = {A[m_row1][k_col+kb*32 +16..+19]}
-    //
-    // uint32 loads of 4-byte-aligned K groups are swizzle-safe in K_SW128 (Swizzle<3,4,3>):
-    // the swizzle permutes 8-byte groups but preserves bytes within each group, so a 4-byte
-    // read at 4-byte-aligned offset stays within one 8-byte group (no cross-group aliasing).
+    // K_SW128 swizzle (Swizzle<3,4,3>): physical_k = K_start ^ ((M_abs & 7) << 4).
+    // M_abs & 7 == mat_row since warp_m*16 and (mat_num&1)*8 are multiples of 8.
     auto load_a_z_pattern = [&](auto&& sA_pi, auto& tCrA, int k_block_base, int k_block_count) {
-      const int lane   = tidx_math & 31;
-      const int warp_m = tidx_math / 32;
-      const int m_row0 = warp_m * 16 + (lane >> 2);   // lane/4: M row 0 within warp
-      const int m_row1 = m_row0 + 8;                   // Z-pattern M row 1
-      const int k_col  = (lane & 3) * 4;               // 4*(lane%4): K offset within 32-K atom
+      const int lane    = tidx_math & 31;
+      const int warp_m  = tidx_math / 32;
+      const int mat_num = lane >> 3;    // matrix index (0..3) this lane provides addr for
+      const int mat_row = lane & 7;     // row within that matrix (0..7)
+      const int M_abs   = warp_m * 16 + ((mat_num & 1) << 3) + mat_row;
+      const int K_half  = mat_num >> 1; // 0 = K low 16, 1 = K high 16
+      const uint32_t smem_base =
+          static_cast<uint32_t>(__cvta_generic_to_shared(&sA_pi(0, 0)));
+      const uint32_t row_base = smem_base + static_cast<uint32_t>(M_abs * 128);
       auto tXrA = recast<uint32_t>(tCrA);
       CUTE_UNROLL
       for (int kb = 0; kb < k_block_count; ++kb) {
-        const int K0 = k_col + (k_block_base + kb) * 32;
-        const int K1 = K0 + 16;
-        tXrA(4*kb+0) = *reinterpret_cast<const uint32_t*>(&sA_pi(m_row0, K0));
-        tXrA(4*kb+1) = *reinterpret_cast<const uint32_t*>(&sA_pi(m_row1, K0));
-        tXrA(4*kb+2) = *reinterpret_cast<const uint32_t*>(&sA_pi(m_row0, K1));
-        tXrA(4*kb+3) = *reinterpret_cast<const uint32_t*>(&sA_pi(m_row1, K1));
+        const int K_start = (k_block_base + kb) * 32 + (K_half << 4);
+        const uint32_t addr =
+            row_base + static_cast<uint32_t>(K_start ^ (mat_row << 4));
+        asm volatile(
+            "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3},[%4];\n"
+            : "=r"(tXrA(4*kb+0)), "=r"(tXrA(4*kb+1)),
+              "=r"(tXrA(4*kb+2)), "=r"(tXrA(4*kb+3))
+            : "r"(addr));
       }
     };
 
-    // B-operand Z-pattern loader for SM120_16x8x32_TN under AtomLayout <_8,_1,_1>.
+    // B-operand loader using ldmatrix.sync.aligned.m8n8.x4.shared.b16.
     //
-    // BLayout from SM80_16x8x32_S32S8S8S32_TN (K-major, B_lin = k*8 + n, N=8 inner):
-    //   T_contrib = 32*t0 + t1  →  n=t1 (=lane/4), k_start=4*t0 (=4*(lane%4))
-    //
-    // Thread lane holds 2 uint32 per K=32 atom per N-rep:
-    //   N = N_base[nr] + lane/4   (n-row within each 8-wide N-atom)
-    //   K0 = 4*(lane%4) + kb*32,  K1 = K0+16
-    //   r0 = {B[N][K0..K0+3]}    (4 consecutive K bytes, low-K half)
-    //   r1 = {B[N][K1..K1+3]}    (4 consecutive K bytes, high-K half)
-    //
-    // PermMmaTileN = Layout<Shape<_8,_4,_4>, Stride<_1,_32,_8>>: N_base[nr]=(nr%4)*32+(nr/4)*8.
-    // Fragment linear index: base = 32*kb + 2*nr  (KB varies slowest, N-rep fastest within KB).
+    // PermMmaTileN = Layout<Shape<_8,_4,_4>, Stride<_1,_32,_8>>:
+    //   N_base[nr] = (nr%4)*32 + (nr/4)*8.  Group by g = nr%4:
+    //   g=0: nr={0,4,8,12}  → N=[0,8,16,24]    (32 consecutive SMEM rows)
+    //   g=1: nr={1,5,9,13}  → N=[32,40,48,56]
+    //   g=2: nr={2,6,10,14} → N=[64,72,80,88]
+    //   g=3: nr={3,7,11,15} → N=[96,104,112,120]
+    // One x4 call covers 4 N-atoms (32 rows) × 16 K = one (g, K_half) slice.
+    //   frag_base = 32*kb + 2*g
+    //   r0→frag_base+K_half+0, r1→+8, r2→+16, r3→+24
+    // K_SW128 swizzle: physical_k = K_start ^ ((N_addr&7)<<4) = K_start ^ (mat_row<<4).
     auto load_b_z_pattern = [&](auto&& sB_pi, auto& tCrB, int k_block_base, int k_block_count) {
-      const int lane  = tidx_math & 31;
-      const int n_row = lane >> 2;        // lane/4: N row within 8-row atom
-      const int k_col = (lane & 3) * 4;  // 4*(lane%4): K offset within 32-K atom
+      const int lane    = tidx_math & 31;
+      const int mat_num = lane >> 3;
+      const int mat_row = lane & 7;
+      const uint32_t smem_base =
+          static_cast<uint32_t>(__cvta_generic_to_shared(&sB_pi(0, 0)));
       auto tXrB = recast<uint32_t>(tCrB);
-      constexpr int kNReps = kBlockN / 8; // N-atoms per thread; kBlockN=128 → 16
+      constexpr int kNGroups = kBlockN / 32;  // 4
       CUTE_UNROLL
       for (int kb = 0; kb < k_block_count; ++kb) {
-        const int K0 = k_col + (k_block_base + kb) * 32;
-        const int K1 = K0 + 16;
         CUTE_UNROLL
-        for (int nr = 0; nr < kNReps; ++nr) {
-          // PermMmaTileN = Layout<Shape<_8,_4,_4>, Stride<_1,_32,_8>>:
-          //   N_base[nr] = (nr % 4) * 32 + (nr / 4) * 8
-          const int N    = (nr % 4) * 32 + (nr / 4) * 8 + n_row;
-          const int base = 32 * kb + 2 * nr;
-          tXrB(base + 0) = *reinterpret_cast<const uint32_t*>(&sB_pi(N, K0));
-          tXrB(base + 1) = *reinterpret_cast<const uint32_t*>(&sB_pi(N, K1));
+        for (int g = 0; g < kNGroups; ++g) {
+          const uint32_t N_row   = static_cast<uint32_t>(g * 32 + mat_num * 8 + mat_row);
+          const int frag_base    = 32 * kb + 2 * g;
+          CUTE_UNROLL
+          for (int K_half = 0; K_half < 2; ++K_half) {
+            const int K_start  = (k_block_base + kb) * 32 + K_half * 16;
+            const uint32_t addr =
+                smem_base + N_row * 128 + static_cast<uint32_t>(K_start ^ (mat_row << 4));
+            asm volatile(
+                "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3},[%4];\n"
+                : "=r"(tXrB(frag_base + K_half +  0)),
+                  "=r"(tXrB(frag_base + K_half +  8)),
+                  "=r"(tXrB(frag_base + K_half + 16)),
+                  "=r"(tXrB(frag_base + K_half + 24))
+                : "r"(addr));
+          }
         }
       }
     };
@@ -1008,17 +1013,14 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
             const int n_k_row     = ni * 16 + n_off;
             const int swizzle_xor = (n_k_row & 7) << 4;
             const uint32_t addr   = v_smem_base + (uint32_t)(n_k_row * kHeadDim + (d_start ^ swizzle_xor));
-            uint32_t r0, r1, r2, r3;
-            asm volatile(
-                "ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0,%1,%2,%3},[%4];\n"
-                : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
             // r0..r3 cover 4 n_k-groups (4 rows each) at d = dg*32+lane, placed into
             // N-atoms {dg, dg+4, dg+8, dg+12} × K-half {ni&1} of K-block {ni>>1}.
             const int base = 32 * (ni >> 1) + 2 * dg + (ni & 1);
-            tXrV(base + 0)  = r0;
-            tXrV(base + 8)  = r1;
-            tXrV(base + 16) = r2;
-            tXrV(base + 24) = r3;
+            asm volatile(
+                "ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0,%1,%2,%3},[%4];\n"
+                : "=r"(tXrV(base + 0)), "=r"(tXrV(base + 8)),
+                  "=r"(tXrV(base + 16)), "=r"(tXrV(base + 24))
+                : "r"(addr));
           }
         }
       }
