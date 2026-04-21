@@ -264,11 +264,11 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     auto tKsK_d_1     = tma_slice_K.partition_D(
         make_tensor(make_smem_ptr(sK_base[1]), SmemLayoutK_SW128{}));
 
-    auto mVt_tma   = params.tma_vt.get_tma_tensor(make_shape(params.d, params.total_k, params.h_k));
+    auto mVt_tma   = params.tma_vt.get_tma_tensor(make_shape(params.total_k, params.d, params.h_k));
     auto gVt_head  = mVt_tma(_, _, bidh_kv);
-    auto gVt_tiles = local_tile(gVt_head, Shape<Int<kHeadDim>, Int<kBlockN>>{}, make_coord(_, _));
+    auto gVt_tiles = local_tile(gVt_head, Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(_, _));
     auto tma_slice_Vt  = params.tma_vt.get_slice(0);
-    auto tVtgVt_tma    = tma_slice_Vt.partition_S(gVt_tiles(_, _, Int<0>{}, _));
+    auto tVtgVt_tma    = tma_slice_Vt.partition_S(gVt_tiles(_, _, _, Int<0>{}));
     auto tVtsVt_d_0    = tma_slice_Vt.partition_D(
         make_tensor(make_smem_ptr(sVt_base[0]), SmemLayoutVt_SW128{}));
     auto tVtsVt_d_1    = tma_slice_Vt.partition_D(
@@ -614,32 +614,91 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     Tensor acc_o = partition_fragment_C(tiled_mma_g2, Shape<Int<kBlockM>, Int<kHeadDim>>{});
     clear(acc_o);
 
-    // s2r copy atoms.
-    auto s2r_copy_A   = make_tiled_copy_A(typename BS1::SmemCopyAtomA{}, tiled_mma_g1);
-    auto s2r_thr_A    = s2r_copy_A.get_thread_slice(tidx_math);
-    auto s2r_copy_B   = make_tiled_copy_B(typename BS1::SmemCopyAtomB{}, tiled_mma_g1);
-    auto s2r_thr_B    = s2r_copy_B.get_thread_slice(tidx_math);
-    auto s2r_copy_A2  = make_tiled_copy_A(typename BS2::SmemCopyAtomA{}, tiled_mma_g2);
-    auto s2r_thr_A2   = s2r_copy_A2.get_thread_slice(tidx_math);
-    auto s2r_copy_B2  = make_tiled_copy_B(typename BS2::SmemCopyAtomB{}, tiled_mma_g2);
-    auto s2r_thr_B2   = s2r_copy_B2.get_thread_slice(tidx_math);
-    // LDSM_T tiled copy: construction succeeds; cute::copy is bypassed (static_assert in copy_unpack
-    // trips on MN_SW128 source). We use partition_S only to compute per-thread SMEM addresses, then
-    // issue the PTX and byte-reorder manually — matching SM100_U8x16_LDSM_T::copy() exactly.
-    auto s2r_copy_Vt  = make_tiled_copy_B(Copy_Atom<SM100_U8x16_LDSM_T, FP8Elem>{}, tiled_mma_g2);
-    auto s2r_thr_Vt   = s2r_copy_Vt.get_thread_slice(tidx_math);
+    // s2r copy atoms — A operands (Q, P) loaded via load_a_z_pattern (inline PTX Z-pattern).
+    // B operands (K) loaded via load_b_z_pattern (direct uint32 reads, bypassing ldmatrix.x4
+    // which is incompatible with AtomLayout <_8,_1,_1> ThrN=1).
+    // B operand (V^T) loaded via LDSM_T inline PTX.
     auto s2r_copy_SFA = make_tiled_copy_impl(typename BS1::SmemCopyAtomSF{},
         BS1::get_layoutSFA_TV(tiled_mma_g1), make_shape(size<0>(tile_shape(tiled_mma_g1)), _1{}));
     auto s2r_thr_SFA  = s2r_copy_SFA.get_thread_slice(tidx_math);
-    auto s2r_copy_SFB = make_tiled_copy_impl(typename BS1::SmemCopyAtomSF{},
-        BS1::get_layoutSFB_TV(tiled_mma_g1), make_shape(size<1>(tile_shape(tiled_mma_g1)), _1{}));
-    auto s2r_thr_SFB  = s2r_copy_SFB.get_thread_slice(tidx_math);
+    // SFB/SFV: get_layoutSFB_TV degenerates under AtomLayout <_8,_1,_1> (ThrN=1 → all
+    // threads map to SMEM position 0). Use direct SMEM reads at the call site instead.
     auto s2r_copy_SFP = make_tiled_copy_impl(typename BS2::SmemCopyAtomSF{},
         BS2::get_layoutSFA_TV(tiled_mma_g2), make_shape(size<0>(tile_shape(tiled_mma_g2)), _1{}));
     auto s2r_thr_SFP  = s2r_copy_SFP.get_thread_slice(tidx_math);
-    auto s2r_copy_SFV = make_tiled_copy_impl(typename BS2::SmemCopyAtomSF{},
-        BS2::get_layoutSFB_TV(tiled_mma_g2), make_shape(size<1>(tile_shape(tiled_mma_g2)), _1{}));
-    auto s2r_thr_SFV  = s2r_copy_SFV.get_thread_slice(tidx_math);
+
+    // A-operand Z-pattern loader for SM120_16x8x32_TN AtomLayout <_8,_1,_1>.
+    //
+    // ALayout from SM80_16x8x32_S32S8S8S32_TN (same for SM89/SM120):
+    //   Layout<Shape<Shape<_4,_8>,Shape<_4,_2,_2>>, Stride<Stride<_64,_1>,Stride<_16,_8,_256>>>
+    //
+    // ALayout uses K-major linearization (A_lin = k*M_atom + m, M_atom=16):
+    //   T_contrib = 64*t0 + t1  where t0=lane%4, t1=lane/4
+    //   For A_lin = k*16 + m:  m = t1 (=lane/4), k_start = 4*t0 (=4*(lane%4))
+    //
+    // Thread lane in warp warp_m holds 4 uint32 per K=32 atom:
+    //   m_row0 = warp_m*16 + lane/4,  m_row1 = m_row0+8
+    //   k_col  = 4*(lane%4)  (K offset within 32-K block)
+    //   r0 = {A[m_row0][k_col+kb*32    .. +3]}  (4 consecutive K bytes, low-K half)
+    //   r1 = {A[m_row1][k_col+kb*32    .. +3]}
+    //   r2 = {A[m_row0][k_col+kb*32 +16..+19]}  (4 consecutive K bytes, high-K half)
+    //   r3 = {A[m_row1][k_col+kb*32 +16..+19]}
+    //
+    // uint32 loads of 4-byte-aligned K groups are swizzle-safe in K_SW128 (Swizzle<3,4,3>):
+    // the swizzle permutes 8-byte groups but preserves bytes within each group, so a 4-byte
+    // read at 4-byte-aligned offset stays within one 8-byte group (no cross-group aliasing).
+    auto load_a_z_pattern = [&](auto&& sA_pi, auto& tCrA, int k_block_base, int k_block_count) {
+      const int lane   = tidx_math & 31;
+      const int warp_m = tidx_math / 32;
+      const int m_row0 = warp_m * 16 + (lane >> 2);   // lane/4: M row 0 within warp
+      const int m_row1 = m_row0 + 8;                   // Z-pattern M row 1
+      const int k_col  = (lane & 3) * 4;               // 4*(lane%4): K offset within 32-K atom
+      auto tXrA = recast<uint32_t>(tCrA);
+      CUTE_UNROLL
+      for (int kb = 0; kb < k_block_count; ++kb) {
+        const int K0 = k_col + (k_block_base + kb) * 32;
+        const int K1 = K0 + 16;
+        tXrA(4*kb+0) = *reinterpret_cast<const uint32_t*>(&sA_pi(m_row0, K0));
+        tXrA(4*kb+1) = *reinterpret_cast<const uint32_t*>(&sA_pi(m_row1, K0));
+        tXrA(4*kb+2) = *reinterpret_cast<const uint32_t*>(&sA_pi(m_row0, K1));
+        tXrA(4*kb+3) = *reinterpret_cast<const uint32_t*>(&sA_pi(m_row1, K1));
+      }
+    };
+
+    // B-operand Z-pattern loader for SM120_16x8x32_TN under AtomLayout <_8,_1,_1>.
+    //
+    // BLayout from SM80_16x8x32_S32S8S8S32_TN (K-major, B_lin = k*8 + n, N=8 inner):
+    //   T_contrib = 32*t0 + t1  →  n=t1 (=lane/4), k_start=4*t0 (=4*(lane%4))
+    //
+    // Thread lane holds 2 uint32 per K=32 atom per N-rep:
+    //   N = N_base[nr] + lane/4   (n-row within each 8-wide N-atom)
+    //   K0 = 4*(lane%4) + kb*32,  K1 = K0+16
+    //   r0 = {B[N][K0..K0+3]}    (4 consecutive K bytes, low-K half)
+    //   r1 = {B[N][K1..K1+3]}    (4 consecutive K bytes, high-K half)
+    //
+    // PermMmaTileN = Layout<Shape<_8,_4,_4>, Stride<_1,_32,_8>>: N_base[nr]=(nr%4)*32+(nr/4)*8.
+    // Fragment linear index: base = 32*kb + 2*nr  (KB varies slowest, N-rep fastest within KB).
+    auto load_b_z_pattern = [&](auto&& sB_pi, auto& tCrB, int k_block_base, int k_block_count) {
+      const int lane  = tidx_math & 31;
+      const int n_row = lane >> 2;        // lane/4: N row within 8-row atom
+      const int k_col = (lane & 3) * 4;  // 4*(lane%4): K offset within 32-K atom
+      auto tXrB = recast<uint32_t>(tCrB);
+      constexpr int kNReps = kBlockN / 8; // N-atoms per thread; kBlockN=128 → 16
+      CUTE_UNROLL
+      for (int kb = 0; kb < k_block_count; ++kb) {
+        const int K0 = k_col + (k_block_base + kb) * 32;
+        const int K1 = K0 + 16;
+        CUTE_UNROLL
+        for (int nr = 0; nr < kNReps; ++nr) {
+          // PermMmaTileN = Layout<Shape<_8,_4,_4>, Stride<_1,_32,_8>>:
+          //   N_base[nr] = (nr % 4) * 32 + (nr / 4) * 8
+          const int N    = (nr % 4) * 32 + (nr / 4) * 8 + n_row;
+          const int base = 32 * kb + 2 * nr;
+          tXrB(base + 0) = *reinterpret_cast<const uint32_t*>(&sB_pi(N, K0));
+          tXrB(base + 1) = *reinterpret_cast<const uint32_t*>(&sB_pi(N, K1));
+        }
+      }
+    };
 
     __syncthreads();  // S1: barriers initialized by load warp; math warps can now use them.
 
@@ -677,60 +736,66 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     };
     auto apply_mask_bs = [&](auto& tSrS, int nb) {
       static constexpr int Row = 0, Col = 1;
-      Tensor cS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
+      Tensor cS   = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
       Tensor tScS = thr_mma_g1.partition_C(cS);
       const int base_row = m_block * kBlockM + actual_seqlen_offset;
       const int base_col = nb * kBlockN;
-      Tensor tSrS_v = make_tensor(tSrS.data(),
-          group<1,3>(group<0,2>(select<1,2,0,3>(flatten(tSrS.layout())))));
-      Tensor tScS_v = make_tensor(tScS.data(),
-          group<1,3>(group<0,2>(select<1,2,0,3>(flatten(tScS.layout())))));
+      // Under AtomLayout <_8,_1,_1>, select<1,2,0,3> is invalid.
+      // Use direct flat indexing: tScS(flat) and tSrS(flat) share the same
+      // element ordering produced by partition_C, giving correct (row,col) coords.
       Tensor col_min = make_tensor<int>(make_shape(size<0>(gMinFunc)));
       Tensor col_max = make_tensor<int>(make_shape(size<0>(gMaxFunc)));
+      int prev_block_row    = -1;
+      int row               = 0;
+      [[maybe_unused]] int tgt_col_lft = 0;
 #pragma unroll
-      for (int r = 0; r < size<0>(tSrS_v); r++) {
-        const int block_row = int(get<Row>(tScS_v(r,0)));
-        const int row = block_row + base_row;
-        [[maybe_unused]] const int tgt_idx =
-            Is_target ? (row - actual_seqlen_h) / params.target_group_size : 0;
-        [[maybe_unused]] const int tgt_col_lft =
-            Is_target ? actual_seqlen_h + tgt_idx * params.target_group_size : 0;
-        if constexpr (Is_arbitrary) {
-          col_max(0) = gMaxFunc(0, block_row);
+      for (int flat = 0; flat < size(tSrS); ++flat) {
+        const auto coord    = tScS(flat);
+        const int block_row = int(get<Row>(coord));
+        // Lazily recompute per-row values when block_row changes.
+        // Each thread has exactly 2 distinct block_rows (lane>>2 and lane>>2+8),
+        // alternating every 2 elements in the MMA D-register flat ordering.
+        if (block_row != prev_block_row) {
+          row           = block_row + base_row;
+          prev_block_row = block_row;
+          if constexpr (Is_target) {
+            const int tgt_idx = (row - actual_seqlen_h) / params.target_group_size;
+            tgt_col_lft = actual_seqlen_h + tgt_idx * params.target_group_size;
+          }
+          if constexpr (Is_arbitrary) {
+            col_max(0) = gMaxFunc(0, block_row);
 #pragma unroll
-          for (int j = 0; j < size<0>(gMinFunc); ++j) {
-            col_min(j) = gMinFunc(j, block_row);
-            col_max(j+1) = gMaxFunc(j+1, block_row);
+            for (int j = 0; j < size<0>(gMinFunc); ++j) {
+              col_min(j)   = gMinFunc(j, block_row);
+              col_max(j+1) = gMaxFunc(j+1, block_row);
+            }
           }
         }
+        const int block_col = int(get<Col>(coord));
+        const int col       = block_col + base_col;
+        if constexpr (!Is_causal && !Is_local && !Is_arbitrary) {
+          if (col >= actual_seqlen_k) { tSrS(flat) = -INFINITY; continue; }
+        } else {
+          if constexpr (Is_context) {
+            if (row < actual_seqlen_c && col < actual_seqlen_h) continue;
+          }
+          if (col >= col_limit_right(row)) { tSrS(flat) = -INFINITY; continue; }
+          if constexpr (Is_local) {
+            if (col < col_limit_left(row)) { tSrS(flat) = -INFINITY; continue; }
+          }
+          if constexpr (Is_target) {
+            if (row >= actual_seqlen_h && col >= actual_seqlen_h && col < tgt_col_lft)
+              tSrS(flat) = -INFINITY;
+          }
+          if constexpr (Is_arbitrary) {
+            bool non_mask = (0 <= col) && (col < col_max(0));
+            if (non_mask) continue;
 #pragma unroll
-        for (int c = 0; c < size<1>(tSrS_v); c++) {
-          const int block_col = int(get<Col>(tScS_v(r,c)));
-          const int col = block_col + base_col;
-          if constexpr (!Is_causal && !Is_local && !Is_arbitrary) {
-            if (col >= actual_seqlen_k) { tSrS_v(r,c) = -INFINITY; continue; }
-          } else {
-            if constexpr (Is_context) {
-              if (row < actual_seqlen_c && col < actual_seqlen_h) continue;
+            for (int j = 0; j < size<0>(gMinFunc); ++j) {
+              non_mask = (col_min(j) <= col) && (col < col_max(j+1));
+              if (non_mask) break;
             }
-            if (col >= col_limit_right(row)) { tSrS_v(r,c) = -INFINITY; continue; }
-            if constexpr (Is_local) {
-              if (col < col_limit_left(row)) { tSrS_v(r,c) = -INFINITY; continue; }
-            }
-            if constexpr (Is_target) {
-              if (row >= actual_seqlen_h && col >= actual_seqlen_h && col < tgt_col_lft)
-                tSrS_v(r,c) = -INFINITY;
-            }
-            if constexpr (Is_arbitrary) {
-              bool non_mask = (0 <= col) && (col < col_max(0));
-              if (non_mask) continue;
-#pragma unroll
-              for (int j = 0; j < size<0>(gMinFunc); ++j) {
-                non_mask = (col_min(j) <= col) && (col < col_max(j+1));
-                if (non_mask) break;
-              }
-              if (!non_mask) tSrS_v(r,c) = -INFINITY;
-            }
+            if (!non_mask) tSrS(flat) = -INFINITY;
           }
         }
       }
@@ -743,10 +808,9 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       smem_sfp_ptr[i] = 0x7f7f7f7f;
 
     // ===== MATH WARP DOUBLE-BUFFER QMMA CONSUMER LOOP =====
-    // Phase 11: s2r V^T uses ldmatrix.m16n16.x2.trans.b8 (LDSM_T) directly from non-swizzled
-    // D-major SMEM (SmemLayoutVt_TMA = Layout<[kHeadDim,kBlockN],[1,kHeadDim]>).
-    // Source addressing: CuTe partition_S on s2r_thr_Vt gives 16B-aligned row pointers because
-    // every row start = n*kHeadDim + d_base with kHeadDim=128 (128-aligned) and d_base a multiple of 16.
+    // Phase 11: s2r V^T uses ldmatrix.m16n16.x2.trans.b8 (LDSM_T) directly from MN_SW128 SMEM.
+    // Under AtomLayout <_8,_1,_1>, all 8 warps load all 4 N-slabs (nw=0..3 outer loop);
+    // 16B alignment: d_start = nw*32+d_mat ∈ multiples of 16, XOR swizzle_xor also multiple of 16.
     static_assert(kHeadDim % 32 == 0 && kBlockN % 16 == 0,
         "LDSM_T requires kHeadDim divisible by 32 and kBlockN divisible by 16.");
     int tma_wait_parity[2] = {1, 0};
@@ -776,49 +840,57 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       FP8Elem* sK_cur  = sK_base[math_stage];
       FP8Elem* sVt_cur = sVt_base[math_stage];
 
-      // GEMM1: acc_s += Q × K^T (block-scaled).
-      // acc_s declared outside the K/SFB scope so it outlives tCrK/tCrSFB.
+      // GEMM1: acc_s += Q × K^T (block-scaled QMMA).
+      // Full-K=128 copy: make_tiled_copy_A/B expects the full TiledMMA tile;
+      // cute::gemm internally loops 4×K=32 when the fragment covers K=128.
       Tensor acc_s = partition_fragment_C(tiled_mma_g1, Shape<Int<kBlockM>, Int<kBlockN>>{});
       clear(acc_s);
-      { // Per-tile s2r Q+SFA (short lifetime) + K/SFB + GEMM1.
-      Tensor tCrQ = thr_mma_g1.partition_fragment_A(sQ_persist_pi);
-      {
-        auto tXsQ = s2r_thr_A.partition_S(sQ_persist_pi);
-        auto tXrQ = s2r_thr_A.retile_D(tCrQ);
-        cute::copy(s2r_copy_A, tXsQ, tXrQ);
-      }
+
+      auto sK_cur_pi = as_position_independent_swizzle_tensor(
+          make_tensor(make_smem_ptr(sK_cur), SmemLayoutK_SW128{}));
+
       Tensor tCrSFA = BS1::partition_fragment_SFA(sSFA(_,_,_0{}), thr_mma_g1);
       {
-        auto tXsSFA = s2r_thr_SFA.partition_S(sSFA);
-        auto tXrSFA = s2r_thr_SFA.retile_D(tCrSFA);
-        cute::copy(s2r_copy_SFA, tXsSFA(_,_,_,_0{}), tXrSFA);
+        // load_a_z_pattern: m_row0 = warp_m*16 + (lane>>2), m_row1 = m_row0+8.
+        // SFA must match AtomLayoutSFA_TV: T_contrib = 8*(lane&1) + (lane>>2).
+        // smem_sfa_ptr is linear: smem_sfa_ptr[m_row] = packed int32 for M-row m_row.
+        const int warp_m  = tidx_math / 32;
+        const int lane    = tidx_math & 31;
+        const int sfa_row = warp_m * 16 + 8 * (lane & 1) + (lane >> 2);
+        tCrSFA(0, 0, 0)  = smem_sfa_ptr[sfa_row];
       }
       auto tCrSFA_frg = BS1::transform_fragment_for_qmma(tCrSFA);
 
-      { // tCrK and tCrSFB scoped: freed before silu / P path.
-      auto sK_cur_pi = as_position_independent_swizzle_tensor(
-          make_tensor(make_smem_ptr(sK_cur), SmemLayoutK_SW128{}));
-      Tensor tCrK = thr_mma_g1.partition_fragment_B(sK_cur_pi);
-      {
-        auto tXsK = s2r_thr_B.partition_S(sK_cur_pi);
-        auto tXrK = s2r_thr_B.retile_D(tCrK);
-        cute::copy(s2r_copy_B, tXsK, tXrK);
-      }
-
       Tensor tCrSFB = BS1::partition_fragment_SFB(sSFB(_,_,_0{}), thr_mma_g1);
       {
-        auto tXsSFB = s2r_thr_SFB.partition_S(sSFB);
-        auto tXrSFB = s2r_thr_SFB.retile_D(tCrSFB);
-        cute::copy(s2r_copy_SFB, tXsSFB(_,_,_,_0{}), tXrSFB);
+        // get_layoutSFB_TV degenerates under <_8,_1,_1>: ThrN=1 causes all threads to map
+        // to SMEM position 0 via the stride-0 btile, leaving tCrSFB[1..15] uninitialized.
+        // Direct load from smem_sfb_ptr (LINEAR N-row order [0..kBlockN-1]).
+        // partition_fragment_SFB->make_fragment_like compacts the (4,4) N-rep sub-modes in
+        // column-major order (first dim fastest), giving fragment nr -> N_base = 8*nr (LINEAR).
+        // n_row_sfb: this thread's N-offset within the 8-wide N-atom (lane >> 2 = 0..7).
+        const int n_row_sfb = (tidx_math & 31) >> 2;
+        constexpr int kNAtomsSFB = kBlockN / 8;
+        CUTE_UNROLL
+        for (int nr = 0; nr < kNAtomsSFB; ++nr) {
+          const int N_base = nr * 8;  // LINEAR: 0, 8, 16, ..., 120
+          tCrSFB(0, nr, 0) = smem_sfb_ptr[math_stage][N_base + n_row_sfb];
+        }
       }
       auto tCrSFB_frg = BS1::transform_fragment_for_qmma(tCrSFB);
 
+      // GEMM1: acc_s += Q × K^T (block-scaled QMMA).
+      // load_b_z_pattern replaces make_tiled_copy_B (ldmatrix.x4) which is incompatible
+      // with AtomLayout <_8,_1,_1> ThrN=1. Direct uint32 reads bypass ldmatrix entirely.
+      // linear_idx = reg + 2*nr + 32*kb matches SM120 BLayout under <_8,_1,_1>.
+      Tensor tCrQ = thr_mma_g1.partition_fragment_A(sQ_persist_pi);
+      load_a_z_pattern(sQ_persist_pi, tCrQ, 0, kHeadDim / 32);
+      Tensor tCrK = thr_mma_g1.partition_fragment_B(sK_cur_pi);
+      load_b_z_pattern(sK_cur_pi, tCrK, 0, kHeadDim / 32);
       cute::gemm(tiled_mma_g1,
           make_zip_tensor(tCrQ, tCrSFA_frg(_,_,_,_0{})),
           make_zip_tensor(tCrK, tCrSFB_frg(_,_,_,_0{})),
           acc_s);
-      } // tCrK, tCrSFB
-      } // tCrQ, tCrSFA
 
       if (params.debug_gemm1_only) {
         for (int i = 0; i < size(acc_s); ++i) acc_o(i) += acc_s(i);
@@ -849,23 +921,18 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       // LOP3 address computation, eliminating the acc_o spill.
       //
       // kAccSElems = 64 for kBlockM=kBlockN=128 / kNMathThreads=256.
-      // Packing order: flat index f = r*kPWriteC + c (same as P-write (r,c) order),
-      // acc_s_packed[f/4] bits [8*(f%4)+7 : 8*(f%4)] = FP8(acc_s_v(r,c)).
+      // Packing order matches the flat C-fragment order of thr_mma_g1.partition_C(...).
+      // Under AtomLayout <_8,_1,_1>, the old select<1,2,0,3>-based regrouping is not a
+      // valid (M,N) mapping; use acc_s(flat) directly to preserve C-fragment order.
       constexpr int kAccSElems = kBlockM * kBlockN / kNMathThreads;  // = 64
       static_assert(kAccSElems % 4 == 0, "kAccSElems must be a multiple of 4");
       uint32_t acc_s_packed[kAccSElems / 4];  // 16 registers (vs. 64 for F32)
       {
         cutlass::NumericConverter<FP8Elem, float> fp32_to_fp8;
-        auto acc_s_v_pre = make_tensor(acc_s.data(),
-            group<1,3>(group<0,2>(select<1,2,0,3>(flatten(acc_s.layout())))));
-        // size<1>(acc_s_v_pre) is a compile-time Int<C>; with CUTE_UNROLL all
-        // loop variables are compile-time so flat/4 and flat%4 fold to constants.
-        constexpr int kC = decltype(size<1>(acc_s_v_pre))::value;
-        static_assert(kAccSElems % kC == 0, "kAccSElems must be divisible by kC");
         CUTE_UNROLL
         for (int flat = 0; flat < kAccSElems; flat += 4) {
           auto get_fp8 = [&](int f) -> uint8_t {
-            FP8Elem v = fp32_to_fp8(static_cast<float>(acc_s_v_pre(f / kC, f % kC)));
+            FP8Elem v = fp32_to_fp8(static_cast<float>(acc_s(f)));
             return *reinterpret_cast<const uint8_t*>(&v);
           };
           acc_s_packed[flat / 4] =
@@ -879,101 +946,80 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
 
       // Convert/store P: write packed FP8 (from acc_s_packed) into sPbuf via CuTe API.
       // acc_s (64 F32 regs) was already converted → acc_s_packed (16 uint32) above,
-      // freeing ~48 registers before this write.  We use the CuTe position-independent
-      // API (guaranteed correct address) instead of a manual swizzle formula.
+      // freeing ~48 registers before this write.
+      // partition_C(sPbuf_pi) has the same logical C-fragment ordering as acc_s because
+      // both are derived from the same TiledMMA (thr_mma_g1). The position-independent
+      // swizzle tensor only changes how an (M,N) coordinate is lowered to SMEM address;
+      // it does not change the fragment enumeration order. Therefore tPsP(i) = FP8(acc_s(i))
+      // is correct without any intermediate select<1,2,0,3> regrouping.
       asm volatile("bar.sync 1, 256;\n" : : : "memory");
       Tensor sPbuf    = make_tensor(make_smem_ptr(sK_cur), SmemLayoutQ_SW128{});
       auto sPbuf_pi   = as_position_independent_swizzle_tensor(sPbuf);
       {
-        Tensor cP_id    = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
-        Tensor tPcP_raw = thr_mma_g1.partition_C(cP_id);
-        Tensor tPcP_v   = make_tensor(tPcP_raw.data(),
-            group<1,3>(group<0,2>(select<1,2,0,3>(flatten(tPcP_raw.layout())))));
-        constexpr int kC2 = decltype(size<1>(tPcP_v))::value;
-        constexpr int kR = kAccSElems / kC2;
+        Tensor tPsP = thr_mma_g1.partition_C(sPbuf_pi);
         CUTE_UNROLL
-        for (int r = 0; r < kR; ++r) {
-          CUTE_UNROLL
-          for (int c = 0; c < kC2; ++c) {
-            int flat = r * kC2 + c;  // compile-time with CUTE_UNROLL
-            uint8_t fp8_byte = (acc_s_packed[flat / 4] >> ((flat % 4) * 8)) & 0xFF;
-            FP8Elem fp8_val;
-            *reinterpret_cast<uint8_t*>(&fp8_val) = fp8_byte;
-            sPbuf_pi(get<0>(tPcP_v(r, c)), get<1>(tPcP_v(r, c))) = fp8_val;
-          }
+        for (int flat = 0; flat < kAccSElems; ++flat) {
+          uint8_t fp8_byte = (acc_s_packed[flat / 4] >> ((flat % 4) * 8)) & 0xFF;
+          FP8Elem fp8_val;
+          *reinterpret_cast<uint8_t*>(&fp8_val) = fp8_byte;
+          tPsP(flat) = fp8_val;
         }
       }
       asm volatile("bar.sync 1, 256;\n" : : : "memory");
 
-      // s2r P (GEMM2 A-operand).
+      // s2r P (GEMM2 A-operand) — same load_a_z_pattern as Q; sPbuf uses SmemLayoutQ_SW128 (K_SW128).
       Tensor tCrP = thr_mma_g2.partition_fragment_A(sPbuf_pi);
-      {
-        auto tXsP = s2r_thr_A2.partition_S(sPbuf_pi);
-        auto tXrP = s2r_thr_A2.retile_D(tCrP);
-        cute::copy(s2r_copy_A2, tXsP, tXrP);
-      }
+      load_a_z_pattern(sPbuf_pi, tCrP, 0, kBlockN / 32);
 
       { // tCrV, tCrSFV, tCrSFP scoped here: compiler can reuse registers freed by tCrK/tCrSFB.
-      // s2r V^T — Phase 11 LDSM_T from MN_SW128-swizzled SMEM.
+      // s2r V row-major — LDSM_T from K_SW128-swizzled SMEM [kBlockN, kHeadDim].
       //
-      // sVt_cur layout: SmemLayoutVt_TMA = tile_to_shape(MN_SW128_Atom<Element>, [kHeadDim, kBlockN]).
-      //   Swizzle<3,4,3>: physical_byte(d, n_k) = n_k * kHeadDim + (d ^ ((n_k & 7) << 4)).
-      //   TMA writes swizzled bytes automatically via the descriptor's swizzle mode.
+      // SmemLayoutVt_SW128 = K_SW128 on [kBlockN, kHeadDim]:
+      //   physical_byte(n_k, d) = n_k * kHeadDim + (d ^ ((n_k & 7) << 4)).
+      //   TMA loads row-major V directly into this layout.
       //
-      // BS2 TiledMMA: AtomLayout<_2,_4,_1>, PermMmaTileN=Layout<_8,_4,_4, Stride<_1,_32,_8>>.
-      // → 4 N-warps (ThrN=0..3), each covering 32 N-columns (d-direction): d ∈ [ThrN*32, ThrN*32+32).
-      // n_warp = (tidx_math / 32) % 4  (= ThrN = warp_id % 4 from Stride<_4,_1,_0> AtomLayout).
+      // LDSM_T (ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8): transposes [16 n_k × 32 d]
+      // from SMEM into registers. Lane t provides address for n_k row (ni*16 + t%16),
+      // d_start = dg*32 + (t>>4)*16 (matrix 0 or 1). After transpose, thread t receives
+      // 16 n_k values at its specific d-column, split into 4 registers r0..r3.
       //
-      // Fragment tXrV = recast<uint32_t>(tCrV): shape (2, 4, 4) = (reg, N_atom_in_warp, K_step).
-      //   linear_idx = reg + 2*N_atom + 8*K_step.  Total = 32 uint32 per thread.
-      //
-      // ldmatrix.m16n16.x2.trans.b8 at iteration ni (ni=0..7):
-      //   Covers n_k ∈ [ni*16, ni*16+16) and d ∈ [n_warp*32, n_warp*32+32).
-      //   Thread lane provides row address for M0 (lanes 0..15, d_mat=0) or M1 (lanes 16..31, d_mat=16).
-      //   n_k_row = ni*16 + n_off; d_start = n_warp*32 + d_mat.
-      //   swizzle_xor = (n_k_row & 7) << 4 = (n_off & 7) << 4  (ni*16 contributes 0 mod 8).
-      //   Physical address = vt_base + n_k_row * kHeadDim + (d_start ^ swizzle_xor).
-      //   16B alignment: d_start ∈ {0,16,32,...,112}, swizzle_xor ∈ {0,16,...,112}
-      //   → (d_start ^ swizzle_xor) is always a multiple of 16. ✓
-      //
-      //   After .trans, thread t gets (same logical element mapping as non-swizzled):
-      //     r0: M0[4*(t&3)..+3][t>>2]   → d = n_warp*32      + (t>>2), K = ni*16+{4*(t&3),..,+3}
-      //     r1: M0[4*(t&3)..+3][t>>2+8] → d = n_warp*32 +  8 + (t>>2), same K
-      //     r2: M1[4*(t&3)..+3][t>>2]   → d = n_warp*32 + 16 + (t>>2), same K
-      //     r3: M1[4*(t&3)..+3][t>>2+8] → d = n_warp*32 + 24 + (t>>2), same K
-      //   → r0..r3 fill N_atoms 0..3 of this warp (8 d-values each).
-      //   K mapping: K_step = ni>>1, reg = ni&1 → base = (ni&1) + 8*(ni>>1).
+      // Fragment placement: PermMmaTileN = Layout<Shape<_8,_4,_4>, Stride<_1,_32,_8>>
+      //   maps d-group dg (d ∈ [dg*32,(dg+1)*32)) to N-atoms nr ∈ {dg, dg+4, dg+8, dg+12}.
+      //   ni maps to K-block kb=ni>>1, K-half k_h=ni&1.
+      //   base = 32*(ni>>1) + 2*dg + (ni&1):
+      //     r0 → slot base+0  (nr=dg,    k_h)
+      //     r1 → slot base+8  (nr=dg+4,  k_h)
+      //     r2 → slot base+16 (nr=dg+8,  k_h)
+      //     r3 → slot base+24 (nr=dg+12, k_h)
+      //   Covers all 128 uint32 slots (16 N-atoms × 4 K-blocks × 2 regs). ✓
       auto sVt_ns = make_tensor(make_smem_ptr(sVt_cur), SmemLayoutVt_SW128{});
       Tensor tCrV = thr_mma_g2.partition_fragment_B(sVt_ns);
       {
-        const uint32_t vt_base = static_cast<uint32_t>(__cvta_generic_to_shared(sVt_cur));
-        const int lane   = tidx_math & 31;
-        const int n_off  = lane & 15;          // row index within 16-row group (for M0 or M1)
-        const int d_mat  = (lane >> 4) << 4;  // d-offset: 0 for M0 (lanes 0..15), 16 for M1 (16..31)
-        // n_warp: this warp's N-tile index (0..3). AtomLayout Stride<_4,_1,_0> → ThrN = warp_id % 4.
-        const int n_warp = (tidx_math / 32) % 4;
-
         auto tXrV = recast<uint32_t>(tCrV);
-        constexpr int kNTiles = kBlockN / 16;    // 8 (K-axis: 16 n_k values per LDSM_T call)
+        const uint32_t v_smem_base = static_cast<uint32_t>(__cvta_generic_to_shared(sVt_cur));
+        const int lane  = tidx_math & 31;
+        const int n_off = lane & 15;          // row within 16-row n_k group
+        const int d_mat = (lane >> 4) << 4;  // 0 for lanes 0-15, 16 for lanes 16-31
         CUTE_UNROLL
-        for (int ni = 0; ni < kNTiles; ++ni) {
-          // MN_SW128 swizzle: physical_byte(d, n_k) = n_k * kHeadDim + (d ^ ((n_k & 7) << 4)).
-          // n_k_row & 7 == n_off & 7 (since ni * 16 contributes 0 mod 8).
-          const int n_k_row     = ni * 16 + n_off;
-          const int d_start     = n_warp * 32 + d_mat;
-          const int swizzle_xor = (n_off & 7) << 4;
-          uint32_t addr = vt_base + (uint32_t)(n_k_row * kHeadDim + (d_start ^ swizzle_xor));
-          uint32_t r0, r1, r2, r3;
-          asm volatile(
-              "ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0,%1,%2,%3},[%4];\n"
-              : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-              : "r"(addr));
-          // K_step = ni>>1, reg = ni&1 → base = (ni&1) + 8*(ni>>1)
-          const int base = (ni & 1) + (8 * (ni >> 1));
-          tXrV(base + 0) = r0;   // N_atom=0: d ∈ [n_warp*32,    n_warp*32+8)
-          tXrV(base + 2) = r1;   // N_atom=1: d ∈ [n_warp*32+8,  n_warp*32+16)
-          tXrV(base + 4) = r2;   // N_atom=2: d ∈ [n_warp*32+16, n_warp*32+24)
-          tXrV(base + 6) = r3;   // N_atom=3: d ∈ [n_warp*32+24, n_warp*32+32)
+        for (int dg = 0; dg < kHeadDim / 32; ++dg) {   // 4 d-groups of 32 d-values each
+          const int d_start = dg * 32 + d_mat;
+          CUTE_UNROLL
+          for (int ni = 0; ni < kBlockN / 16; ++ni) {   // 8 n_k tiles of 16 rows each
+            const int n_k_row     = ni * 16 + n_off;
+            const int swizzle_xor = (n_k_row & 7) << 4;
+            const uint32_t addr   = v_smem_base + (uint32_t)(n_k_row * kHeadDim + (d_start ^ swizzle_xor));
+            uint32_t r0, r1, r2, r3;
+            asm volatile(
+                "ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0,%1,%2,%3},[%4];\n"
+                : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+            // r0..r3 cover 4 n_k-groups (4 rows each) at d = dg*32+lane, placed into
+            // N-atoms {dg, dg+4, dg+8, dg+12} × K-half {ni&1} of K-block {ni>>1}.
+            const int base = 32 * (ni >> 1) + 2 * dg + (ni & 1);
+            tXrV(base + 0)  = r0;
+            tXrV(base + 8)  = r1;
+            tXrV(base + 16) = r2;
+            tXrV(base + 24) = r3;
+          }
         }
       }
 
@@ -989,9 +1035,17 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       auto sSFV = as_position_independent_swizzle_tensor(sSFV_);
       Tensor tCrSFV = BS2::partition_fragment_SFB(sSFV(_,_,_0{}), thr_mma_g2);
       {
-        auto tXsSFV = s2r_thr_SFV.partition_S(sSFV);
-        auto tXrSFV = s2r_thr_SFV.retile_D(tCrSFV);
-        cute::copy(s2r_copy_SFV, tXsSFV(_,_,_,_0{}), tXrSFV);
+        // Same degeneracy as SFB: ThrN=1 → all threads → position 0 via stride-0 btile.
+        // Direct load from smem_sfv_ptr; N-atoms span the head-dim (d) direction for V^T.
+        // Same scale-fragment compaction rule as SFB: fragment nr -> N_base = 8*nr (LINEAR).
+        // AtomLayoutSFB_TV = (4,8):(0,1): lane>>2 indexes the within-atom N-column offset.
+        const int n_row_sfv = (tidx_math & 31) >> 2;
+        constexpr int kNAtomsSFV = kHeadDim / 8;
+        CUTE_UNROLL
+        for (int nr = 0; nr < kNAtomsSFV; ++nr) {
+          const int N_base = nr * 8;  // LINEAR: 0, 8, 16, ..., 120
+          tCrSFV(0, nr, 0) = smem_sfv_ptr[math_stage][N_base + n_row_sfv];
+        }
       }
       auto tCrSFV_frg = BS2::transform_fragment_for_qmma(tCrSFV);
 
@@ -1015,6 +1069,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     }
 
     // ===== EPILOGUE =====
+
     for (int i = 0; i < size(acc_o); ++i) acc_o(i) /= params.scaling_seqlen;
     using OutElement = typename Kernel_traits::OutputType;
     Tensor rO = make_tensor_like<OutElement>(acc_o);
@@ -1026,19 +1081,11 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         make_smem_ptr(reinterpret_cast<OutElement*>(smem_q)),
         Layout<Shape<Int<kBlockM>, Int<kHeadDim>>, Stride<Int<kHeadDim>, _1>>{});
     {
-      Tensor cO_id    = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});
-      Tensor tOcO_raw = thr_mma_g2.partition_C(cO_id);
-      Tensor tOcO_v   = make_tensor(tOcO_raw.data(),
-          group<1,3>(group<0,2>(select<1,2,0,3>(flatten(tOcO_raw.layout())))));
-      Tensor rO_v     = make_tensor(rO.data(),
-          group<1,3>(group<0,2>(select<1,2,0,3>(flatten(rO.layout())))));
-      CUTE_UNROLL
-      for (int r = 0; r < size<0>(rO_v); ++r) {
-        CUTE_UNROLL
-        for (int c = 0; c < size<1>(rO_v); ++c) {
-          sO_flat(int(get<0>(tOcO_v(r,c))), int(get<1>(tOcO_v(r,c)))) = rO_v(r,c);
-        }
-      }
+      // partition_C(sO_flat) directly maps the C-fragment to SMEM positions via the
+      // TiledMMA layout, bypassing manual coordinate extraction (select<1,2,0,3>)
+      // which was designed for <_2,_4,_1> and only covers 16/64 elements under <_8,_1,_1>.
+      Tensor tOsO = thr_mma_g2.partition_C(sO_flat);
+      for (int i = 0; i < size(rO); ++i) tOsO(i) = rO(i);
     }
 
     __syncthreads();  // S5: sO visible to all; load warp arrives here after its loop ends.

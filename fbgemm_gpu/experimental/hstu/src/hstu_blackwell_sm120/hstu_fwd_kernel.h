@@ -477,60 +477,63 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
 
     auto apply_mask = [&](auto& tSrS, int n_block) {
       static constexpr int Row = 0, Col = 1;
-      Tensor cS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
+      Tensor cS   = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
       Tensor tScS = thr_mma.partition_C(cS);
       const int base_row = m_block * kBlockM + actual_seqlen_offset;
       const int base_col = n_block * kBlockN;
-      Tensor tSrS_view = make_tensor(tSrS.data(),
-          group<1, 3>(group<0, 2>(select<1, 2, 0, 3>(flatten(tSrS.layout())))));
-      Tensor tScS_view = make_tensor(tScS.data(),
-          group<1, 3>(group<0, 2>(select<1, 2, 0, 3>(flatten(tScS.layout())))));
+      // Direct flat indexing: tScS(flat)/tSrS(flat) share the same element ordering
+      // produced by partition_C, giving correct (row,col) coords for any AtomLayout.
+      Tensor col_min = make_tensor<int>(make_shape(size<0>(gMinFunc)));
+      Tensor col_max = make_tensor<int>(make_shape(size<0>(gMaxFunc)));
+      int prev_block_row    = -1;
+      int row               = 0;
+      [[maybe_unused]] int target_col_limit_left = 0;
 #pragma unroll
-      for (int mma_row = 0; mma_row < size<0>(tSrS_view); mma_row++) {
-        const int block_row = int(get<Row>(tScS_view(mma_row, 0)));
-        const int row = block_row + base_row;
-        [[maybe_unused]] const int target_index = Is_target ? (row - actual_seqlen_h) / params.target_group_size : 0;
-        [[maybe_unused]] const int target_col_limit_left = Is_target ? actual_seqlen_h + target_index * params.target_group_size : 0;
-        Tensor col_min = make_tensor<int>(make_shape(size<0>(gMinFunc)));
-        Tensor col_max = make_tensor<int>(make_shape(size<0>(gMaxFunc)));
-        if constexpr (Is_arbitrary) {
-          col_max(0) = gMaxFunc(0, block_row);
-#pragma unroll
-          for (int j = 0; j < size<0>(gMinFunc); ++j) {
-            col_min(j) = gMinFunc(j, block_row);
-            col_max(j+1) = gMaxFunc(j+1, block_row);
-          }
-        }
-#pragma unroll
-        for (int mma_col = 0; mma_col < size<1>(tSrS_view); mma_col++) {
-          const int block_col = int(get<Col>(tScS_view(mma_row, mma_col)));
-          int col = block_col + base_col;
-          if constexpr (!Is_causal && !Is_local && !Is_arbitrary) {
-            if (col >= actual_seqlen_k) { tSrS_view(mma_row, mma_col) = -INFINITY; continue; }
-          } else {
-            if constexpr (Is_context) {
-              if (row < actual_seqlen_c && col < actual_seqlen_h) continue;
-            }
-            if (col >= col_limit_right(row)) { tSrS_view(mma_row, mma_col) = -INFINITY; continue; }
-            if constexpr (Is_local) {
-              if (col < col_limit_left(row)) { tSrS_view(mma_row, mma_col) = -INFINITY; continue; }
-            }
-            if constexpr (Is_target) {
-              if (row >= actual_seqlen_h && col >= actual_seqlen_h && col < target_col_limit_left) {
-                tSrS_view(mma_row, mma_col) = -INFINITY;
-              }
-            }
+      for (int flat = 0; flat < size(tSrS); ++flat) {
+        const auto coord    = tScS(flat);
+        const int block_row = int(get<Row>(coord));
+        if (block_row != prev_block_row) {
+          row            = block_row + base_row;
+          prev_block_row = block_row;
+          if constexpr (Is_target) {
+            const int target_index = (row - actual_seqlen_h) / params.target_group_size;
+            target_col_limit_left = actual_seqlen_h + target_index * params.target_group_size;
           }
           if constexpr (Is_arbitrary) {
-            bool non_mask = (0 <= col) && (col < col_max(0));
-            if (non_mask) continue;
+            col_max(0) = gMaxFunc(0, block_row);
 #pragma unroll
             for (int j = 0; j < size<0>(gMinFunc); ++j) {
-              non_mask = (col_min(j) <= col) && (col < col_max(j+1));
-              if (non_mask) break;
+              col_min(j)   = gMinFunc(j, block_row);
+              col_max(j+1) = gMaxFunc(j+1, block_row);
             }
-            if (!non_mask) tSrS_view(mma_row, mma_col) = -INFINITY;
           }
+        }
+        const int block_col = int(get<Col>(coord));
+        const int col       = block_col + base_col;
+        if constexpr (!Is_causal && !Is_local && !Is_arbitrary) {
+          if (col >= actual_seqlen_k) { tSrS(flat) = -INFINITY; continue; }
+        } else {
+          if constexpr (Is_context) {
+            if (row < actual_seqlen_c && col < actual_seqlen_h) continue;
+          }
+          if (col >= col_limit_right(row)) { tSrS(flat) = -INFINITY; continue; }
+          if constexpr (Is_local) {
+            if (col < col_limit_left(row)) { tSrS(flat) = -INFINITY; continue; }
+          }
+          if constexpr (Is_target) {
+            if (row >= actual_seqlen_h && col >= actual_seqlen_h && col < target_col_limit_left)
+              tSrS(flat) = -INFINITY;
+          }
+        }
+        if constexpr (Is_arbitrary) {
+          bool non_mask = (0 <= col) && (col < col_max(0));
+          if (non_mask) continue;
+#pragma unroll
+          for (int j = 0; j < size<0>(gMinFunc); ++j) {
+            non_mask = (col_min(j) <= col) && (col < col_max(j+1));
+            if (non_mask) break;
+          }
+          if (!non_mask) tSrS(flat) = -INFINITY;
         }
       }
     };
@@ -800,15 +803,59 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
     Tensor acc_o = partition_fragment_C(tiled_mma_g2, Shape<Int<kBlockM>, Int<kHeadDim>>{});
     clear(acc_o);
 
-    // s2r copy atoms.
-    auto s2r_copy_A  = make_tiled_copy_A(typename BS1::SmemCopyAtomA{}, tiled_mma_g1);
-    auto s2r_thr_copy_A  = s2r_copy_A.get_thread_slice(tidx);
+    // s2r copy atoms — A operands use Z-pattern uint32 loads (see load_a_z_pattern below).
     auto s2r_copy_B  = make_tiled_copy_B(typename BS1::SmemCopyAtomB{}, tiled_mma_g1);
     auto s2r_thr_copy_B  = s2r_copy_B.get_thread_slice(tidx);
-    auto s2r_copy_A2 = make_tiled_copy_A(typename BS2::SmemCopyAtomA{}, tiled_mma_g2);
-    auto s2r_thr_copy_A2 = s2r_copy_A2.get_thread_slice(tidx);
     auto s2r_copy_B2 = make_tiled_copy_B(typename BS2::SmemCopyAtomB{}, tiled_mma_g2);
     auto s2r_thr_copy_B2 = s2r_copy_B2.get_thread_slice(tidx);
+
+    // A-operand Z-pattern loader for SM120_16x8x32_TN AtomLayout <_8,_1,_1>.
+    // See matching implementation in hstu_fwd_kernel_fp8_ws.h for full comment.
+    // Uses individual uint32 loads (not ldmatrix.x4) to correctly implement Z-pattern
+    // from K_SW128 SMEM (ldmatrix.x4 fails for odd rows due to Swizzle<3,4,3> non-contiguity).
+    auto load_a_z_pattern = [&](auto&& sA_pi, auto& tCrA, int k_block_base, int k_block_count) {
+      const int lane   = tidx & 31;
+      const int warp_m = tidx / 32;
+      const int m_row0 = warp_m * 16 + (lane >> 2);
+      const int m_row1 = m_row0 + 8;
+      const int k_col  = (lane & 3) * 4;
+      auto tXrA = recast<uint32_t>(tCrA);
+      CUTE_UNROLL
+      for (int kb = 0; kb < k_block_count; ++kb) {
+        const int K0 = k_col + (k_block_base + kb) * 32;
+        const int K1 = K0 + 16;
+        tXrA(4*kb+0) = *reinterpret_cast<const uint32_t*>(&sA_pi(m_row0, K0));
+        tXrA(4*kb+1) = *reinterpret_cast<const uint32_t*>(&sA_pi(m_row1, K0));
+        tXrA(4*kb+2) = *reinterpret_cast<const uint32_t*>(&sA_pi(m_row0, K1));
+        tXrA(4*kb+3) = *reinterpret_cast<const uint32_t*>(&sA_pi(m_row1, K1));
+      }
+    };
+
+    // B-operand Z-pattern loader.  Mirrors load_b_z_pattern in hstu_fwd_kernel_fp8_ws.h.
+    // make_tiled_copy_B(SM75_U32x4_LDSM_N) is incompatible with AtomLayout <_8,_1,_1>
+    // (ThrN=1) because ldmatrix.x4 expects 16-byte-aligned addresses derived from the
+    // N-partition, which the new layout cannot guarantee.  Direct uint32 reads bypass this.
+    // PermMmaTileN = Layout<Shape<_8,_4,_4>, Stride<_1,_32,_8>>:
+    //   N_base[nr] = (nr % 4)*32 + (nr / 4)*8; linear_idx = 2*nr + 32*kb.
+    auto load_b_z_pattern = [&](auto&& sB_pi, auto& tCrB, int k_block_base, int k_block_count) {
+      const int lane  = tidx & 31;
+      const int n_row = lane >> 2;
+      const int k_col = (lane & 3) * 4;
+      auto tXrB = recast<uint32_t>(tCrB);
+      constexpr int kNReps = kBlockN / 8;
+      CUTE_UNROLL
+      for (int kb = 0; kb < k_block_count; ++kb) {
+        const int K0 = k_col + (k_block_base + kb) * 32;
+        const int K1 = K0 + 16;
+        CUTE_UNROLL
+        for (int nr = 0; nr < kNReps; ++nr) {
+          const int N    = (nr % 4) * 32 + (nr / 4) * 8 + n_row;
+          const int base = 32 * kb + 2 * nr;
+          tXrB(base + 0) = *reinterpret_cast<const uint32_t*>(&sB_pi(N, K0));
+          tXrB(base + 1) = *reinterpret_cast<const uint32_t*>(&sB_pi(N, K1));
+        }
+      }
+    };
 
     // s2r copy for SF operands.
     auto s2r_copy_SFA = make_tiled_copy_impl(
@@ -846,11 +893,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
 
     auto sQ_pi = as_position_independent_swizzle_tensor(sQ_sw128);
     Tensor tCrQ = thr_mma_g1.partition_fragment_A(sQ_pi);
-    {
-      auto tXsQ = s2r_thr_copy_A.partition_S(sQ_pi);
-      auto tXrQ = s2r_thr_copy_A.retile_D(tCrQ);
-      cute::copy(s2r_copy_A, tXsQ, tXrQ);
-    }
+    load_a_z_pattern(sQ_pi, tCrQ, 0, kHeadDim / 32);
 
     // Load SFA once (unit scale stays constant throughout).
     Tensor tCrSFA = BS1::partition_fragment_SFA(sSFA(_,_,_0{}), thr_mma_g1);
@@ -877,59 +920,58 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
       const int base_row = m_block * kBlockM + actual_seqlen_offset;
       const int base_col = nb * kBlockN;
 
-      Tensor tSrS_v = make_tensor(tSrS.data(),
-          group<1,3>(group<0,2>(select<1,2,0,3>(flatten(tSrS.layout())))));
-      Tensor tScS_v = make_tensor(tScS.data(),
-          group<1,3>(group<0,2>(select<1,2,0,3>(flatten(tScS.layout())))));
+      Tensor col_min = make_tensor<int>(make_shape(size<0>(gMinFunc)));
+      Tensor col_max = make_tensor<int>(make_shape(size<0>(gMaxFunc)));
+      int prev_block_row         = -1;
+      int row                    = 0;
+      [[maybe_unused]] int target_col_limit_left = 0;
 #pragma unroll
-      for (int r = 0; r < size<0>(tSrS_v); r++) {
-        const int block_row = int(get<Row>(tScS_v(r,0)));
-        const int row = block_row + base_row;
-        [[maybe_unused]] const int target_index =
-            Is_target ? (row - actual_seqlen_h) / params.target_group_size : 0;
-        [[maybe_unused]] const int target_col_limit_left =
-            Is_target ? actual_seqlen_h + target_index * params.target_group_size : 0;
-        // Pre-load arbitrary function bounds for this row.
-        Tensor col_min = make_tensor<int>(make_shape(size<0>(gMinFunc)));
-        Tensor col_max = make_tensor<int>(make_shape(size<0>(gMaxFunc)));
-        if constexpr (Is_arbitrary) {
-          col_max(0) = gMaxFunc(0, block_row);
-#pragma unroll
-          for (int j = 0; j < size<0>(gMinFunc); ++j) {
-            col_min(j) = gMinFunc(j, block_row);
-            col_max(j+1) = gMaxFunc(j+1, block_row);
-          }
-        }
-#pragma unroll
-        for (int c = 0; c < size<1>(tSrS_v); c++) {
-          const int block_col = int(get<Col>(tScS_v(r,c)));
-          const int col = block_col + base_col;
-          if constexpr (!Is_causal && !Is_local && !Is_arbitrary) {
-            if (col >= actual_seqlen_k) { tSrS_v(r,c) = -INFINITY; continue; }
-          } else {
-            if constexpr (Is_context) {
-              if (row < actual_seqlen_c && col < actual_seqlen_h) continue;
-            }
-            if (col >= col_limit_right(row)) { tSrS_v(r,c) = -INFINITY; continue; }
-            if constexpr (Is_local) {
-              if (col < col_limit_left(row)) { tSrS_v(r,c) = -INFINITY; continue; }
-            }
-            if constexpr (Is_target) {
-              if (row >= actual_seqlen_h && col >= actual_seqlen_h && col < target_col_limit_left) {
-                tSrS_v(r,c) = -INFINITY;
-              }
-            }
+      for (int flat = 0; flat < size(tSrS); ++flat) {
+        const auto coord    = tScS(flat);
+        const int block_row = int(get<Row>(coord));
+        if (block_row != prev_block_row) {
+          row            = block_row + base_row;
+          prev_block_row = block_row;
+          if constexpr (Is_target) {
+            const int target_index = (row - actual_seqlen_h) / params.target_group_size;
+            target_col_limit_left  = actual_seqlen_h + target_index * params.target_group_size;
           }
           if constexpr (Is_arbitrary) {
-            bool non_mask = (0 <= col) && (col < col_max(0));
-            if (non_mask) continue;
+            col_max(0) = gMaxFunc(0, block_row);
 #pragma unroll
             for (int j = 0; j < size<0>(gMinFunc); ++j) {
-              non_mask = (col_min(j) <= col) && (col < col_max(j+1));
-              if (non_mask) break;
+              col_min(j)   = gMinFunc(j, block_row);
+              col_max(j+1) = gMaxFunc(j+1, block_row);
             }
-            if (!non_mask) tSrS_v(r,c) = -INFINITY;
           }
+        }
+        const int block_col = int(get<Col>(coord));
+        const int col       = block_col + base_col;
+        if constexpr (!Is_causal && !Is_local && !Is_arbitrary) {
+          if (col >= actual_seqlen_k) { tSrS(flat) = -INFINITY; continue; }
+        } else {
+          if constexpr (Is_context) {
+            if (row < actual_seqlen_c && col < actual_seqlen_h) continue;
+          }
+          if (col >= col_limit_right(row)) { tSrS(flat) = -INFINITY; continue; }
+          if constexpr (Is_local) {
+            if (col < col_limit_left(row)) { tSrS(flat) = -INFINITY; continue; }
+          }
+          if constexpr (Is_target) {
+            if (row >= actual_seqlen_h && col >= actual_seqlen_h && col < target_col_limit_left) {
+              tSrS(flat) = -INFINITY;
+            }
+          }
+        }
+        if constexpr (Is_arbitrary) {
+          bool non_mask = (0 <= col) && (col < col_max(0));
+          if (non_mask) continue;
+#pragma unroll
+          for (int j = 0; j < size<0>(gMinFunc); ++j) {
+            non_mask = (col_min(j) <= col) && (col < col_max(j+1));
+            if (non_mask) break;
+          }
+          if (!non_mask) tSrS(flat) = -INFINITY;
         }
       }
     };
@@ -973,11 +1015,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
       __syncthreads();
       auto sK_pi = as_position_independent_swizzle_tensor(sK_sw128);
       Tensor tCrK = thr_mma_g1.partition_fragment_B(sK_pi);
-      {
-        auto tXsK = s2r_thr_copy_B.partition_S(sK_pi);
-        auto tXrK = s2r_thr_copy_B.retile_D(tCrK);
-        cute::copy(s2r_copy_B, tXsK, tXrK);
-      }
+      load_b_z_pattern(sK_pi, tCrK, 0, kHeadDim / 32);
 
       // Load SFB (unit scale).
       Tensor tCrSFB = BS1::partition_fragment_SFB(sSFB(_,_,_0{}), thr_mma_g1);
@@ -1008,19 +1046,13 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
       // register element, then read sRab(m,n,0) as float and add to acc_s.
       if constexpr (Has_rab) {
         Tensor cRab_id = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
-        Tensor tScRab = thr_mma_g1.partition_C(cRab_id);
-        Tensor tScRab_v = make_tensor(tScRab.data(),
-            group<1,3>(group<0,2>(select<1,2,0,3>(flatten(tScRab.layout())))));
-        Tensor acc_s_v = make_tensor(acc_s.data(),
-            group<1,3>(group<0,2>(select<1,2,0,3>(flatten(acc_s.layout())))));
+        Tensor tScRab  = thr_mma_g1.partition_C(cRab_id);
         CUTE_UNROLL
-        for (int r = 0; r < size<0>(acc_s_v); r++) {
-          CUTE_UNROLL
-          for (int c = 0; c < size<1>(acc_s_v); c++) {
-            int m = int(get<0>(tScRab_v(r, c)));
-            int n = int(get<1>(tScRab_v(r, c)));
-            acc_s_v(r, c) += float(sRab(m, n, 0));  // BF16 → float, single stage
-          }
+        for (int flat = 0; flat < size(acc_s); ++flat) {
+          const auto coord = tScRab(flat);
+          const int m      = int(get<0>(coord));
+          const int n      = int(get<1>(coord));
+          acc_s(flat) += float(sRab(m, n, 0));
         }
       }
 
@@ -1074,30 +1106,20 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
       auto sPbuf_pi = as_position_independent_swizzle_tensor(sPbuf);
       {
         Tensor cP_id = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
-        Tensor tPcP_raw = thr_mma_g1.partition_C(cP_id);
-        Tensor tPcP_v = make_tensor(tPcP_raw.data(),
-            group<1,3>(group<0,2>(select<1,2,0,3>(flatten(tPcP_raw.layout())))));
-        Tensor rP_v = make_tensor(rP.data(),
-            group<1,3>(group<0,2>(select<1,2,0,3>(flatten(rP.layout())))));
+        Tensor tPcP  = thr_mma_g1.partition_C(cP_id);
         CUTE_UNROLL
-        for (int r = 0; r < size<0>(rP_v); ++r) {
-          CUTE_UNROLL
-          for (int c = 0; c < size<1>(rP_v); ++c) {
-            int m_rel = int(get<0>(tPcP_v(r, c)));
-            int k_pos = int(get<1>(tPcP_v(r, c)));
-            sPbuf_pi(m_rel, k_pos) = rP_v(r, c);
-          }
+        for (int flat = 0; flat < size(rP); ++flat) {
+          const auto coord  = tPcP(flat);
+          const int m_rel   = int(get<0>(coord));
+          const int k_pos   = int(get<1>(coord));
+          sPbuf_pi(m_rel, k_pos) = rP(flat);
         }
       }
       __syncthreads();
 
-      // s2r load P (A-operand for GEMM2).
+      // s2r load P (A-operand for GEMM2) via Z-pattern uint32 loads.
       Tensor tCrP = thr_mma_g2.partition_fragment_A(sPbuf_pi);
-      {
-        auto tXsP = s2r_thr_copy_A2.partition_S(sPbuf_pi);
-        auto tXrP = s2r_thr_copy_A2.retile_D(tCrP);
-        cute::copy(s2r_copy_A2, tXsP, tXrP);
-      }
+      load_a_z_pattern(sPbuf_pi, tCrP, 0, kBlockN / 32);
 
       // Fill SFP (P scale, always unit) and load SFV (V scale).
       // These writes to end-of-SMEM (smem_sfa/sfb_ptr) happen before V DMA, no conflict.
@@ -1135,15 +1157,13 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
       __syncthreads();
 
       // s2r Vt: [kHeadDim, kBlockN] → tCrV registers (GEMM2 B operand).
+      // Use Z-pattern uint32 reads (same as WS kernel) — ldmatrix.x4 is incompatible
+      // with AtomLayout <_8,_1,_1> ThrN=1, producing misaligned SMEM addresses.
       FP8Elem* sVt_read_ptr = reinterpret_cast<FP8Elem*>(smem_q);
       Tensor sVt_read = make_tensor(make_smem_ptr(sVt_read_ptr), SmemLayoutVt_SW128{});
       auto sVt_pi = as_position_independent_swizzle_tensor(sVt_read);
       Tensor tCrV = thr_mma_g2.partition_fragment_B(sVt_pi);
-      {
-          auto tXsVt = s2r_thr_copy_B2.partition_S(sVt_pi);
-          auto tXrV = s2r_thr_copy_B2.retile_D(tCrV);
-          cute::copy(s2r_copy_B2, tXsVt, tXrV);
-      }
+      load_b_z_pattern(sVt_pi, tCrV, 0, kBlockN / 32);
 
       // Prefetch K[nb_next] + V[nb_next] for next iteration.
       if (nb_next >= 0) {
@@ -1238,19 +1258,13 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
     // fragment position — same flatten/select pattern as apply_mask_bs.
     {
       Tensor cO_id = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});
-      Tensor tOcO_raw = thr_mma_g2.partition_C(cO_id);
-      Tensor tOcO_v = make_tensor(tOcO_raw.data(),
-          group<1,3>(group<0,2>(select<1,2,0,3>(flatten(tOcO_raw.layout())))));
-      Tensor rO_v = make_tensor(rO.data(),
-          group<1,3>(group<0,2>(select<1,2,0,3>(flatten(rO.layout())))));
+      Tensor tOcO  = thr_mma_g2.partition_C(cO_id);
       CUTE_UNROLL
-      for (int r = 0; r < size<0>(rO_v); ++r) {
-        CUTE_UNROLL
-        for (int c = 0; c < size<1>(rO_v); ++c) {
-          int m_rel = int(get<0>(tOcO_v(r, c)));
-          int n_pos = int(get<1>(tOcO_v(r, c)));
-          sO_flat(m_rel, n_pos) = rO_v(r, c);
-        }
+      for (int flat = 0; flat < size(rO); ++flat) {
+        const auto coord  = tOcO(flat);
+        const int m_rel   = int(get<0>(coord));
+        const int n_pos   = int(get<1>(coord));
+        sO_flat(m_rel, n_pos) = rO(flat);
       }
     }
     __syncthreads();
@@ -1303,7 +1317,7 @@ template <typename TMA_Q_t, typename TMA_K_t, typename TMA_Vt_t,
 struct Hstu_fwd_params_fp8_ws_tma : public Hstu_fwd_params {
     TMA_Q_t   tma_q;   // TMA descriptor for Q:        [total_q, d, h]
     TMA_K_t   tma_k;   // TMA descriptor for K:        [total_k, d, h_k]
-    TMA_Vt_t  tma_vt;  // TMA descriptor for V^T:      [d, total_k, h_k] (pre-transposed)
+    TMA_Vt_t  tma_vt;  // TMA descriptor for V (row-major): [total_k, d, h_k]
     TMA_SFA_t tma_sfa; // TMA descriptor for Q scale:  [q_block_descale_head_stride, 1, h]
     TMA_SFB_t tma_sfb; // TMA descriptor for K scale:  [kv_block_descale_head_stride, 1, h_k]
     TMA_SFV_t tma_sfv; // TMA descriptor for V scale:  [v_block_descale_head_stride, 1, h_k]
@@ -1370,20 +1384,20 @@ void run_hstu_fwd_sm120_fp8_ws_tma_impl(Hstu_fwd_params& params, cudaStream_t st
       cute::make_shape(cute::Int<kBlockN>{}, cute::Int<kHeadDim>{}),
       cute::_1{});
 
-  // V^T TMA: GMEM described as [d, total_k, h_k] strides [1, v_row_stride, v_head_stride].
-  // Tile = [kHeadDim, kBlockN]: dim 0 = d (kHeadDim), dim 1 = k (kBlockN).
-  // Unambiguous 1:1 dim mapping even when kHeadDim == kBlockN == 128.
-  // SmemLayoutVt_TMA uses MN_SW128 → kHeadDim (d, stride-1 in GMEM) is SMEM inner axis.
+  // V TMA: GMEM described as [total_k, d, h_k] strides [v_row_stride, 1, v_head_stride].
+  // Row-major V: v_row_stride=d (token stride), d-stride=1.
+  // Tile = [kBlockN, kHeadDim]: dim 0 = n_k (kBlockN), dim 1 = d (kHeadDim).
+  // SmemLayoutVt_TMA uses K_SW128 [kBlockN, kHeadDim] → d is SMEM fast axis (K_SW128 convention).
   auto tensor_Vt_full = cute::make_tensor(
       cute::make_gmem_ptr(static_cast<FP8Elem*>(params.v_ptr)),
       cute::make_layout(
-          cute::make_shape(params.d, params.total_k, params.h_k),
-          cute::make_stride(cute::_1{}, params.v_row_stride, params.v_head_stride)));
+          cute::make_shape(params.total_k, params.d, params.h_k),
+          cute::make_stride(params.v_row_stride, cute::_1{}, params.v_head_stride)));
   auto tma_vt = cute::make_tma_copy(
       cute::SM90_TMA_LOAD{},
       tensor_Vt_full,
       SmemLayoutVt_TMA{},
-      cute::make_shape(cute::Int<kHeadDim>{}, cute::Int<kBlockN>{}),
+      cute::make_shape(cute::Int<kBlockN>{}, cute::Int<kHeadDim>{}),
       cute::_1{});
 
   // SFA: Q scale factors — int32 [q_block_descale_head_stride, 1, h] with strides [1, stride, stride].

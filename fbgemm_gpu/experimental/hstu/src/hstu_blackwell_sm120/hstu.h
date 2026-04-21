@@ -154,6 +154,7 @@ struct Hstu_fwd_params : public Hstu_params {
   // instead accumulate raw GEMM1 outputs (Q×K^T tiles) into acc_o.
   // Set HSTU_DEBUG_GEMM1_ONLY=1 to enable.  Useful to isolate GEMM1 bugs.
   bool debug_gemm1_only = false;
+
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

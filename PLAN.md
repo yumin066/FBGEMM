@@ -409,109 +409,117 @@ bash run_hstu8_examples.sh                             # 14/14 PASS（含 Has_ra
 
 ---
 
-# Phase 13 实现计划：P staging 同步优化
+# Phase 13 实现计划：消除 P staging SMEM — AtomLayout `<_8,_1,_1>` 重构
 
-> 技术分析经 Codex 二次确认（2026-04-17）。
+> 方案经 Codex 二次确认（2026-04-17）；替代旧方案（bar.sync 256→128 分割，已废弃）。
 
-## 背景
+## 背景与目标
 
-GEMM1 输出 `acc_s`（float32，kBlockM×kBlockN=128×128，每线程 64 元素）通过以下步骤转化为 GEMM2 输入 `tCrP`：
+### 当前 P staging 开销
 
+每个 N-block 迭代（N_total 次）：
 ```
-acc_s（寄存器）
-  → F32→FP8 量化（acc_s_packed）
-  → bar.sync 1,256          ← 第一个屏障（等所有线程量化完毕再写 SMEM）
-  → 写 sPbuf（aliased sK_cur）
-  → bar.sync 1,256          ← 第二个屏障（等所有线程写完再读 SMEM）
-  → LDSM → tCrP（寄存器）
+acc_s (F32, 64 elem/thread)
+  → F32→FP8 量化 (acc_s_packed，4 FP8/uint32)
+  → bar.sync 1,256          ← 阻塞全部 256 math threads
+  → SMEM 写 sPbuf (16KB, aliased sK_cur)
+  → bar.sync 1,256          ← 再次阻塞
+  → LDSM → tCrP (FP8, A-layout, 256 elem/thread)
 ```
 
-两个 `bar.sync 1,256` 串行阻塞全部 256 个 math 线程。本 Phase 目标是减少这两个同步屏障的代价。
+根因：`<_2,_4,_1>` 下 4 个 N-warp 各持有 P 的 32/128 列，GEMM2 A-fragment 需要全部 128 列，必须跨 warp 通过 SMEM 交换。
+
+### 新方案
+
+将 AtomLayout 改为 `<_8,_1,_1>`（8M-warp × 1N-warp = 8 warp）：
+- 每个 warp 覆盖 **16M 行 × 全部 128N 列**（MMA_M=1, MMA_N=16）
+- GEMM1 结束后每个 warp 寄存器已持有本 warp 所有 M 行对应的完整 128 列 P 数据
+- D→A 格式转换纯在 warp 内完成：lane t（t%4=p）在 K-rep k_a 所需的 8 个 K 列全来自 N-rep `s=k_a*4+p`，源 lane `{t&~3 .. t&~3+3}`，约 12 次 int32 `__shfl_sync`
+- **完全消除** 2×`bar.sync 1,256` + 16KB SMEM 写读
 
 ---
 
-## 技术分析结论
+## 关键设计决策（经 Codex 确认）
 
-### 为何纯 warp shuffle 不可行
-
-- GEMM1 使用 `TiledMMA<AtomLayout<_2,_4,_1>>` — 8 个 warp 排列为 2M×4N
-- warp j（N 方向）持有 P[:,j*32:(j+1)*32)（N-cols 范围），以 D-format 存于寄存器
-- GEMM2 K-step j 需要**全部 8 个 warp** 读取第 j 个 N-col 块 → 跨 N-warp 广播
-- `__shfl_sync` 仅作用于单个 warp 内 32 条 lane；跨 warp 数据交换必须经过 SMEM
-
-### `AB_Stages=4` 不产生 N 方向分片
-
-- `AB_Stages=4`（SM120QmmaBuilder 模板参数）控制 scale factor 流水线（`kNumTileKPerSF = 512/128 = 4`），**非** N 方向分区
-- 一次 `cute::gemm(tiled_mma, tCrQ, tCrK, acc_s)` 对 HeadDim 方向所有 4 个 K=32 子步累加，最终结果是完整的 128×128 P 矩阵（所有位置同时更新），无法在 K 步间截取 N-col 分片
-- 结论：warp shuffle 优化 P staging **在数学上不可行**
-
----
-
-## 可行优化方案
-
-### 方案 A（主方案）：拆分 `bar.sync 1,256` 为两个 `bar.sync 128`
-
-**原理**：P 矩阵的 M 方向由两个 warpgroup（WG0: warp 0-3，WG1: warp 4-7）分别负责不同的 M 行：
-- WG0（warp 0-3）：P 行 0..63
-- WG1（warp 4-7）：P 行 64..127
-
-这两半的写入和读取**完全独立**，无需等对方。可将 `bar.sync 1,256` 拆为：
-- `bar.sync A,128`（WG0 内部同步）
-- `bar.sync B,128`（WG1 内部同步）
-
-两组可独立推进，减少等待。
-
-**实现**：
-```cpp
-// 替换 bar.sync 1,256
-const int wg_id = tidx_math / 128;          // 0 = WG0, 1 = WG1
-const int bar_id = (wg_id == 0) ? 2 : 3;   // 用 bar ID 2,3（0,1 已被 tma/math mbar 占用）
-asm volatile("bar.sync %0, 128;" :: "r"(bar_id));
-```
-
-**注意**：需在 `kernel_traits.h` 的 `kNSyncBarriers` 中为这两个 bar 预留槽位（如果有显式声明）。
-
-### 方案 B（可选）：P 使用独立 SMEM buffer，消除第一个屏障
-
-**原理**：当前 sPbuf aliased 到 `sK_cur`，写入前需要确保 K 被 GEMM1 读完（第一个 bar.sync 的语义）。若给 P 分配独立 SMEM buffer（不与 K/V^T 复用），第一个 bar.sync 可省略。
-
-**代价**：新增 128×128×1 = 16KB SMEM（已经很紧张），需评估 occupancy 影响后决定是否实施。
+| 决策 | 说明 |
+|------|------|
+| PermMmaTileN | `Layout<Shape<_8,_1,_16>, Stride<_1,_128,_8>>`（size=128，1N-warp × 16 atom，identity 排列）|
+| SFB bug 修正 | `partition_fragment_SFB` 的 `get<1>(thr_vmnk)` 改为 `get<2>`（当前在 `<_2,_4,_1>` 下被 stride-0 collapse 掩盖，新 layout 下会产生实错）|
+| D→A 转换时机 | FP8 量化**之后**操作（不在 F32 acc_s 上），`acc_s_packed` = 4 FP8/uint32 |
+| Pack 设计 | 不复用当前 `acc_s_packed` 直接 shuffle；需设计面向 `tCrP` 目标 layout 的 shuffle-friendly pack |
+| acc_o 大小 | 每 warp 仍为 2048 float32（16M×128N），总量不变；epilogue `partition_C` 写回逻辑无需手改 |
 
 ---
 
 ## 实施步骤
 
-### Step 1：替换第一个 `bar.sync 1,256`（写前同步）
+### Step 1：改 builder 骨架 + 修复 SFB bug
 
-**文件**：`hstu_fwd_kernel_fp8_ws.h`，找到 GEMM1 结束后的第一个 `bar.sync 1,256`
+**文件**：`sm120_qmma_builder.h`
 
-```cpp
-// 删除
-asm volatile("bar.sync 1, 256;");
+- `:73-98`：
+  ```cpp
+  using PermMmaTileN = Layout<Shape<_8,_1,_16>, Stride<_1,_128,_8>>;
+  // TiledMma AtomLayout:
+  Layout<Shape<_8,_1,_1>, Stride<_1,_0,_0>>
+  ```
+- `:241-255`（`partition_fragment_SFB`）：`get<1>(thr_vmnk)` → `get<2>(thr_vmnk)`
 
-// 替换为
-const int wg_bar = (tidx_math < 128) ? 2 : 3;
-asm volatile("bar.sync %0, 128;" :: "r"(wg_bar));
-```
+**验证**：编译通过（静态 assert 不报错）
 
-### Step 2：替换第二个 `bar.sync 1,256`（读前同步）
-
-```cpp
-// 删除
-asm volatile("bar.sync 1, 256;");
-
-// 替换为
-asm volatile("bar.sync %0, 128;" :: "r"(wg_bar));
-// wg_bar 在 Step 1 中已定义，可直接复用
-```
-
-### Step 3：验证 bar ID 可用性
-
-检查 `hstu_fwd_kernel_fp8_ws.h` 中已使用的 bar ID（tma_mbar/math_mbar 用 0,1），确认 2,3 未被占用。
+**最大风险**：builder helper 内其他处隐含了旧 2×4 warp 网格语义
 
 ---
 
-## 验证流程
+### Step 2：只切 BS2，重写 V^T 手写 ldmatrix（保留 P staging）
+
+**文件**：`hstu_fwd_kernel_fp8_ws.h`
+
+- `:49-52`：`BS2 = SM120QmmaBuilder<kBlockM, kHeadDim, 4>` 使用新 layout builder
+- `:916-997`：V^T 手写 ldmatrix 重写，新循环结构：
+  ```cpp
+  // 外层 ni=0..7（K-group），内层 dg=0..3（D-group）
+  // fragment 逻辑 shape: (reg=2, n_atom=16, k_step=4)
+  // d_group_base = dg * 32;
+  // addr = vt_base + n_k_row * kHeadDim + (d_start ^ swizzle_xor);
+  ```
+
+**验证**：编译 + sweep_accuracy.py fp8_gt_cos ≥ 0.995
+
+**最大风险**：`tCrV` fragment shape 与预期不符导致寄存器落点错位
+
+---
+
+### Step 3：切 BS1 到新 layout，验证 GEMM1（保留 P staging）
+
+**文件**：`hstu_fwd_kernel_fp8_ws.h:49-52`
+
+- `BS1 = SM120QmmaBuilder<kBlockM, kBlockN, 4>` 也使用新 layout builder
+- P staging 代码**暂时保留**，仅验证 GEMM1 acc_s 分布是否正确
+
+**验证**：编译 + sweep_accuracy.py fp8_gt_cos ≥ 0.995 + run_hstu8_examples.sh 14/14 PASS
+
+**最大风险**：acc_s lane/col 坐标分布与纸面推导存在偏差
+
+---
+
+### Step 4：去掉 P staging，替换为 warp 内 D→A 转换
+
+**文件**：`hstu_fwd_kernel_fp8_ws.h:839-914`
+
+- 删除：2×`bar.sync 1,256` + sPbuf write + LDSM read
+- 替换为：
+  1. acc_s → FP8 量化（保留现有逻辑）
+  2. 设计 shuffle-friendly pack（4 FP8/uint32，按 tCrP 目标 layout 排列）
+  3. 每个 k_a（0..3）做 1 次 quad gather（3 次 `__shfl_sync`），直接填入 tCrP
+
+**验证**：编译 + sweep_accuracy.py fp8_gt_cos ≥ 0.995 + 14/14 PASS + benchmark 对比基线
+
+**最大风险**：pack 设计与 tCrP 目标 layout 不匹配，导致额外拆包重组抵消收益
+
+---
+
+## 验证命令
 
 ```bash
 # 编译
@@ -526,13 +534,11 @@ MAX_JOBS=32 pip install --no-build-isolation --config-settings editable_mode=com
 # 数值验证
 HSTU_SWEEP_FP8_QUANT_MODE=2 \
 python /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/sweep_accuracy.py \
-  2>&1 | tee /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/1test_results/090_phase13_bar_split.log
+  2>&1 | tee /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/1test_results/090_phase13_atom_layout.log
 
 # 全场景验证
 bash /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/run_hstu8_examples.sh
 ```
-
-**通过标准**：fp8_gt_cos ≥ 0.995，14/14 PASS
 
 ---
 
@@ -540,6 +546,7 @@ bash /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/run_hstu8_examples.sh
 
 | 项 | 说明 |
 |----|------|
-| 预期收益 | 每个 N-tile 迭代节省 1-2 个 256-thread 全局屏障，WG0 和 WG1 可独立推进写/读 P |
-| 风险 | bar ID 冲突（需确认 2,3 未被 mbarrier slot 占用）；SM120 上 named-barrier 语义与 mbarrier 语义不同，需确认兼容性 |
-| 方案 B 条件 | 仅在 SMEM 预算允许（+16KB）且 occupancy 不下降时实施 |
+| 预期收益 | 每 N-block 消除 2×`bar.sync 256` + 16KB SMEM write/read；12 次 int32 shuffle 代价远小于当前 SMEM roundtrip |
+| 新增成本 | `tCrV` 寄存器从 MMA_N=4 增至 MMA_N=16（4×），需确认 spill 不升高 |
+| SMEM V^T 访问 | 8 个 M-warp 读同一组 128 列，无 bank conflict，但总读带宽集中，需实测 |
+| 回退方案 | 如 Step 3 acc_s 分布验证失败，回退至旧方案（bar.sync 256→128 分割，archived below）|

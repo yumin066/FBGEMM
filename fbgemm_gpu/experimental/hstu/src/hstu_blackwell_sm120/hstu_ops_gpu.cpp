@@ -204,6 +204,7 @@ void set_params_fprop_sm120(
   } else {
     params->debug_gemm1_only = false;
   }
+
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -383,7 +384,9 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_120(
       "SM120 supports head_size 64 or 128, got ", head_size);
   TORCH_CHECK(q.stride(-1) == 1, "q must have contiguous last dimension");
   TORCH_CHECK(k.stride(-1) == 1, "k must have contiguous last dimension");
-  TORCH_CHECK(v.stride(-1) == 1, "v must have contiguous last dimension");
+  // V must be row-major (d-stride=1). WS TMA path uses row-major V with LDSM_T transpose.
+  TORCH_CHECK(v.stride(-1) == 1,
+      "v must have contiguous last dimension (row-major)");
 
   // FP8 mode: output is float16 (matches q_raw dtype from which q was quantized).
   // float16 has 10 mantissa bits (step=0.0625 at 64) vs BF16's 7 (step=0.5 at 64),

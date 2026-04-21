@@ -87,7 +87,7 @@ struct SM120QmmaBuilder {
 
   using TiledMma = TiledMMA<
       MmaAtom,
-      Layout<Shape<_2, _4, _1>, Stride<_4, _1, _0>>,
+      Layout<Shape<_8, _1, _1>, Stride<_1, _0, _0>>,
       Tile<PermMmaTileM, PermMmaTileN, PermMmaTileK>>;
 
   static_assert(
@@ -246,10 +246,10 @@ struct SM120QmmaBuilder {
         static_cast<SFBTensor&&>(sfbtensor).data(),
         thrfrg_SFB(sfbtensor.layout(), thread_mma));
     auto thr_vmnk = thread_mma.thr_vmnk_;
-    // SFB partition uses same vmnk indices as SFA (get<1> = N-warp, get<3> = K-warp).
+    // SFB is indexed by ThrN (get<2>) and ThrK (get<3>), not ThrM (get<1>).
     auto thr_vnk = make_coord(
         get<0>(thr_vmnk),
-        make_coord(get<1>(thr_vmnk), get<3>(thr_vmnk)));
+        make_coord(get<2>(thr_vmnk), get<3>(thr_vmnk)));
     auto partition_SFB =
         thr_tensor(thr_vnk, make_coord(_, repeat<rank<1, 1>(thr_tensor)>(_)));
     return make_fragment_like<ElementSFLoad>(partition_SFB);

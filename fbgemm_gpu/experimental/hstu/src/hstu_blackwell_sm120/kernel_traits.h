@@ -296,16 +296,13 @@ struct Hstu_fwd_kernel_traits_sm120_fp8 {
   using SmemLayoutAtomSW128 = GMMA::Layout_K_SW128_Atom<Element>;  // 8-row × 128-FP8 atom
   using SmemLayoutQ_TMA  = decltype(tile_to_shape(SmemLayoutAtomSW128{}, Shape<Int<kBlockM>, Int<kHeadDim>>{}));
   using SmemLayoutK_TMA  = decltype(tile_to_shape(SmemLayoutAtomSW128{}, Shape<Int<kBlockN>, Int<kHeadDim>>{}));
-  // V^T [kHeadDim, kBlockN] in SMEM, loaded via TMA from GMEM [d, total_k] (stride-1 on d axis).
-  // Phase 11 swizzle: MN_SW128_Atom (Swizzle<3,4,3>) applied to [kHeadDim, kBlockN].
-  //   Physical byte(d, n_k) = n_k * kHeadDim + (d ^ ((n_k & 7) << 4))
-  // All LDSM_T source addresses remain 16B-aligned because:
-  //   d_start ∈ {0, 16, 32, ..., 112} and swizzle_xor = (n_off & 7) << 4 ∈ {0, 16, 32, ..., 112}
-  //   → (d_start ^ swizzle_xor) is always a multiple of 16. ✓
-  // TMA descriptor uses the swizzle natively, so TMA writes swizzled bytes automatically.
+  // V row-major [kBlockN, kHeadDim] in SMEM, loaded via TMA from row-major V (d stride-1).
+  // K_SW128_Atom: dim1 = kHeadDim (d axis) is the SMEM fast axis; dim0 = kBlockN (n_k, token).
+  // Physical byte: physical(n_k, d) = n_k * kHeadDim + (d ^ ((n_k & 7) << 4)).
+  // LDSM_T address for n_k row, d-group: addr = v_base + n_k * kHeadDim + (d_start ^ ((n_k & 7) << 4)). ✓
   using SmemLayoutVt_TMA = decltype(tile_to_shape(
-      GMMA::Layout_MN_SW128_Atom<Element>{},
-      Shape<Int<kHeadDim>, Int<kBlockN>>{}));
+      SmemLayoutAtomSW128{},
+      Shape<Int<kBlockN>, Int<kHeadDim>>{}));
 
   // Output layout: BF16 written to sO (reuses smem_ base), then copied to GMEM.
   // SM120 QMMA output uses PermMmaTileN = Layout<_8,_4,_4>, Stride<_1,_32,_8>, which

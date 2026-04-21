@@ -635,52 +635,54 @@ commit `0aa00eca Refactor code`：
 
 ---
 
-## Phase 13：P staging 同步优化（规划中）
+## Phase 13：消除 P staging SMEM — AtomLayout `<_8,_1,_1>` 重构（规划中）
 
-**目标**：减少每个 N-block 迭代中 GEMM1→GEMM2 P 矩阵中转的 barrier 开销。
+**目标**：将 BS1/BS2 的 TiledMMA AtomLayout 从 `<_2,_4,_1>`（2M×4N=8 warp）改为 `<_8,_1,_1>`（8M×1N=8 warp），使每个 warp 在 GEMM1 后持有 P 矩阵全部 128 K 列，从而将 GEMM2 的 A-fragment 组装从 SMEM 跨 warp 交换降为 warp 内 `__shfl_sync`，**完全消除 2×`bar.sync 1,256` + 16KB SMEM 写读**。
 
-### 当前 P staging 路径及开销
+### 当前 P staging 开销
 
-每个 N-block（N_total 次）：
+每个 N-block 迭代：
 ```
-acc_s (F32, D-layout) → F32→FP8 convert → bar.sync 1,256 → SMEM write (16 STS/thread)
-  → bar.sync 1,256 → LDSM (16 LDS/thread) → tCrP (FP8, A-layout)
+acc_s (F32) → F32→FP8 量化 → bar.sync 1,256
+  → SMEM 写 sPbuf (16KB) → bar.sync 1,256 → LDSM → tCrP
 ```
+根因：当前 `<_2,_4,_1>` 下每个 N-warp 只持有 P 的 32/128 列，GEMM2 需要全部 128 列，必须靠 SMEM 跨 warp 交换。
 
-- 2×`bar.sync 1,256`（256线程全局同步，代价高）
-- 16 STS.128 + 16 LDS.128 per thread（32 SMEM 操作）
+### 新方案原理
 
-### 为什么 warp shuffle 无法完全替代 SMEM
+`<_8,_1,_1>` 后：
+- 8M-warp × 1N-warp，每个 warp 覆盖 **16M 行 × 全部 128N 列**（MMA_M=1, MMA_N=16）
+- GEMM1 结束后，每个 warp 的寄存器里已持有对应 16 M 行的完整 P 数据
+- D→A 格式转换：lane t（t%4=p）在 K-rep k_a 时所需的 8 个 K 列全来自 N-rep `s=k_a*4+p`，源 lane 为 `{t&~3 .. t&~3+3}`（同 warp 内），3 次 `__shfl_sync` 即可完成一个 k_a 的重排，4 个 k_a 共约 12 次 int32 shuffle
 
-**技术根因**（经 Codex 双重确认）：
+### 与 Codex 达成的三点共识（2026-04-17）
 
-- `Stages_=4`（BS1/BS2 的 `AB_Stages=4`）对应 GEMM1 的 **HeadDim-K inner dimension** 的 4 个累积步骤（K=32 × 4 = 128），与 N 方向（P 的列）**正交**
-- GEMM1 K-step s 对 **所有** N-warp 的 P 列都有贡献，即 `P[m,n] = Σ_{s=0}^{3} Σ_{k∈[32s,32s+32)} Q[m,k]·K[n,k]`——P[:,j\*32:(j+1)\*32) 的最终值需等全部 4 个 K-step 完成
-- 与此同时，N-warp j 持有 P[:,j\*32:(j+1)\*32) 的 D 格式数据，但 GEMM2 同一 M-half 的其他 N-warp 也需要该数据→需要 1→4 跨 warp 广播
-- `__shfl_sync` 只在 32-lane warp 内工作，跨 warp 广播必须通过 SMEM
+1. `sm120_qmma_builder.h` 的 `partition_fragment_SFB()` 中 `get<1>(thr_vmnk)` 是潜在 bug（应为 `get<2>`），当前 `<_2,_4,_1>` 下被 stride-0 collapse 掩盖；新 layout 下必须修正
+2. D→A 转换在 FP8 **量化之后**操作（不在 F32 acc_s 上），数据量减半；`acc_s_packed` 打包为 4 FP8/uint32
+3. 不直接复用当前 `acc_s_packed` 做 shuffle，需设计面向 `tCrP` 目标 layout 的 shuffle-friendly pack
 
-**能做的 within-warp D→A 转换**（仅限 own K-slice）：
-- N-warp j 持有 P[:,j\*32:(j+1)\*32) 的 4 个 D atom（各 8 N-col），可用 group-of-4 内的 `__shfl_sync` 将 D 格式重排为 A 格式
-- A-lane (q,t_A=0) 需 D-lane t_D=0（own）和 t_D=1 的 FP8 数据；A-lane t_A=1 需 D-lane t_D=2 和 t_D=3 的数据（均 within-warp）
-- 但这只覆盖 1/4 GEMM2 K-step，其余 3/4 仍需 SMEM → 无法消除 bar.sync
+### 实施步骤（4 步，每步独立可验证）
 
-### 可行优化方案
+**Step 1**：改 `sm120_qmma_builder.h` 骨架
+- `sm120_qmma_builder.h:73-98`：`PermMmaTileN = Layout<Shape<_8,_1,_16>, Stride<_1,_128,_8>>`；`AtomLayout = Layout<Shape<_8,_1,_1>, Stride<_1,_0,_0>>`
+- `sm120_qmma_builder.h:241-255`：`partition_fragment_SFB` 的 `get<1>` 改 `get<2>`
+- 风险：builder helper 内其他隐含 2×4 假设
 
-**方案 A（主要）：256-thread → 2×128-thread barrier**
-- 各 M-half（warps 0-3 / warps 4-7）的 P rows 不重叠（P[0..63] 和 P[64..127]）
-- 两个 M-half 可独立同步，各自用 128-thread barrier
-- `bar.sync 1,256 × 2` → `bar.sync A,128 + bar.sync B,128`（可并发）
-- 预期收益：同步代价减半
+**Step 2**：只切 BS2，重写 GEMM2 V^T 手写 ldmatrix（保留 P staging）
+- `hstu_fwd_kernel_fp8_ws.h:49-52`：BS2 使用新 layout
+- `hstu_fwd_kernel_fp8_ws.h:916-997`：V^T load 改为 `for ni=0..7, dg=0..3` 二层循环，fragment 逻辑 shape `(reg=2, n_atom=16, k_step=4)`
+- 风险：`tCrV` fragment shape 与预期不符
 
-**方案 B（可选）：消除第一个 bar.sync**
-- 第一个 `bar.sync` 的目的：等 sK（SMEM）被 GEMM1 消费完，再覆盖写 P
-- `sPbuf = sK_cur`（alias）是原因
-- 若给 P 分配独立 SMEM 区域（不与 sK 共用），第一个 bar.sync 可消除
-- 代价：需额外 16KB SMEM（128×128 FP8），需检查 SMEM 预算
-- 当前 kSmemSize 已很紧，可能不可行
+**Step 3**：切 BS1 到新 layout，验证 GEMM1 正确性（保留 P staging）
+- `hstu_fwd_kernel_fp8_ws.h:49-52`：BS1 也用新 layout
+- 风险：acc_s lane/col 分布与纸面推导有偏差
+
+**Step 4**：去掉 P staging，替换为 warp 内 D→A 转换
+- `hstu_fwd_kernel_fp8_ws.h:839-914`：删除 bar.sync + sPbuf write/read，改为量化 → shuffle-friendly pack → `__shfl_sync` → 直接构造 tCrP
+- 风险：pack 设计与 tCrP 目标 layout 不匹配导致寄存器重组抵消收益
 
 ### 验证流程
-编译通过 + sweep_accuracy.py 6/6 PASS + run_hstu8_examples.sh 14/14 PASS + benchmark 对比 Phase 12 基线。
+编译通过 + sweep_accuracy.py 6/6 PASS（fp8_gt_cos ≥ 0.995）+ run_hstu8_examples.sh 14/14 PASS + benchmark 对比 Phase 12 基线
 
 ---
 

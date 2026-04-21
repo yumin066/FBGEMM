@@ -93,7 +93,6 @@ def quantize_fp8_bs(q_bf16, k_bf16, v_bf16, batch_size, seqlen, nheads, headdim)
     v_fp8, v_descale, cu_v_blk = quantize_for_block_scale_v_along_n(
         v_in, cu_seqlens, block_size=128, fp8_type=torch.float8_e4m3fn
     )
-
     # Pack descale factors to e8m0×4 int32 format for kernel.
     # sf_v is expanded from [H, total_blocks] → [H, total_tokens] via repeat_interleave
     # so TMA SFV can load kBlockN-element tiles indexed by nb_abs (same as SFB).
