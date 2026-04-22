@@ -127,7 +127,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
   // ============================================================
   if (is_load_warp) {
     //printf("load warp, befor setmaxnreg, %d\n", tidx);
-    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" : : "n"(64));
+    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" : : "n"(56));
     //printf("load warp, after setmaxnreg, %d\n", tidx);
     // is_active_load: true only for warp 8 (threads 256-287)
     const bool is_active_load = (tidx < kNMathThreads + 32);
@@ -448,7 +448,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
   // MATH WARP PATH  (warps 0-7, threads 0-255)
   // ============================================================
     //printf("math warp, befor setmaxnreg, %d\n", tidx);
-    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" : : "n"(216));
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" : : "n"(224));
     //printf("math warp, after setmaxnreg, %d\n", tidx);
 
     constexpr bool Is_causal    = Kernel_traits::Is_causal;
@@ -622,40 +622,20 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     using SmemLayoutVt_SW128 = typename Kernel_traits::SmemLayoutVt_TMA;
 
     constexpr int kSmemKVElems = kBlockN * kHeadDim;
-    FP8Elem* const sK_base[2] = {
-        reinterpret_cast<FP8Elem*>(smem_q),
-        reinterpret_cast<FP8Elem*>(smem_q) + 2 * kSmemKVElems
-    };
-    FP8Elem* const sVt_base[2] = {
-        reinterpret_cast<FP8Elem*>(smem_q) + kSmemKVElems,
-        reinterpret_cast<FP8Elem*>(smem_q) + 3 * kSmemKVElems
-    };
-    Tensor sQ_sw128 = make_tensor(make_smem_ptr(sK_base[0]), SmemLayoutQ_SW128{});
+    Tensor sQ_sw128 = make_tensor(
+        make_smem_ptr(reinterpret_cast<FP8Elem*>(smem_q)), SmemLayoutQ_SW128{});
 
-    // Barrier pointers (same SMEM addresses as load warp).
+    // smem_base32: shared-memory base address as uint32 for on-demand barrier/KV
+    // pointer computation in the main loop — replaces 6 persistent pointer arrays.
     static constexpr int kSmemMbar0Offset =
         Kernel_traits::kSmemSize - Kernel_traits::kSmemMbarSize;
-    uint64_t* tma_mbar_ptr[2] = {
-        reinterpret_cast<uint64_t*>(smem_ + kSmemMbar0Offset),
-        reinterpret_cast<uint64_t*>(smem_ + kSmemMbar0Offset + 8)
-    };
-    uint64_t* math_mbar_ptr[2] = {
-        reinterpret_cast<uint64_t*>(smem_ + kSmemMbar0Offset + 16),
-        reinterpret_cast<uint64_t*>(smem_ + kSmemMbar0Offset + 24)
-    };
+    const uint32_t smem_base32 =
+        static_cast<uint32_t>(__cvta_generic_to_shared(smem_));
 
     // SF SMEM pointers.
     static constexpr int kSmemSFOffset_WS = Kernel_traits::kSmemWsDataSizePadded;
     int32_t* smem_sfa_ptr = reinterpret_cast<int32_t*>(smem_ + kSmemSFOffset_WS);
     int32_t* smem_sfp_ptr = smem_sfa_ptr + kBlockM;
-    int32_t* const smem_sfb_ptr[2] = {
-        smem_sfa_ptr + 2 * kBlockM,
-        smem_sfa_ptr + 2 * kBlockM + kBlockN
-    };
-    int32_t* const smem_sfv_ptr[2] = {
-        smem_sfa_ptr + 2 * kBlockM + 2 * kBlockN,
-        smem_sfa_ptr + 2 * kBlockM + 3 * kBlockN
-    };
 
     using SmemLayoutSFA = typename BS1::SmemLayoutSFA;
     using SmemLayoutSFB = typename BS1::SmemLayoutSFB;
@@ -888,7 +868,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
 
       // Wait for TMA K[nb]+Vt[nb]+SFB[nb]+SFV[nb] to land.
       {
-        uint32_t taddr = static_cast<uint32_t>(__cvta_generic_to_shared(tma_mbar_ptr[math_stage]));
+        uint32_t taddr = smem_base32 + (uint32_t)kSmemMbar0Offset + (uint32_t)(math_stage * 8);
         uint32_t done = 0;
         do {
           asm volatile("{.reg .pred p;\nmbarrier.test_wait.parity.shared::cta.b64 p, [%1], %2;\nselp.u32 %0, 1, 0, p;}\n"
@@ -902,11 +882,12 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       // reuse by the load warp.  Compiler barrier suffices.
       asm volatile("" ::: "memory");
 
-      Tensor sSFB_ = make_tensor(make_smem_ptr(smem_sfb_ptr[math_stage]), SmemLayoutSFB{});
+      int32_t* smem_sfb_cur = smem_sfa_ptr + 2 * kBlockM + math_stage * kBlockN;
+      Tensor sSFB_ = make_tensor(make_smem_ptr(smem_sfb_cur), SmemLayoutSFB{});
       auto sSFB = as_position_independent_swizzle_tensor(sSFB_);
 
-      FP8Elem* sK_cur  = sK_base[math_stage];
-      FP8Elem* sVt_cur = sVt_base[math_stage];
+      FP8Elem* sK_cur  = reinterpret_cast<FP8Elem*>(smem_q) + math_stage * 2 * kSmemKVElems;
+      FP8Elem* sVt_cur = reinterpret_cast<FP8Elem*>(smem_q) + kSmemKVElems + math_stage * 2 * kSmemKVElems;
 
       // GEMM1: acc_s += Q × K^T (block-scaled QMMA).
       // Full-K=128 copy: make_tiled_copy_A/B expects the full TiledMMA tile;
@@ -942,7 +923,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         CUTE_UNROLL
         for (int nr = 0; nr < kNAtomsSFB; ++nr) {
           const int N_base = nr * 8;  // LINEAR: 0, 8, 16, ..., 120
-          tCrSFB(0, nr, 0) = smem_sfb_ptr[math_stage][N_base + n_row_sfb];
+          tCrSFB(0, nr, 0) = smem_sfb_cur[N_base + n_row_sfb];
         }
       }
       auto tCrSFB_frg = BS1::transform_fragment_for_qmma(tCrSFB);
@@ -963,7 +944,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       if (params.debug_gemm1_only) {
         for (int i = 0; i < size(acc_s); ++i) acc_o(i) += acc_s(i);
         if ((tidx_math & 31) == 0) {
-          uint32_t maddr = static_cast<uint32_t>(__cvta_generic_to_shared(math_mbar_ptr[math_stage]));
+          uint32_t maddr = smem_base32 + (uint32_t)kSmemMbar0Offset + 16u + (uint32_t)(math_stage * 8);
           asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" : : "r"(maddr));
         }
         if (is_jump && masking_step == n_masking_steps - 1)
@@ -1126,7 +1107,8 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         cute::copy(s2r_copy_SFP, tXsSFP(_,_,_,_0{}), tXrSFP);
       }
       auto tCrSFP_frg = BS2::transform_fragment_for_qmma(tCrSFP);
-      Tensor sSFV_ = make_tensor(make_smem_ptr(smem_sfv_ptr[math_stage]), SmemLayoutSFB{});
+      int32_t* smem_sfv_cur = smem_sfa_ptr + 2 * kBlockM + 2 * kBlockN + math_stage * kBlockN;
+      Tensor sSFV_ = make_tensor(make_smem_ptr(smem_sfv_cur), SmemLayoutSFB{});
       auto sSFV = as_position_independent_swizzle_tensor(sSFV_);
       Tensor tCrSFV = BS2::partition_fragment_SFB(sSFV(_,_,_0{}), thr_mma_g2);
       {
@@ -1139,14 +1121,14 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         CUTE_UNROLL
         for (int nr = 0; nr < kNAtomsSFV; ++nr) {
           const int N_base = nr * 8;  // LINEAR: 0, 8, 16, ..., 120
-          tCrSFV(0, nr, 0) = smem_sfv_ptr[math_stage][N_base + n_row_sfv];
+          tCrSFV(0, nr, 0) = smem_sfv_cur[N_base + n_row_sfv];
         }
       }
       auto tCrSFV_frg = BS2::transform_fragment_for_qmma(tCrSFV);
 
       // Signal load warp: sK[math_stage] and sVt[math_stage] consumed; load warp may overwrite.
       if ((tidx_math & 31) == 0) {
-        uint32_t maddr = static_cast<uint32_t>(__cvta_generic_to_shared(math_mbar_ptr[math_stage]));
+        uint32_t maddr = smem_base32 + (uint32_t)kSmemMbar0Offset + 16u + (uint32_t)(math_stage * 8);
         asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" : : "r"(maddr));
       }
 
