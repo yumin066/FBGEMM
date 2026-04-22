@@ -96,9 +96,44 @@
 | 10 | 消除 SMEM transpose（col-major V） | ✅ | seq≥2048 FP8 超 BF16（2026-04-13）|
 | 11 | PTX LDSM_T + MN_SW128 swizzle | ✅ | seq≥1024 FP8 超 BF16（2026-04-16）|
 | 12 | 代码整洁化（本地 sm120_qmma_builder.h） | ✅ | 无功能变化（2026-04-17）|
-| **13** | AtomLayout `<_8,_1,_1>` + 消除 P staging（warp shuffle） | ✅ | seq≥1024 全面 +10~30%（2026-04-22）|
+| 13 | AtomLayout `<_8,_1,_1>` + 消除 P staging（warp shuffle） | ✅ | seq≥1024 全面 +10~30%（2026-04-22）|
+| **14** | setmaxnreg 224/56 + 消除全部 LDL/STL reg spill（math+load warp 零 spill） | ✅ | FP8 突破 1 TFLOPS（2026-04-22）|
 
-详细历史记录见 `HISTORY.md`。最新基线性能（Phase 13，benchmark 039）：seq=4096 causal，FP8 **833 TFLOPS** vs BF16 658 TFLOPS（**+26.7%**）；seq=4096 full：FP8 **458 TFLOPS** vs BF16 364 TFLOPS（**+25.8%**）。
+详细历史记录见 `HISTORY.md`。最新基线性能（Phase 14，benchmark 047）：seq=4096 causal，FP8 **1068.7 TFLOPS** vs BF16 661.2 TFLOPS（**+61.6%**）；seq=4096 full：FP8 **619.2 TFLOPS** vs BF16 366.7 TFLOPS（**+68.9%**）。
+
+---
+
+## Phase 14 COMPLETE：setmaxnreg 224/56 + 消除全部 LDL/STL 寄存器 Spill（2026-04-22）
+
+**核心变更**（`hstu_fwd_kernel_fp8_ws.h`）：
+- **math warp**：`smem_base32` 替换 6 个持久化 64-bit 指针数组（freed ~24 regs）；`tma_wait_parity[2]` → 独立标量 `tma_parity0/1`
+- **load warp**：`tma_mbar_ptr[2]`/`math_mbar_ptr[2]` → 独立标量指针 `tma_mbar_ptr0/1`/`math_mbar_ptr0/1`；mbar 地址用字节偏移加到 32-bit SMEM 地址上；`math_wait_parity[2]` → 独立标量 `math_wait_parity0/1`
+- **setmaxnreg**：load warp `56`，math warp `224`
+
+**优化历程（SASS LDL/STL 计数）**：
+
+| 阶段 | LDL/STL 总数 | 说明 |
+|------|------------|------|
+| Phase 13 基线 | 24 | math warp 热路径 6×STL.128 + 1×STL.64 |
+| smem_base32 替换指针数组 | 11 | math warp 热路径清零 |
+| tma/math_wait_parity 标量化 | 4 | math warp 零 spill，余 load warp |
+| load warp mbar 指针标量化 | **0** | **全部清零** |
+
+**验证结果**：
+- sweep_accuracy.py：所有配置 fp8_gt_cos ≥ 0.9996（日志 `1test_results/084_phase15_tma_parity_scalar.log`）
+- run_hstu8_examples.sh：14/14 PASS
+
+**性能结果（benchmark 047，RTX PRO 6000 Blackwell SM120）**：
+
+| Config | BF16 TFLOPS | FP8 TFLOPS | FP8 vs BF16 |
+|--------|-------------|------------|-------------|
+| bs=8 seq=4096 h=16 causal | 661 | **1068.7** | **+61.6%** |
+| bs=4 seq=4096 h=16 causal | 633 | **1012.3** | **+59.9%** |
+| bs=1 seq=4096 h=16 causal | 473 | **783.9** | **+65.8%** |
+| bs=8 seq=4096 h=16 full | 367 | **619.2** | **+68.9%** |
+| bs=8 seq=2048 h=16 causal | 577 | **860.0** | **+49.1%** |
+
+Phase 13（039）→ Phase 16（047）FP8 kernel TFLOPS 提升：seq=4096 causal +28%，seq=4096 full +35%。
 
 ---
 

@@ -29,6 +29,13 @@
       "Bash(CUDA_LAUNCH_BLOCKING=* python *)",
       "Bash(* pip install *)",
       "Bash(* python *)",
+      "Bash(nvidia-smi *)",
+      "Bash(nvidia-smi)",
+      "Bash(bash /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/*)",
+      "Bash(compute-sanitizer *)",
+      "Bash(HSTU_DISABLE_BACKWARD=* pip install *)",
+      "Bash(HSTU_DISABLE_BACKWARD=* HSTU_ARCH_LIST=* pip install *)",
+      "Bash(touch *)",
       "WebFetch(domain:arxiv.org)",
       "WebFetch(domain:code.claude.com)",
       "WebSearch"

@@ -231,14 +231,10 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     // Barrier pointers.
     static constexpr int kSmemMbar0Offset =
         Kernel_traits::kSmemSize - Kernel_traits::kSmemMbarSize;
-    uint64_t* tma_mbar_ptr[2] = {
-        reinterpret_cast<uint64_t*>(smem_ + kSmemMbar0Offset),
-        reinterpret_cast<uint64_t*>(smem_ + kSmemMbar0Offset + 8)
-    };
-    uint64_t* math_mbar_ptr[2] = {
-        reinterpret_cast<uint64_t*>(smem_ + kSmemMbar0Offset + 16),
-        reinterpret_cast<uint64_t*>(smem_ + kSmemMbar0Offset + 24)
-    };
+    uint64_t* tma_mbar_ptr0 = reinterpret_cast<uint64_t*>(smem_ + kSmemMbar0Offset);
+    uint64_t* tma_mbar_ptr1 = reinterpret_cast<uint64_t*>(smem_ + kSmemMbar0Offset + 8);
+    uint64_t* math_mbar_ptr0 = reinterpret_cast<uint64_t*>(smem_ + kSmemMbar0Offset + 16);
+    uint64_t* math_mbar_ptr1 = reinterpret_cast<uint64_t*>(smem_ + kSmemMbar0Offset + 24);
 
     // SF SMEM pointers.
     static constexpr int kSmemSFOffset_WS = Kernel_traits::kSmemWsDataSizePadded;
@@ -255,10 +251,10 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
 
     // Barrier init: only thread kNMathThreads (load warp's first thread).
     if (tidx == kNMathThreads) {
-      uint32_t tm0 = static_cast<uint32_t>(__cvta_generic_to_shared(tma_mbar_ptr[0]));
-      uint32_t tm1 = static_cast<uint32_t>(__cvta_generic_to_shared(tma_mbar_ptr[1]));
-      uint32_t mm0 = static_cast<uint32_t>(__cvta_generic_to_shared(math_mbar_ptr[0]));
-      uint32_t mm1 = static_cast<uint32_t>(__cvta_generic_to_shared(math_mbar_ptr[1]));
+      uint32_t tm0 = static_cast<uint32_t>(__cvta_generic_to_shared(tma_mbar_ptr0));
+      uint32_t tm1 = static_cast<uint32_t>(__cvta_generic_to_shared(tma_mbar_ptr1));
+      uint32_t mm0 = static_cast<uint32_t>(__cvta_generic_to_shared(math_mbar_ptr0));
+      uint32_t mm1 = static_cast<uint32_t>(__cvta_generic_to_shared(math_mbar_ptr1));
       asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" : : "r"(tm0), "r"(1));
       asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" : : "r"(tm1), "r"(1));
       asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" : : "r"(mm0), "r"(8));
@@ -294,12 +290,12 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         auto tSFAsSFA_d     = tma_slice_SFA.partition_D(
             make_tensor(make_smem_ptr(smem_sfa_ptr), SmemLayoutSFA_TMA_t{}));
         auto tSFAgSFA_tma   = tma_slice_SFA.partition_S(gSFA_tiles(_, _, _, Int<0>{}));
-        uint32_t taddr = static_cast<uint32_t>(__cvta_generic_to_shared(tma_mbar_ptr[0]));
+        uint32_t taddr = static_cast<uint32_t>(__cvta_generic_to_shared(tma_mbar_ptr0));
         asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"
                      : : "r"(taddr), "r"(kSmemQBytes + kSmemSFABytes));
-        cute::copy(params.tma_q.with(*tma_mbar_ptr[0]),   tQgQ_tma(_, _, _, m_abs),     tQsQ_d);
-        cute::copy(params.tma_sfa.with(*tma_mbar_ptr[0]), tSFAgSFA_tma(_, _, _, m_abs), tSFAsSFA_d);
-        wait_mbar_parity(tma_mbar_ptr[0], 0);  // spin until Q+SFA TMA complete
+        cute::copy(params.tma_q.with(*tma_mbar_ptr0),   tQgQ_tma(_, _, _, m_abs),     tQsQ_d);
+        cute::copy(params.tma_sfa.with(*tma_mbar_ptr0), tSFAgSFA_tma(_, _, _, m_abs), tSFAsSFA_d);
+        wait_mbar_parity(tma_mbar_ptr0, 0);  // spin until Q+SFA TMA complete
       }
     }
     __syncthreads();  // S2: Q and SFA visible to math warps; tma_mbar[0] now at phase 1.
@@ -369,29 +365,30 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     // Only active load warp (warp 8) participates.
     // Idle load warps (9-11) skip this entire section and go directly to S5.
     if (is_active_load) {
-    int math_wait_parity[2] = {0, 0};
+    int math_wait_parity0 = 0;
+    int math_wait_parity1 = 0;
 
     // Preamble: wait math_mbar[0] (pre-satisfied), then issue tile n_block_max-1 into stage 0.
     {
-      uint32_t maddr = static_cast<uint32_t>(__cvta_generic_to_shared(math_mbar_ptr[0]));
+      uint32_t maddr = static_cast<uint32_t>(__cvta_generic_to_shared(math_mbar_ptr0));
       uint32_t done = 0;
       do {
         asm volatile("{.reg .pred p;\nmbarrier.test_wait.parity.shared::cta.b64 p, [%1], %2;\nselp.u32 %0, 1, 0, p;}\n"
-                     : "=r"(done) : "r"(maddr), "r"((uint32_t)math_wait_parity[0]));
+                     : "=r"(done) : "r"(maddr), "r"((uint32_t)math_wait_parity0));
       } while (!done);
     }
-    math_wait_parity[0] ^= 1;
+    math_wait_parity0 ^= 1;
 
     if (tidx == kNMathThreads) {
       const int nb0     = Is_arbitrary ? int(sValidBlockIds[n_block_max - 1]) : (n_block_max - 1);
       const int nb_abs0 = binfo.sum_s_k / kBlockN + nb0;
-      uint32_t taddr0   = static_cast<uint32_t>(__cvta_generic_to_shared(tma_mbar_ptr[0]));
+      uint32_t taddr0   = static_cast<uint32_t>(__cvta_generic_to_shared(tma_mbar_ptr0));
       asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"
                    : : "r"(taddr0), "r"(kSmemKVtSFBBytes));
-      cute::copy(params.tma_k.with(*tma_mbar_ptr[0]),   tKgK_tma(_, _, _, nb_abs0),    tKsK_d_0);
-      cute::copy(params.tma_vt.with(*tma_mbar_ptr[0]),  tVtgVt_tma(_, _, _, nb_abs0),  tVtsVt_d_0);
-      cute::copy(params.tma_sfb.with(*tma_mbar_ptr[0]), tSFBgSFB_tma(_, _, _, nb_abs0), tSFBsSFB_d_0);
-      cute::copy(params.tma_sfv.with(*tma_mbar_ptr[0]), tSFVgSFV_tma(_, _, _, nb_abs0), tSFVsSFV_d_0);
+      cute::copy(params.tma_k.with(*tma_mbar_ptr0),   tKgK_tma(_, _, _, nb_abs0),    tKsK_d_0);
+      cute::copy(params.tma_vt.with(*tma_mbar_ptr0),  tVtgVt_tma(_, _, _, nb_abs0),  tVtsVt_d_0);
+      cute::copy(params.tma_sfb.with(*tma_mbar_ptr0), tSFBgSFB_tma(_, _, _, nb_abs0), tSFBsSFB_d_0);
+      cute::copy(params.tma_sfv.with(*tma_mbar_ptr0), tSFVgSFV_tma(_, _, _, nb_abs0), tSFVsSFV_d_0);
     }
 
     int load_n_valid_init = n_block_max - 1;
@@ -405,30 +402,31 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       const int nb = Is_arbitrary ? int(sValidBlockIds[n_valid]) : n_valid;
 
       {
-        uint32_t maddr = static_cast<uint32_t>(__cvta_generic_to_shared(math_mbar_ptr[load_stage]));
+        const int cur_math_parity = load_stage ? math_wait_parity1 : math_wait_parity0;
+        uint32_t maddr = static_cast<uint32_t>(__cvta_generic_to_shared(math_mbar_ptr0)) + (uint32_t)(load_stage * 8);
         uint32_t done = 0;
         do {
           asm volatile("{.reg .pred p;\nmbarrier.test_wait.parity.shared::cta.b64 p, [%1], %2;\nselp.u32 %0, 1, 0, p;}\n"
-                       : "=r"(done) : "r"(maddr), "r"((uint32_t)math_wait_parity[load_stage]));
+                       : "=r"(done) : "r"(maddr), "r"((uint32_t)cur_math_parity));
         } while (!done);
       }
-      math_wait_parity[load_stage] ^= 1;
+      if (load_stage) { math_wait_parity1 ^= 1; } else { math_wait_parity0 ^= 1; }
 
       if (tidx == kNMathThreads) {
         const int nb_abs = binfo.sum_s_k / kBlockN + nb;
-        uint32_t taddr   = static_cast<uint32_t>(__cvta_generic_to_shared(tma_mbar_ptr[load_stage]));
+        uint32_t taddr   = static_cast<uint32_t>(__cvta_generic_to_shared(tma_mbar_ptr0)) + (uint32_t)(load_stage * 8);
         asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"
                      : : "r"(taddr), "r"(kSmemKVtSFBBytes));
         if (load_stage == 0) {
-          cute::copy(params.tma_k.with(*tma_mbar_ptr[0]),   tKgK_tma(_, _, _, nb_abs),    tKsK_d_0);
-          cute::copy(params.tma_vt.with(*tma_mbar_ptr[0]),  tVtgVt_tma(_, _, _, nb_abs),  tVtsVt_d_0);
-          cute::copy(params.tma_sfb.with(*tma_mbar_ptr[0]), tSFBgSFB_tma(_, _, _, nb_abs), tSFBsSFB_d_0);
-          cute::copy(params.tma_sfv.with(*tma_mbar_ptr[0]), tSFVgSFV_tma(_, _, _, nb_abs), tSFVsSFV_d_0);
+          cute::copy(params.tma_k.with(*tma_mbar_ptr0),   tKgK_tma(_, _, _, nb_abs),    tKsK_d_0);
+          cute::copy(params.tma_vt.with(*tma_mbar_ptr0),  tVtgVt_tma(_, _, _, nb_abs),  tVtsVt_d_0);
+          cute::copy(params.tma_sfb.with(*tma_mbar_ptr0), tSFBgSFB_tma(_, _, _, nb_abs), tSFBsSFB_d_0);
+          cute::copy(params.tma_sfv.with(*tma_mbar_ptr0), tSFVgSFV_tma(_, _, _, nb_abs), tSFVsSFV_d_0);
         } else {
-          cute::copy(params.tma_k.with(*tma_mbar_ptr[1]),   tKgK_tma(_, _, _, nb_abs),    tKsK_d_1);
-          cute::copy(params.tma_vt.with(*tma_mbar_ptr[1]),  tVtgVt_tma(_, _, _, nb_abs),  tVtsVt_d_1);
-          cute::copy(params.tma_sfb.with(*tma_mbar_ptr[1]), tSFBgSFB_tma(_, _, _, nb_abs), tSFBsSFB_d_1);
-          cute::copy(params.tma_sfv.with(*tma_mbar_ptr[1]), tSFVgSFV_tma(_, _, _, nb_abs), tSFVsSFV_d_1);
+          cute::copy(params.tma_k.with(*tma_mbar_ptr1),   tKgK_tma(_, _, _, nb_abs),    tKsK_d_1);
+          cute::copy(params.tma_vt.with(*tma_mbar_ptr1),  tVtgVt_tma(_, _, _, nb_abs),  tVtsVt_d_1);
+          cute::copy(params.tma_sfb.with(*tma_mbar_ptr1), tSFBgSFB_tma(_, _, _, nb_abs), tSFBsSFB_d_1);
+          cute::copy(params.tma_sfv.with(*tma_mbar_ptr1), tSFVgSFV_tma(_, _, _, nb_abs), tSFVsSFV_d_1);
         }
       }
 
@@ -857,7 +855,8 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     // 16B alignment: d_start = nw*32+d_mat ∈ multiples of 16, XOR swizzle_xor also multiple of 16.
     static_assert(kHeadDim % 32 == 0 && kBlockN % 16 == 0,
         "LDSM_T requires kHeadDim divisible by 32 and kBlockN divisible by 16.");
-    int tma_wait_parity[2] = {1, 0};
+    int tma_parity0 = 1;  // parity for mbar[0]: Q TMA used it at parity 0, so next wait is 1
+    int tma_parity1 = 0;  // parity for mbar[1]: first KV TMA will complete at parity 0
     int math_stage = 0;
 
     for (int n_valid = n_block_max - 1, masking_step = 0; n_valid >= n_block_min;
@@ -868,14 +867,15 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
 
       // Wait for TMA K[nb]+Vt[nb]+SFB[nb]+SFV[nb] to land.
       {
+        const int cur_parity = math_stage ? tma_parity1 : tma_parity0;
         uint32_t taddr = smem_base32 + (uint32_t)kSmemMbar0Offset + (uint32_t)(math_stage * 8);
         uint32_t done = 0;
         do {
           asm volatile("{.reg .pred p;\nmbarrier.test_wait.parity.shared::cta.b64 p, [%1], %2;\nselp.u32 %0, 1, 0, p;}\n"
-                       : "=r"(done) : "r"(taddr), "r"((uint32_t)tma_wait_parity[math_stage]));
+                       : "=r"(done) : "r"(taddr), "r"((uint32_t)cur_parity));
         } while (!done);
       }
-      tma_wait_parity[math_stage] ^= 1;
+      if (math_stage) { tma_parity1 ^= 1; } else { tma_parity0 ^= 1; }
       // mbarrier.test_wait already guarantees TMA data visibility in SMEM.
       // No cross-warp SMEM write->read dependency exists before GEMM1; math_mbar
       // (count=8, one arrive per warp-leader after V s2r) protects stage buffer
