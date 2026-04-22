@@ -896,7 +896,11 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         } while (!done);
       }
       tma_wait_parity[math_stage] ^= 1;
-      asm volatile("bar.sync 1, 256;\n" : : : "memory");
+      // mbarrier.test_wait already guarantees TMA data visibility in SMEM.
+      // No cross-warp SMEM write->read dependency exists before GEMM1; math_mbar
+      // (count=8, one arrive per warp-leader after V s2r) protects stage buffer
+      // reuse by the load warp.  Compiler barrier suffices.
+      asm volatile("" ::: "memory");
 
       Tensor sSFB_ = make_tensor(make_smem_ptr(smem_sfb_ptr[math_stage]), SmemLayoutSFB{});
       auto sSFB = as_position_independent_swizzle_tensor(sSFB_);
