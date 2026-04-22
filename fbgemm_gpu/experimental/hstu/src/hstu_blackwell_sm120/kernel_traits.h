@@ -462,11 +462,12 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
   // kNMathThreads: math-warp-only thread count used for per-warp layout arithmetic.
   static constexpr int kNMathThreads = kNMathWarps * cutlass::NumThreadsPerWarp;  // 256
 
-  // Double-buffer pipeline: 4 barriers (2 per role), no load_mbar needed.
+  // Double-buffer pipeline: 5 barriers, no load_mbar needed.
   //   tma_mbar[0], tma_mbar[1]: TMA completion per stage (math warps wait these)
   //   math_mbar[0], math_mbar[1]: SMEM consumed per stage (load warp waits these)
-  // Each barrier is 8 bytes; total = 32 bytes.  Placed at the last 32 bytes of kSmemSize.
-  static constexpr int kSmemMbarSize = 32;
+  //   q_tma_mbar: Q+SFA preamble TMA completion (math warp thread 0 waits, expected=1)
+  // Each barrier is 8 bytes; total = 40 bytes.  Placed at the last 40 bytes of kSmemSize.
+  static constexpr int kSmemMbarSize = 40;
 
   // Double-buffer KV SMEM layout.
   // Each K or Vt tile is kBlockN * kHeadDim FP8 bytes (1 byte each).
@@ -480,7 +481,7 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
   //   [kSmemWsKVTotalBytes .. +ValidBl)   : ValidBlockIds (Is_arbitrary only)
   //   [.. + func region)                  : func arrays (Is_arbitrary only)
   //   [padded to 8B)                      : SFA(512B) + SFB(512B) = 1024B
-  //   [last kSmemMbarSize bytes)          : 4 mbarriers × 8B
+  //   [last kSmemMbarSize bytes)          : 5 mbarriers × 8B
   static constexpr int kSmemWsValidBlockIdsOffset = kSmemWsKVTotalBytes;
   static constexpr int kSmemWsFuncOffset = kSmemWsValidBlockIdsOffset +
       (Is_arbitrary_ ? (int)(size(typename Base::SmemLayoutValidBlockIds{}) * sizeof(int)) : 0);
@@ -488,10 +489,12 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
   static constexpr int kSmemWsFuncEnd = kSmemWsFuncOffset +
       (Is_arbitrary_ ? (int)((Base::kNFunc/2 + 1 + Base::kNFunc/2 + 1 + 1) * (int)sizeof(int)) : 0);
 
-  // Persistent Q tile after KV/func: K TMA reuses sK_base[0]; math reloads Q from here each GEMM1.
+  // Persistent Q tile: math warp TMA writes Q directly here; LDSM reads it every GEMM1 iteration.
+  // Aligned to the SW128 absolute-swizzle period (2048B) so TMA's absolute-swizzle write addresses
+  // match the PI-swizzled LDSM read addresses for both Is_causal and Is_arbitrary.
   static constexpr int kSmemQPersistBytes =
       kBlockM_ * kHeadDim_ * (int)sizeof(typename Base::Element);
-  static constexpr int kSmemWsQPersistOffset = ((kSmemWsFuncEnd + 127) / 128) * 128;
+  static constexpr int kSmemWsQPersistOffset = ((kSmemWsFuncEnd + 2047) / 2048) * 2048;
   static constexpr int kSmemWsAfterQPersist = kSmemWsQPersistOffset + kSmemQPersistBytes;
   // WS data region padded to 128B; SF (TMA targets) starts at this offset from smem_.
   static constexpr int kSmemWsDataSizePadded = ((kSmemWsAfterQPersist + 127) / 128) * 128;
@@ -506,6 +509,6 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
       "kNMathWarps * 16 must equal kBlockM (8 warps × 16 rows = 128)");
   static_assert(kNThreads == (kNMathWarps + kNLoadWarps) * 32,
       "kNThreads == (kNMathWarps + kNLoadWarps) * 32");  // 384
-  static_assert(kSmemMbarSize == 32,
-      "kSmemMbarSize must be 32 (four 8-byte mbarriers: tma_mbar[2] + math_mbar[2])");
+  static_assert(kSmemMbarSize == 40,
+      "kSmemMbarSize must be 40 (five 8-byte mbarriers: tma_mbar[2] + math_mbar[2] + q_tma_mbar)");
 };

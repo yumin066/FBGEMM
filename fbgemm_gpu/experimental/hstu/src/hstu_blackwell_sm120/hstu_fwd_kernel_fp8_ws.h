@@ -15,7 +15,7 @@
 // CTA-level __syncthreads__ map (must match between branches):
 //   S_arb : Is_arbitrary only — math warp 1 writes sValidBlockIds; load warp just syncs
 //   S1    : after load warp inits barriers + fence
-//   S2    : after load warp issues Q+SFA TMA and waits (Q visible to math warps)
+//   S2    : after math warp thread 0 issues Q+SFA TMA and waits (Q visible to all math warps)
 //   S3    : before main WS loop
 //   S5    : epilogue — after math warps write acc_o to SMEM (sO visible for GMEM copy)
 
@@ -231,10 +231,11 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     // Barrier pointers.
     static constexpr int kSmemMbar0Offset =
         Kernel_traits::kSmemSize - Kernel_traits::kSmemMbarSize;
-    uint64_t* tma_mbar_ptr0 = reinterpret_cast<uint64_t*>(smem_ + kSmemMbar0Offset);
-    uint64_t* tma_mbar_ptr1 = reinterpret_cast<uint64_t*>(smem_ + kSmemMbar0Offset + 8);
+    uint64_t* tma_mbar_ptr0  = reinterpret_cast<uint64_t*>(smem_ + kSmemMbar0Offset);
+    uint64_t* tma_mbar_ptr1  = reinterpret_cast<uint64_t*>(smem_ + kSmemMbar0Offset + 8);
     uint64_t* math_mbar_ptr0 = reinterpret_cast<uint64_t*>(smem_ + kSmemMbar0Offset + 16);
     uint64_t* math_mbar_ptr1 = reinterpret_cast<uint64_t*>(smem_ + kSmemMbar0Offset + 24);
+    uint64_t* q_tma_mbar_ptr = reinterpret_cast<uint64_t*>(smem_ + kSmemMbar0Offset + 32);
 
     // SF SMEM pointers.
     static constexpr int kSmemSFOffset_WS = Kernel_traits::kSmemWsDataSizePadded;
@@ -255,10 +256,12 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       uint32_t tm1 = static_cast<uint32_t>(__cvta_generic_to_shared(tma_mbar_ptr1));
       uint32_t mm0 = static_cast<uint32_t>(__cvta_generic_to_shared(math_mbar_ptr0));
       uint32_t mm1 = static_cast<uint32_t>(__cvta_generic_to_shared(math_mbar_ptr1));
+      uint32_t qm0 = static_cast<uint32_t>(__cvta_generic_to_shared(q_tma_mbar_ptr));
       asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" : : "r"(tm0), "r"(1));
       asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" : : "r"(tm1), "r"(1));
       asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" : : "r"(mm0), "r"(8));
       asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" : : "r"(mm1), "r"(8));
+      asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" : : "r"(qm0), "r"(1));
       for (int i = 0; i < 8; i++) {
         asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" : : "r"(mm0));
         asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" : : "r"(mm1));
@@ -267,38 +270,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     asm volatile("fence.proxy.async.shared::cta;\n" : : : "memory");
     __syncthreads();  // S1: barriers initialized and visible to all warps.
 
-    // Q+SFA TMA preamble: only thread kNMathThreads issues TMA and waits.
-    {
-      constexpr uint32_t kSmemQBytes   = kBlockM * kHeadDim * (uint32_t)sizeof(FP8Elem);
-      constexpr uint32_t kSmemSFABytes = kBlockM * (uint32_t)sizeof(int32_t);
-      using SmemLayoutSFA_TMA_t = cute::Layout<cute::Shape<cute::Int<kBlockM>, cute::Int<1>>,
-                                               cute::Stride<cute::_1, cute::Int<kBlockM>>>;
-      const int m_abs = binfo.sum_s_q / kBlockM + m_block;
-      if (tidx == kNMathThreads) {
-        auto mQ_tma   = params.tma_q.get_tma_tensor(make_shape(params.total_q, params.d, params.h));
-        auto gQ_head  = mQ_tma(_, _, bidh);
-        auto gQ_tiles = local_tile(gQ_head, Shape<Int<kBlockM>, Int<kHeadDim>>{}, make_coord(_, _));
-        auto tma_slice_Q = params.tma_q.get_slice(0);
-        auto sQ_buf      = make_tensor(make_smem_ptr(sK_base[0]), SmemLayoutQ_SW128{});
-        auto tQsQ_d      = tma_slice_Q.partition_D(sQ_buf);
-        auto tQgQ_tma    = tma_slice_Q.partition_S(gQ_tiles(_, _, _, Int<0>{}));
-        auto mSFA_tma    = params.tma_sfa.get_tma_tensor(
-            make_shape((int64_t)params.q_block_descale_head_stride, cute::Int<1>{}, params.h));
-        auto gSFA_head   = mSFA_tma(_, _, bidh);
-        auto gSFA_tiles  = local_tile(gSFA_head, Shape<Int<kBlockM>, Int<1>>{}, make_coord(_, _));
-        auto tma_slice_SFA  = params.tma_sfa.get_slice(0);
-        auto tSFAsSFA_d     = tma_slice_SFA.partition_D(
-            make_tensor(make_smem_ptr(smem_sfa_ptr), SmemLayoutSFA_TMA_t{}));
-        auto tSFAgSFA_tma   = tma_slice_SFA.partition_S(gSFA_tiles(_, _, _, Int<0>{}));
-        uint32_t taddr = static_cast<uint32_t>(__cvta_generic_to_shared(tma_mbar_ptr0));
-        asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"
-                     : : "r"(taddr), "r"(kSmemQBytes + kSmemSFABytes));
-        cute::copy(params.tma_q.with(*tma_mbar_ptr0),   tQgQ_tma(_, _, _, m_abs),     tQsQ_d);
-        cute::copy(params.tma_sfa.with(*tma_mbar_ptr0), tSFAgSFA_tma(_, _, _, m_abs), tSFAsSFA_d);
-        wait_mbar_parity(tma_mbar_ptr0, 0);  // spin until Q+SFA TMA complete
-      }
-    }
-    __syncthreads();  // S2: Q and SFA visible to math warps; tma_mbar[0] now at phase 1.
+    __syncthreads();  // S2: CTA rendezvous before K/V TMA setup; math warp issues Q+SFA TMA after split.
 
     // TMA tensor setup for K, V^T, SFB, SFV (load warp only).
     const int bidh_kv = bidh / params.h_h_k_ratio;
@@ -359,7 +331,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         make_smem_ptr(reinterpret_cast<int*>(smem_ + Kernel_traits::kSmemWsValidBlockIdsOffset)),
         typename Kernel_traits::SmemLayoutValidBlockIds{});
 
-    __syncthreads();  // S3: before main loop; math warps finished Q→persist SMEM copy.
+    __syncthreads();  // S3: before main loop; Q+SFA preamble TMA complete, all SMEM state visible.
 
     // ===== LOAD WARP DOUBLE-BUFFER TMA PRODUCER =====
     // Only active load warp (warp 8) participates.
@@ -620,8 +592,6 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     using SmemLayoutVt_SW128 = typename Kernel_traits::SmemLayoutVt_TMA;
 
     constexpr int kSmemKVElems = kBlockN * kHeadDim;
-    Tensor sQ_sw128 = make_tensor(
-        make_smem_ptr(reinterpret_cast<FP8Elem*>(smem_q)), SmemLayoutQ_SW128{});
 
     // smem_base32: shared-memory base address as uint32 for on-demand barrier/KV
     // pointer computation in the main loop — replaces 6 persistent pointer arrays.
@@ -629,6 +599,8 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         Kernel_traits::kSmemSize - Kernel_traits::kSmemMbarSize;
     const uint32_t smem_base32 =
         static_cast<uint32_t>(__cvta_generic_to_shared(smem_));
+    uint64_t* q_tma_mbar_ptr = reinterpret_cast<uint64_t*>(
+        reinterpret_cast<char*>(smem_) + kSmemMbar0Offset + 32);
 
     // SF SMEM pointers.
     static constexpr int kSmemSFOffset_WS = Kernel_traits::kSmemWsDataSizePadded;
@@ -750,24 +722,40 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         SmemLayoutQ_SW128{});
     auto sQ_persist_pi = as_position_independent_swizzle_tensor(sQ_persist);
 
-    __syncthreads();  // S2: Q+SFA TMA complete (load warp waited); Q visible at sK_base[0].
-
-    // Copy Q out of the K/V double-buffer slot before load warp overwrites it with K TMA.
-    // IMPORTANT: write via sQ_persist_pi (position-independent swizzle) to match the
-    // physical addresses that LDSM will read via sQ_persist_pi in the main loop.
-    // sQ_persist base (67712 for Is_arbitrary) is NOT aligned to the SW128 swizzle period
-    // (2048B), so sQ_persist(r,c) and sQ_persist_pi(r,c) map to different physical locations.
-    // Using sQ_persist (non-PI) here while LDSM reads sQ_persist_pi causes element misplacement
-    // for Is_arbitrary but not Is_causal (65536 % 2048 == 0, so PI == non-PI for Is_causal).
+    // Q+SFA TMA preamble: math warp thread 0 issues TMA directly into sQ_persist and smem_sfa_ptr.
+    // kSmemWsQPersistOffset is 2048B-aligned, so TMA's absolute SW128 write addresses and
+    // PI-swizzled LDSM read addresses are identical for all mask patterns (PI == non-PI).
     {
-      for (int i = tidx_math; i < kBlockM * kHeadDim; i += kNMathThreads) {
-        const int r = i / kHeadDim;
-        const int c = i % kHeadDim;
-        sQ_persist_pi(r, c) = sQ_sw128(r, c);
+      constexpr uint32_t kSmemQBytes   = kBlockM * kHeadDim * (uint32_t)sizeof(FP8Elem);
+      constexpr uint32_t kSmemSFABytes = kBlockM * (uint32_t)sizeof(int32_t);
+      using SmemLayoutSFA_TMA_t = cute::Layout<cute::Shape<cute::Int<kBlockM>, cute::Int<1>>,
+                                               cute::Stride<cute::_1, cute::Int<kBlockM>>>;
+      const int m_abs = binfo.sum_s_q / kBlockM + m_block;
+      if (tidx_math == 0) {
+        auto mQ_tma   = params.tma_q.get_tma_tensor(make_shape(params.total_q, params.d, params.h));
+        auto gQ_head  = mQ_tma(_, _, bidh);
+        auto gQ_tiles = local_tile(gQ_head, Shape<Int<kBlockM>, Int<kHeadDim>>{}, make_coord(_, _));
+        auto tma_slice_Q = params.tma_q.get_slice(0);
+        auto sQ_buf      = make_tensor(make_smem_ptr(sQ_persist.data()), SmemLayoutQ_SW128{});
+        auto tQsQ_d      = tma_slice_Q.partition_D(sQ_buf);
+        auto tQgQ_tma    = tma_slice_Q.partition_S(gQ_tiles(_, _, _, Int<0>{}));
+        auto mSFA_tma    = params.tma_sfa.get_tma_tensor(
+            make_shape((int64_t)params.q_block_descale_head_stride, cute::Int<1>{}, params.h));
+        auto gSFA_head   = mSFA_tma(_, _, bidh);
+        auto gSFA_tiles  = local_tile(gSFA_head, Shape<Int<kBlockM>, Int<1>>{}, make_coord(_, _));
+        auto tma_slice_SFA = params.tma_sfa.get_slice(0);
+        auto tSFAsSFA_d    = tma_slice_SFA.partition_D(
+            make_tensor(make_smem_ptr(smem_sfa_ptr), SmemLayoutSFA_TMA_t{}));
+        auto tSFAgSFA_tma  = tma_slice_SFA.partition_S(gSFA_tiles(_, _, _, Int<0>{}));
+        uint32_t qaddr = static_cast<uint32_t>(__cvta_generic_to_shared(q_tma_mbar_ptr));
+        asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"
+                     : : "r"(qaddr), "r"(kSmemQBytes + kSmemSFABytes));
+        cute::copy(params.tma_q.with(*q_tma_mbar_ptr),   tQgQ_tma(_, _, _, m_abs),     tQsQ_d);
+        cute::copy(params.tma_sfa.with(*q_tma_mbar_ptr), tSFAgSFA_tma(_, _, _, m_abs), tSFAsSFA_d);
+        wait_mbar_parity(q_tma_mbar_ptr, 0);  // spin until Q+SFA TMA complete
       }
     }
-    // Math-only rendezvous; do NOT use __syncthreads() here (would desync load path's S3/S5).
-    asm volatile("bar.sync 1, 256;\n" : : : "memory");
+    __syncthreads();  // S2: Q+SFA TMA complete; Q resident in sQ_persist, SFA in smem_sfa_ptr.
 
     // Mask lambda (captures variables from math warp scope).
     auto col_limit_right = [&](int row) {
@@ -855,8 +843,8 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     // 16B alignment: d_start = nw*32+d_mat ∈ multiples of 16, XOR swizzle_xor also multiple of 16.
     static_assert(kHeadDim % 32 == 0 && kBlockN % 16 == 0,
         "LDSM_T requires kHeadDim divisible by 32 and kBlockN divisible by 16.");
-    int tma_parity0 = 1;  // parity for mbar[0]: Q TMA used it at parity 0, so next wait is 1
-    int tma_parity1 = 0;  // parity for mbar[1]: first KV TMA will complete at parity 0
+    int tma_parity0 = 0;  // parity for mbar[0]: first K TMA preamble arrives at parity 0
+    int tma_parity1 = 0;  // parity for mbar[1]: first V TMA preamble arrives at parity 0
     int math_stage = 0;
 
     for (int n_valid = n_block_max - 1, masking_step = 0; n_valid >= n_block_min;

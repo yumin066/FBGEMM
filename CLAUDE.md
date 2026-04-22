@@ -98,8 +98,38 @@
 | 12 | 代码整洁化（本地 sm120_qmma_builder.h） | ✅ | 无功能变化（2026-04-17）|
 | 13 | AtomLayout `<_8,_1,_1>` + 消除 P staging（warp shuffle） | ✅ | seq≥1024 全面 +10~30%（2026-04-22）|
 | **14** | setmaxnreg 224/56 + 消除全部 LDL/STL reg spill（math+load warp 零 spill） | ✅ | FP8 突破 1 TFLOPS（2026-04-22）|
+| **15** | Q+SFA TMA 迁移到 math warp，直接打到 sQ_persist，删除 load warp Q copy + bar.sync | ✅ | FP8/BF16 比值 1.633（2026-04-22）|
 
-详细历史记录见 `HISTORY.md`。最新基线性能（Phase 14，benchmark 047）：seq=4096 causal，FP8 **1068.7 TFLOPS** vs BF16 661.2 TFLOPS（**+61.6%**）；seq=4096 full：FP8 **619.2 TFLOPS** vs BF16 366.7 TFLOPS（**+68.9%**）。
+详细历史记录见 `HISTORY.md`。最新基线性能（Phase 14，benchmark 047，锁频 2407 MHz）：seq=4096 causal，FP8 **1068.7 TFLOPS** vs BF16 661.2 TFLOPS（**+61.6%**）；seq=4096 full：FP8 **619.2 TFLOPS** vs BF16 366.7 TFLOPS（**+68.9%**）。Phase 15（benchmark 049，未锁频）：FP8/BF16 比值 1.633，无退化。
+
+---
+
+## Phase 15 COMPLETE：Q+SFA TMA 迁移到 math warp（2026-04-22）
+
+**核心变更**（`hstu_fwd_kernel_fp8_ws.h` + `kernel_traits.h`）：
+- **kernel_traits.h**：`kSmemMbarSize` 32→40（新增 `q_tma_mbar` 第5个 barrier）；`kSmemWsQPersistOffset` 对齐 128B→2048B（与 SW128 swizzle 周期一致，保证 TMA 绝对写地址 = PI-swizzle LDSM 读地址）
+- **load warp**：删除 Q+SFA TMA preamble block（约30行），S2 变纯同步屏障
+- **math warp**：新增 `q_tma_mbar_ptr` 声明；thread 0 在 S1 后发 Q+SFA TMA → `wait_mbar_parity(q_tma_mbar_ptr, 0)` 自旋等待完成；S2 使 Q 对所有 math warp 可见
+- **主循环**：`tma_parity0 = 1` → `0`（Q TMA 不再占用 tma_mbar[0]，K TMA 从 parity 0 起算）
+
+**两个关键 bug 修复**（Codex review 发现）：
+1. `q_tma_mbar` init `expected=2` → `1`（避免 `wait_mbar_parity` 死锁）
+2. `tma_parity0 = 1` → `0`（Q 不再用 tma_mbar[0]，parity 修正）
+
+**验证结果**（2026-04-22）：
+- sweep_accuracy.py：所有配置 fp8_gt_cos ≥ 0.9996（日志 `1test_results/085_phase15_q_tma_math_warp.log`）
+- run_hstu8_examples.sh：14/14 PASS
+- FP8/BF16 TFLOPS 比值：1.619（Phase 14: 1.616），无退化（benchmark 048）
+
+**性能结果（benchmark 048，RTX PRO 6000 Blackwell SM120）**：
+
+| Config | BF16 TFLOPS | FP8 TFLOPS | FP8 vs BF16 |
+|--------|-------------|------------|-------------|
+| bs=8 seq=4096 h=16 causal | 654 | **1059.2** | **+61.9%** |
+| bs=4 seq=4096 h=16 causal | 627 | **1025.2** | **+63.6%** |
+| bs=1 seq=4096 h=16 causal | 472 | **804.2** | **+70.3%** |
+| bs=8 seq=4096 h=16 full | 366 | **619.0** | **+69.3%** |
+| bs=8 seq=2048 h=16 full | 329 | **581.1** | **+76.7%** |
 
 ---
 
