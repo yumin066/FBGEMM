@@ -36,6 +36,65 @@ __device__ inline void wait_mbar_parity(uint64_t* mbar, uint32_t parity) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Rearrange GEMM1 C-fragment (acc_s_packed[16]) to GEMM2 A-fragment (tCrP[16]) layout
+// using warp shuffle only — no SMEM staging, no bar.sync required.
+//
+// With AtomLayout <_8,_1,_1> (1 N-warp), each warp holds all 128 N-values of P in its
+// own registers after GEMM1. No cross-warp communication is needed: the entire D→A
+// rearrangement is intra-warp, performed by SHFL.IDX within each 4-thread quad.
+//
+// QMMA.SF.16832 coordinate mappings (SPA ISA):
+//   C-fragment: acc_s_packed[nr] = N-atom nr, bytes {mr=0,i=0},{mr=0,i=1},{mr=1,i=0},{mr=1,i=1}
+//     where N_base(nr) = (nr%4)*32 + (nr/4)*8  (from PermMmaTileN strides (1,32,8))
+//     and   col = N_base(nr) + (lane&3)*2 + i
+//   A-fragment: tCrP[4*kb + 2*c + mr] at row=8*mr+(lane>>2), col=32*kb+16*c+(lane&3)*4+{0..3}
+//
+// For each (kb,c), the 4 K-values needed by one thread span two consecutive C-fragment
+// atoms: atom_lo covers col[0..1] (from src_lane0) and atom_hi covers col[2..3] (from src_lane1).
+//   src_lane0 = (lane & ~3u) | ((lane&1u) << 1)  — lower pair of the quad
+//   src_lane1 = src_lane0 + 1                     — upper pair of the quad
+// kAtomLut[kb][c][h]: C-fragment atom index for K-half h (h = (lane&3)>>1).
+//   kAtomLut[kb][c][h] = kb + 4*(2*c + h)
+// Byte assembly:
+//   mr=0 (row=quad):   __byte_perm(a, b, 0x5410) = {a.b0,a.b1,b.b0,b.b1}
+//   mr=1 (row=8+quad): __byte_perm(a, b, 0x7632) = {a.b2,a.b3,b.b2,b.b3}
+//
+// Cost: 4 kb × 2 c × 4 SHFL + 2 __byte_perm = 32 SHFL + 16 BYTE_PERM per thread.
+// Savings: eliminates 2 × bar.sync (256-thread) + 16KB SMEM write + LDSM load-back.
+__device__ __forceinline__ void permute_acc_s_packed_to_tCrP(
+    uint32_t* __restrict__ tCrP,
+    const uint32_t* __restrict__ acc_s_packed) {
+  const unsigned lane      = threadIdx.x & 31u;
+  const unsigned tiq       = lane & 3u;
+  const unsigned quad_base = lane & ~3u;
+  const unsigned src_lane0 = quad_base | ((tiq & 1u) << 1u);
+  const unsigned src_lane1 = src_lane0 + 1u;
+
+  constexpr uint8_t kLut0[4][2] = {{ 0, 8}, { 1, 9}, { 2, 10}, { 3, 11}};
+  constexpr uint8_t kLut1[4][2] = {{ 4,12}, { 5,13}, { 6, 14}, { 7, 15}};
+
+  CUTE_UNROLL
+  for (int kb = 0; kb < 4; ++kb) {
+    CUTE_UNROLL
+    for (int c = 0; c < 2; ++c) {
+      // Shuffle BOTH halves first, then select: src_lane's tiq determines which
+      // N-atom register IT holds, which may differ from the destination's h-half.
+      const uint32_t pk0 = acc_s_packed[kLut0[kb][c]];
+      const uint32_t pk1 = acc_s_packed[kLut1[kb][c]];
+      const uint32_t a0  = __shfl_sync(0xFFFFFFFFu, pk0, src_lane0);
+      const uint32_t b0  = __shfl_sync(0xFFFFFFFFu, pk0, src_lane1);
+      const uint32_t a1  = __shfl_sync(0xFFFFFFFFu, pk1, src_lane0);
+      const uint32_t b1  = __shfl_sync(0xFFFFFFFFu, pk1, src_lane1);
+      const uint32_t a   = (tiq >> 1u) ? a1 : a0;
+      const uint32_t b   = (tiq >> 1u) ? b1 : b0;
+      tCrP[4 * kb + 2 * c + 0] = __byte_perm(a, b, 0x5410u);
+      tCrP[4 * kb + 2 * c + 1] = __byte_perm(a, b, 0x7632u);
+    }
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <typename Kernel_traits, typename Params>
 inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     const Params& params,
@@ -947,34 +1006,64 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
               ((uint32_t)get_fp8(flat + 3) << 24);
         }
       }
-      // acc_s (64 F32 regs) is now DEAD — freed for LOP3 in P-write below.
-
-      // Convert/store P: write packed FP8 (from acc_s_packed) into sPbuf via CuTe API.
-      // acc_s (64 F32 regs) was already converted → acc_s_packed (16 uint32) above,
-      // freeing ~48 registers before this write.
-      // partition_C(sPbuf_pi) has the same logical C-fragment ordering as acc_s because
-      // both are derived from the same TiledMMA (thr_mma_g1). The position-independent
-      // swizzle tensor only changes how an (M,N) coordinate is lowered to SMEM address;
-      // it does not change the fragment enumeration order. Therefore tPsP(i) = FP8(acc_s(i))
-      // is correct without any intermediate select<1,2,0,3> regrouping.
-      asm volatile("bar.sync 1, 256;\n" : : : "memory");
-      Tensor sPbuf    = make_tensor(make_smem_ptr(sK_cur), SmemLayoutQ_SW128{});
-      auto sPbuf_pi   = as_position_independent_swizzle_tensor(sPbuf);
+      // acc_s (64 F32 regs) is now DEAD.
+      //
+      // Build GEMM2 A-fragment P directly in registers via warp shuffle.
+      // With AtomLayout <_8,_1,_1> (1 N-warp), all 128 N-columns of P live in each
+      // warp's own registers — no cross-warp SMEM staging or bar.sync is needed.
+      // sPbuf_pi is defined for partition_fragment_A shape inference only; sK_cur is
+      // not written and remains available for the load warp's next TMA fill.
+      Tensor sPbuf  = make_tensor(make_smem_ptr(sK_cur), SmemLayoutQ_SW128{});
+      auto sPbuf_pi = as_position_independent_swizzle_tensor(sPbuf);
+      Tensor tCrP = thr_mma_g2.partition_fragment_A(sPbuf_pi);
       {
-        Tensor tPsP = thr_mma_g1.partition_C(sPbuf_pi);
+        // Warp shuffle: rearrange acc_s_packed (C-fragment, 16 uint32) into
+        // tCrP (A-fragment, 16 uint32) without SMEM staging or bar.sync.
+        //
+        // Each (kb,c) pair selects TWO compile-time acc_s_packed slots (pk0 for
+        // tiq∈{0,2}, pk1 for tiq∈{1,3}), shuffles them from the correct quad-lane
+        // pair, and byte-permutes them into the mr=0/mr=1 A-fragment slots.
+        //
+        // acc_s_packed[] MUST stay in registers for __shfl_sync to exchange real
+        // register values.  All indices into acc_s_packed are compile-time constants
+        // after CUTE_UNROLL expansion so the compiler keeps the array in registers.
+        auto tXrP = recast<uint32_t>(tCrP);
+        const unsigned lane      = (unsigned)tidx_math & 31u;
+        const unsigned tiq       = lane & 3u;
+        const unsigned quad_base = lane & ~3u;
+        // Lower pair (src_lane0) and upper pair (src_lane1) within the quad:
+        //   tiq=0,2 → src_lane0=quad+0, src_lane1=quad+1
+        //   tiq=1,3 → src_lane0=quad+2, src_lane1=quad+3
+        const unsigned src_lane0 = quad_base | ((tiq & 1u) << 1u);
+        const unsigned src_lane1 = src_lane0 + 1u;
+        // kLut{0,1}[kb][c]: compile-time acc_s_packed indices for K-half h=0 and h=1.
+        //   kLut0[kb][c] = kb + 4*(2*c + 0) = kb + 8*c
+        //   kLut1[kb][c] = kb + 4*(2*c + 1) = kb + 8*c + 4
+        constexpr uint8_t kLut0[4][2] = {{ 0, 8}, { 1, 9}, { 2, 10}, { 3, 11}};
+        constexpr uint8_t kLut1[4][2] = {{ 4,12}, { 5,13}, { 6, 14}, { 7, 15}};
         CUTE_UNROLL
-        for (int flat = 0; flat < kAccSElems; ++flat) {
-          uint8_t fp8_byte = (acc_s_packed[flat / 4] >> ((flat % 4) * 8)) & 0xFF;
-          FP8Elem fp8_val;
-          *reinterpret_cast<uint8_t*>(&fp8_val) = fp8_byte;
-          tPsP(flat) = fp8_val;
+        for (int kb = 0; kb < 4; ++kb) {
+          CUTE_UNROLL
+          for (int c = 0; c < 2; ++c) {
+            // Both indices are compile-time constants after CUTE_UNROLL expansion;
+            // NVCC keeps acc_s_packed in registers and emits a predicated SHFL pair.
+            const uint32_t pk0 = acc_s_packed[kLut0[kb][c]];
+            const uint32_t pk1 = acc_s_packed[kLut1[kb][c]];
+            // Shuffle BOTH halves first, then select: src_lane's tiq determines which
+            // N-atom register IT holds, which may differ from the destination's h-half.
+            const uint32_t a0  = __shfl_sync(0xFFFFFFFFu, pk0, src_lane0);
+            const uint32_t b0  = __shfl_sync(0xFFFFFFFFu, pk0, src_lane1);
+            const uint32_t a1  = __shfl_sync(0xFFFFFFFFu, pk1, src_lane0);
+            const uint32_t b1  = __shfl_sync(0xFFFFFFFFu, pk1, src_lane1);
+            const uint32_t a   = (tiq >> 1u) ? a1 : a0;
+            const uint32_t b   = (tiq >> 1u) ? b1 : b0;
+            // byte_perm 0x5410 = {a.b0,a.b1,b.b0,b.b1} → mr=0 (row = quad)
+            // byte_perm 0x7632 = {a.b2,a.b3,b.b2,b.b3} → mr=1 (row = 8+quad)
+            tXrP(4 * kb + 2 * c + 0) = __byte_perm(a, b, 0x5410u);
+            tXrP(4 * kb + 2 * c + 1) = __byte_perm(a, b, 0x7632u);
+          }
         }
       }
-      asm volatile("bar.sync 1, 256;\n" : : : "memory");
-
-      // s2r P (GEMM2 A-operand) — same load_a_z_pattern as Q; sPbuf uses SmemLayoutQ_SW128 (K_SW128).
-      Tensor tCrP = thr_mma_g2.partition_fragment_A(sPbuf_pi);
-      load_a_z_pattern(sPbuf_pi, tCrP, 0, kBlockN / 32);
 
       { // tCrV, tCrSFV, tCrSFP scoped here: compiler can reuse registers freed by tCrK/tCrSFB.
       // s2r V row-major — LDSM_T from K_SW128-swizzled SMEM [kBlockN, kHeadDim].

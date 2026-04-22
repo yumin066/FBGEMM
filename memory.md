@@ -157,3 +157,30 @@ stripped=$(echo "$last_arg" | sed "s|ARGV0=['\"]\\?apply-seccomp['\"]\\? ['\"]\\
 ```
 
 **调试方法**：在 bwrap wrapper 末尾加 `printf '%s\n' "${args[@]}" >> /tmp/bwrap-debug.log`，看 `--` 后的命令字符串格式。
+
+---
+
+## Phase 13 COMPLETE：AtomLayout `<_8,_1,_1>` + Warp Shuffle（2026-04-22）
+
+**Branch**: sm120，**状态**: ✅ 14/14 PASS，fp8_gt_cos ≥ 0.9996
+
+### 完成内容
+
+- `sm120_qmma_builder.h`：AtomLayout `<_2,_4,_1>` → `<_8,_1,_1>`；`partition_fragment_SFB` get<1> → get<2> bug fix
+- `hstu_fwd_kernel_fp8_ws.h`：GEMM1/GEMM2 改为 4×K=32 k_step streaming；P staging（2×bar.sync 256 + 16KB SMEM）→ warp 内 `__shfl_sync` + `__byte_perm`
+
+### warp shuffle 关键 bug（已修复）
+
+C-fragment → A-fragment 重排必须先 shuffle pk0/pk1 两个 half，再由**目标线程**按 `tiq>>1` 选择。若在 shuffle 前选（旧写法），src_lane 的 tiq 与 dst 不同，导致 N-atom 错配，cos_sim ≈ 0.66。修复后 cos_sim ≥ 0.9996。
+
+### 性能结果（benchmark 039，2026-04-22）
+
+| Config | BF16 T | FP8 T | FP8 vs BF16 |
+|--------|--------|-------|-------------|
+| bs=8 seq=4096 h=16 causal | 658T | **833T** | **+26.7%** |
+| bs=4 seq=4096 h=16 causal | 633T | **792T** | **+25.2%** |
+| bs=1 seq=4096 h=16 causal | 463T | **591T** | **+27.9%** |
+| bs=8 seq=4096 h=16 full | 364T | **457T** | **+25.8%** |
+| bs=8 seq=2048 h=16 full | 326T | **429T** | **+31.9%** |
+
+Phase 12→13 提升：seq≥1024 full +15~25pp，causal +9~13pp。seq=512 causal 约 -10pp（k_step overhead，属预期）。

@@ -34,7 +34,6 @@ v_in = v.to(torch.float8_e4m3fn).to(torch.bfloat16)
 q_fp8, q_dsc, cu_q_blk   = quantize_for_block_scale_qk_along_d(q_in, cu, fp8_type=torch.float8_e4m3fn)
 k_fp8, k_dsc, cu_kv_blk  = quantize_for_block_scale_qk_along_d(k_in, cu, fp8_type=torch.float8_e4m3fn)
 v_fp8, v_dsc, cu_v_blk   = quantize_for_block_scale_v_along_n(v_in, cu, block_size=128, fp8_type=torch.float8_e4m3fn)
-v_fp8 = v_fp8.permute(2, 1, 0).contiguous().permute(2, 1, 0)  # col-major: token dim stride-1
 sf_q = pack_descale_to_e8m0x4_int32(q_dsc)
 sf_k = pack_descale_to_e8m0x4_int32(k_dsc)
 sf_v = pack_descale_to_e8m0x4_int32(v_dsc).repeat_interleave(128, dim=1)
