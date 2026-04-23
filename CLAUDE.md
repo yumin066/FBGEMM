@@ -102,8 +102,65 @@
 | **16** | Q+SFA preload 移到 mbarrier wait 前，隐藏 LDSM latency，减少 No Eligible stall | ✅ | causal +1~3%，全验证通过（2026-04-23）|
 | **17** | 同步点精简：删 S3、S2→wait_mbar_parity、q_tma_mbar 迁 math warp、S5→bar.sync 1,256 | ✅ | bs=1 causal +6.7%，全验证通过（2026-04-23）|
 | **18** | cvt.e4m3x2 双路 FP8 转换：F2FP 指令数 64→32，打包链 IMAD+LOP3+PRMT+IADD→mov.b32 | ✅ | FP8 全面 +1-4%（2026-04-23）|
+| **19** | TMA Store Output：epilogue SMEM→GMEM 改为 thread 0 单线程 TMA bulk store，255 线程提前退出 | ✅ | bs=8 causal +0.95%，全验证通过（2026-04-23）|
 
-详细历史记录见 `HISTORY.md`。最新基线性能（Phase 18，benchmark 054）：seq=4096 causal，FP8 **1113.0 TFLOPS** vs BF16 644.2 TFLOPS（**+72.8%**）；seq=4096 full：FP8 **630.8 TFLOPS** vs BF16 362.5 TFLOPS（**+74.0%**）。
+详细历史记录见 `HISTORY.md`。最新基线性能（Phase 19，benchmark 055）：seq=4096 causal，FP8 **1123.6 TFLOPS** vs BF16 644.7 TFLOPS（**+74.3%**）；seq=4096 full：FP8 **629.7 TFLOPS** vs BF16 362.3 TFLOPS（**+73.8%**）。
+
+---
+
+## Phase 19 COMPLETE：TMA Store Output（2026-04-23）
+
+### 优化目标
+
+将 epilogue SMEM→GMEM 拷贝从 256 线程 LDS.128+STG.E.128 改为 thread 0 单线程 TMA async bulk store，其余 255 个 math thread 在 bar.sync 1,256 后提前退出。
+
+### 核心变更
+
+**host side**（`hstu_fwd_kernel.h`）：
+- `Hstu_fwd_params_fp8_ws_tma` 新增 `TMA_O_t tma_o` 字段（第 7 个模板参数）
+- `run_hstu_fwd_sm120_fp8_ws_tma_impl` 创建 TMA O descriptor：
+  - GMEM tensor dim ordering：`(total_q, d, h)`，与 Q/K/V 保持一致（d 为 innermost，stride=1）
+  - `make_tma_copy(SM90_TMA_STORE{}, tensor_O_full, SmemLayoutO_TMA_t{}, tile_shape, _1{})`
+
+**device side**（`hstu_fwd_kernel_fp8_ws.h`）：
+- S5 改为 `bar.sync 1, 256`（math warp only）
+- OOB 清零：partial tile（varlen 最后一块）256 线程协作将 SMEM 越界行清零，再做第二个 `bar.sync 1, 256`
+- `if (tidx_math != 0) return` — 255 线程提前退出
+- thread 0：`fence.proxy.async.shared::cta` → `UTMASTG.3D`（TMA store）→ `UTMACMDFLUSH`（arrive）→ `DEPBAR.LE SB0, 0x0`（wait）→ EXIT
+
+**关键 bug（已修正）**：TMA descriptor 必须用 `(total_q, d, h)` dim ordering（d stride=1 为 innermost）。若用 `(total_q, h, d)` 则 tile 的第二维 boxDim[1]=kHeadDim=128 > globalDim[1]=h=1，descriptor 初始化失败报 "Failed to initialize the TMA descriptor 1"。
+
+### SASS 验证
+
+SASS（`4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full.sass` offset 0x79e0）确认生成正确 TMA 指令序列：
+```
+UTMASTG.3D [UR8], [UR4]   ← TMA bulk store
+UTMACMDFLUSH               ← tma_store_arrive (commit group)
+DEPBAR.LE SB0, 0x0         ← tma_store_wait<0> (wait all groups)
+EXIT
+```
+
+### SMEM 安全性
+
+`tma_store_wait<0>()` 阻塞 thread 0 直到 TMA 完成数据提交。thread 0 是 CTA 最后存活线程，CTA 的 SMEM 仅在所有线程 EXIT 后才归还 SM，故 SMEM 不会被提前释放。
+
+### 验证结果
+
+- [x] sweep_accuracy.py：全部 fp8_gt_cos ≥ 0.9996（日志 `1test_results/088_phase19_tma_store.log`）
+- [x] run_hstu8_examples.sh：14/14 PASS
+- [x] benchmark 055：bs=8 seq=4096 causal **1123.6 TFLOPS**（+0.95% vs Phase 18）
+
+**性能结果（benchmark 055，RTX PRO 6000 Blackwell SM120）**：
+
+| Config | BF16 TFLOPS | FP8 TFLOPS | FP8 vs BF16 | vs Phase 18 |
+|--------|-------------|------------|-------------|-------------|
+| bs=8 seq=4096 h=16 causal | 644.7 | **1123.6** | **+74.3%** | **+0.95%** |
+| bs=4 seq=4096 h=16 causal | 619.9 | **1068.2** | **+72.3%** | **+0.83%** |
+| bs=1 seq=4096 h=16 causal | 493.6 | **872.6** | **+76.8%** | +0.06% |
+| bs=8 seq=4096 h=16 full | 362.3 | **629.7** | **+73.8%** | -0.2% |
+| bs=8 seq=2048 h=16 full | 340.6 | **612.1** | **+79.7%** | +0.2% |
+
+收益主要来自大 batch causal（epilogue 占比较高）；full 和小 seq 受 Block Limit SMEM=1 限制（1 CTA/SM，255 线程提前退出无法帮助调度其他 CTA）基本持平。
 
 ---
 

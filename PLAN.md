@@ -51,18 +51,46 @@ for (int flat = 0; flat < kAccSElems; flat += 4) {
 
 ---
 
-## Phase 19 候选方向
+## Phase 19 COMPLETE：TMA Store Output（2026-04-23）
+
+将 epilogue SMEM→GMEM 拷贝从 256 线程 LDS.128+STG.E.128 改为单线程 TMA async bulk store，255 个 math thread 提前退出。
+
+**核心变更**：
+- **host side**：`Hstu_fwd_params_fp8_ws_tma` 加 `TMA_O_t tma_o` 字段；`run_hstu_fwd_sm120_fp8_ws_tma_impl` 创建 `make_tma_copy(SM90_TMA_STORE{}, tensor_O_full, SmemLayoutO_TMA_t{}, ...)` descriptor
+- **device side**：S5 bar.sync 后，partial tile 清零 OOB 行（全 256 线程合作 + bar.sync），然后 `if (tidx_math != 0) return;`，thread 0 执行 `fence.proxy.async.shared::cta` + TMA store + `tma_store_arrive` + `tma_store_wait<0>()`
+- **关键 bug（已修正）**：TMA descriptor 必须用 `(total_q, d, h)` dim ordering（d 有 stride 1 为 innermost），与 Q/K/V 保持一致；用 `(total_q, h, d)` 会导致 boxDim 超过 globalDim h=1，descriptor 初始化失败
+
+**验证**：
+- [x] sweep_accuracy.py：全部 fp8_gt_cos ≥ 0.9996（`1test_results/088_phase19_tma_store.log`）
+- [x] run_hstu8_examples.sh：14/14 PASS
+- [x] benchmark 055：bs=8 seq=4096 causal **1123.6 TFLOPS**（+0.95% vs Phase 18）
+
+**性能结果（benchmark 055，RTX PRO 6000 Blackwell SM120）**：
+
+| Config | BF16 TFLOPS | FP8 TFLOPS | FP8 vs BF16 | vs Phase 18 |
+|--------|-------------|------------|-------------|-------------|
+| bs=8 seq=4096 h=16 causal | 644.7 | **1123.6** | **+74.3%** | **+0.95%** |
+| bs=4 seq=4096 h=16 causal | 619.9 | **1068.2** | **+72.3%** | **+0.83%** |
+| bs=1 seq=4096 h=16 causal | 493.6 | **872.6** | **+76.8%** | +0.06% |
+| bs=8 seq=4096 h=16 full | 362.3 | **629.7** | **+73.8%** | -0.2% |
+| bs=8 seq=2048 h=16 full | 340.6 | **612.1** | **+79.7%** | +0.2% |
+
+收益主要来自大 batch causal 配置（epilogue 占比较高），full 和小 seq 基本持平。受 Block Limit SMEM=1（1 CTA/SM）限制，提前释放 warp 无法帮助调度其他 CTA。
+
+---
+
+## Phase 20 候选方向
 
 当前主瓶颈：**No Eligible stall ~60%**，根本原因是 math warp 等 K/V TMA（mbarrier wait）期间调度器无可发射指令。单 CTA 内已无进一步可隐藏的空间，下一步需从结构层面突破。
 
 | 方向 | 思路 | 预期收益 | 难度 |
 |------|------|---------|------|
 | **kBlockN 128→256** | 更大 tile，算术密度提升，TMA 占比下降；需重新计算 SMEM（V tile 256×128=32KB FP8，需检查 85KB 预算） | +10-20% | 中 |
-| **SMEM 降至 64KB** | 解除 Block Limit SMEM=1（1 CTA/SM），occupancy 翻倍，No Eligible 分摊到更多 warp | 理论显著，实测依赖具体布局 | 高 |
+| **SMEM 降至 50KB** | 解除 Block Limit SMEM=1（1 CTA/SM），occupancy 翻倍，No Eligible 分摊到更多 warp（SM120 每 SM 100KB，需降至 50KB 才能 2 CTA/SM） | 理论显著，实测依赖具体布局 | 高 |
 | **Persistent kernel / 双 CTA wave** | 2 个 CTA 交替发 TMA，互相隐藏 wait | +10-30%（若 2 CTA/SM 可行） | 高 |
-| **BF16 kernel 同类优化** | 将 Phase 13-18 的 FP8 WS 优化移植到 BF16 路径 | +5-15% | 中 |
+| **BF16 kernel 同类优化** | 将 Phase 13-19 的 FP8 WS 优化移植到 BF16 路径 | +5-15% | 中 |
 
-**推荐下一步**：评估 kBlockN=256 的 SMEM 可行性（85KB 预算分析），或先做 NCU profile 055 确认 Phase 18 后的新瓶颈分布。
+**推荐下一步**：评估 kBlockN=256 的 SMEM 可行性（85KB 预算分析），或先做 NCU profile 056 确认 Phase 19 后的新瓶颈分布。
 
 ---
 

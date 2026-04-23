@@ -1200,27 +1200,44 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
 
     asm volatile("bar.sync 1, 256;\n" : : : "memory");  // S5: all 256 math threads see sO_flat writes.
 
-    // Copy sO to GMEM.
-    Tensor mO = make_tensor(
-        make_gmem_ptr(reinterpret_cast<OutElement*>(params.o_ptr) + binfo.q_offset(params.o_row_stride)),
-        make_shape(actual_seqlen_q, params.h, params.d),
-        make_stride(params.o_row_stride, params.o_head_stride, _1{}));
-    Tensor gO_bs = local_tile(mO(_, bidh, _),
-        Shape<Int<kBlockM>, Int<kHeadDim>>{}, make_coord(m_block, 0));
-    typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
-    auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx_math);
-    Tensor tOsO = gmem_thr_copy_O.partition_S(sO_flat);
-    Tensor tOgO = gmem_thr_copy_O.partition_D(gO_bs);
-    Tensor tOrO = make_tensor<OutElement>(shape(tOgO));
-    cute::copy(gmem_tiled_copy_O, tOsO, tOrO);
-    Tensor cO_bs = make_identity_tensor(make_shape(size<0>(sO_flat), size<1>(sO_flat)));
-    Tensor tOcO = gmem_thr_copy_O.partition_D(cO_bs);
-    for (int m = 0; m < size<1>(tOgO); m++) {
-      if (get<0>(tOcO(0,m,0)) >= actual_seqlen_q - m_block * kBlockM)
-        cute::clear(tOrO(_,m,_));
+    // For partial tiles (last tile of a varlen sequence): zero SMEM rows [valid_rows, kBlockM)
+    // so TMA bulk store does not write garbage to GMEM beyond actual_seqlen_q.
+    const int valid_rows = actual_seqlen_q - m_block * kBlockM;
+    if (valid_rows < kBlockM) {
+      const int oob_elems = (kBlockM - valid_rows) * kHeadDim;
+      OutElement* sO_raw = reinterpret_cast<OutElement*>(smem_q) + valid_rows * kHeadDim;
+      for (int i = tidx_math; i < oob_elems; i += kNMathThreads)
+        sO_raw[i] = OutElement(0);
+      asm volatile("bar.sync 1, 256;\n" : : : "memory");  // OOB zeros visible before TMA.
     }
-    flash::copy<false,false,false>(gmem_tiled_copy_O, tOrO, tOgO, tOcO,
-        actual_seqlen_q_padded - m_block * kBlockM);
+
+    // Threads 1-255 (7 math warps) exit early — TMA does not require their participation.
+    if (tidx_math != 0) { return; }
+
+    // Thread 0: issue TMA async bulk store (sO_flat → GMEM O tile) and wait for completion.
+    // fence.proxy.async.shared::cta: make all SMEM writes (STSM outputs + OOB zeros)
+    // visible to the TMA proxy before the store is issued.
+    asm volatile("fence.proxy.async.shared::cta;\n" : : : "memory");
+    {
+      using SmemLayoutO_TMA_t = cute::Layout<
+          cute::Shape<cute::Int<kBlockM>, cute::Int<kHeadDim>>,
+          cute::Stride<cute::Int<kHeadDim>, cute::_1>>;
+      Tensor sO_tma = make_tensor(
+          make_smem_ptr(reinterpret_cast<OutElement*>(smem_q)),
+          SmemLayoutO_TMA_t{});
+      // mO_tma: full output tensor [total_q, d, h] — matches descriptor dim ordering.
+      // Slice off the head dimension (dim 2) at bidh to get a (total_q, d) per-head view.
+      auto mO_tma   = params.tma_o.get_tma_tensor(make_shape(params.total_q, params.d, params.h));
+      auto gO_head  = mO_tma(_, _, bidh);
+      auto gO_tiles = local_tile(gO_head, Shape<Int<kBlockM>, Int<kHeadDim>>{}, make_coord(_, _));
+      const int m_abs = binfo.sum_s_q / kBlockM + m_block;
+      auto tma_slice_O = params.tma_o.get_slice(0);
+      Tensor tOsO     = tma_slice_O.partition_S(sO_tma);                   // SMEM source
+      Tensor tOgO_all = tma_slice_O.partition_D(gO_tiles(_, _, _, Int<0>{}));  // GMEM dest tiles
+      cute::copy(params.tma_o, tOsO, tOgO_all(_, _, _, m_abs));
+      cute::tma_store_arrive();
+      cute::tma_store_wait<0>();
+    }
   }
 }
 
@@ -1229,11 +1246,11 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
 // Phase 6 WS TMA kernel entry: launched with kNThreadsTotal=288.
 // Q, K, V^T, Q-SF, K-SF, and V-SF all via TMA.
 template <typename Kernel_traits, typename TMA_Q_t, typename TMA_K_t, typename TMA_Vt_t,
-          typename TMA_SFA_t, typename TMA_SFB_t, typename TMA_SFV_t>
+          typename TMA_SFA_t, typename TMA_SFB_t, typename TMA_SFV_t, typename TMA_O_t>
 __global__ void __launch_bounds__(Kernel_traits::kNThreads, 1)
 hstu_fwd_kernel_sm120_fp8_ws_tma(
     __grid_constant__ Hstu_fwd_params_fp8_ws_tma<TMA_Q_t, TMA_K_t, TMA_Vt_t,
-                                                  TMA_SFA_t, TMA_SFB_t, TMA_SFV_t> const params) {
+                                                  TMA_SFA_t, TMA_SFB_t, TMA_SFV_t, TMA_O_t> const params) {
   int m_block = gridDim.x - blockIdx.x - 1;
   int bidh    = blockIdx.y;
   int bidb    = blockIdx.z;
