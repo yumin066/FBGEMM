@@ -1144,11 +1144,51 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         make_smem_ptr(reinterpret_cast<OutElement*>(smem_q)),
         Layout<Shape<Int<kBlockM>, Int<kHeadDim>>, Stride<Int<kHeadDim>, _1>>{});
     {
-      // partition_C(sO_flat) directly maps the C-fragment to SMEM positions via the
-      // TiledMMA layout, bypassing manual coordinate extraction (select<1,2,0,3>)
-      // which was designed for <_2,_4,_1> and only covers 16/64 elements under <_8,_1,_1>.
-      Tensor tOsO = thr_mma_g2.partition_C(sO_flat);
-      for (int i = 0; i < size(rO); ++i) tOsO(i) = rO(i);
+      // stmatrix.sync.aligned.x4.m8n8.shared.b16: 8 warp-cooperative stores replace 32 STS.32.
+      //
+      // Layout invariants this asm relies on:
+      //   AtomLayout <_8,_1,_1>  → 8 math warps all in M direction, warp covers rows [warp_m*16, warp_m*16+15]
+      //   PermMmaTileN <_8,_4,_4>:<_1,_32,_8>  → N_sorted[j] = 32*(j%4) + 8*(j/4) for j=0..15
+      //   C-atom SM80_16x8_Row  → rO_u32[2*j + m_grp] covers (M=warp_m*16+m_grp*8+lq, N=N_sorted[j]+lqt*2)
+      //   OutElement is 2-byte (BF16); sO_flat row-stride = kHeadDim * sizeof(OutElement) = 256 bytes.
+      static_assert(sizeof(OutElement) == 2, "stmatrix.m8n8.b16 requires 2-byte elements");
+
+      auto rO_u32 = recast<uint32_t>(rO);
+
+      const int lane        = tidx_math & 31;
+      const int lq          = lane >> 2;   // lane-quad (0..7): selects data row within 8×8 matrix
+      const int lqt         = lane & 3;    // lane-quad-thread (0..3): selects data col-group
+      const int warp_m      = tidx_math >> 5;  // M-warp index (0..7)
+      const int addr_row    = ((lq & 1) << 2) | lqt;  // STSM address-row within matrix (0..7)
+      const int mat_in_lane = lq >> 1;                 // which of 4 matrices this thread addresses
+
+      const uint32_t smem_base  = static_cast<uint32_t>(__cvta_generic_to_shared(smem_q));
+      constexpr uint32_t row_bytes = kHeadDim * (uint32_t)sizeof(OutElement);  // 256
+
+      CUTE_UNROLL
+      for (int m_grp = 0; m_grp < 2; ++m_grp) {
+        const uint32_t m_bytes = (uint32_t)(warp_m * 16 + m_grp * 8 + addr_row) * row_bytes;
+
+        CUTE_UNROLL
+        for (int n_grp = 0; n_grp < 4; ++n_grp) {
+          // This thread addresses row addr_row of matrix mat_in_lane,
+          // starting at N-column (n_grp*32 + mat_in_lane*8).
+          uint32_t stsm_addr = smem_base
+              + m_bytes
+              + (uint32_t)(n_grp * 32 + mat_in_lane * 8) * (uint32_t)sizeof(OutElement);
+
+          // Data: rb_k carries the uint32 whose N_sorted position is n_grp*32 + k*8.
+          // N_sorted[n_grp + k*4] = 32*(n_grp+k*4)%4 + 8*(n_grp+k*4)/4 = 32*n_grp + 8*k ✓
+          uint32_t rb0 = rO_u32[2 * (n_grp     ) + m_grp];
+          uint32_t rb1 = rO_u32[2 * (n_grp +  4) + m_grp];
+          uint32_t rb2 = rO_u32[2 * (n_grp +  8) + m_grp];
+          uint32_t rb3 = rO_u32[2 * (n_grp + 12) + m_grp];
+
+          asm volatile(
+              "stmatrix.sync.aligned.x4.m8n8.shared.b16 [%0], {%1, %2, %3, %4};\n"
+              : : "r"(stsm_addr), "r"(rb0), "r"(rb1), "r"(rb2), "r"(rb3) : "memory");
+        }
+      }
     }
 
     asm volatile("bar.sync 1, 256;\n" : : : "memory");  // S5: all 256 math threads see sO_flat writes.
