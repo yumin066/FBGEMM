@@ -853,6 +853,34 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       const bool is_masking = masking_step < n_masking_steps ||
           (nb + 1) * kBlockN > actual_seqlen_h;
 
+      // Phase 16: preload stage-invariant GEMM1 inputs before the K/V TMA wait.
+      // smem_sfb_cur/sK_cur/sVt_cur are pure pointer arithmetic (no TMA data read).
+      // SFA (Q scale) and Q live in persistent SMEM filled by the preamble — both are
+      // independent of the per-tile K/V TMA, so their LDSM latency is fully hidden
+      // under the ~100-200 cycle mbarrier spin below.  Verified safe: smem_sfa_ptr and
+      // sQ_persist_pi are always valid from S2 onwards.
+      int32_t* smem_sfb_cur = smem_sfa_ptr + 2 * kBlockM + math_stage * kBlockN;
+      FP8Elem* sK_cur  = reinterpret_cast<FP8Elem*>(smem_q) + math_stage * 2 * kSmemKVElems;
+      FP8Elem* sVt_cur = reinterpret_cast<FP8Elem*>(smem_q) + kSmemKVElems + math_stage * 2 * kSmemKVElems;
+
+      Tensor tCrSFA = BS1::partition_fragment_SFA(sSFA(_,_,_0{}), thr_mma_g1);
+      {
+        // load_a_z_pattern: m_row0 = warp_m*16 + (lane>>2), m_row1 = m_row0+8.
+        // SFA must match AtomLayoutSFA_TV: T_contrib = 8*(lane&1) + (lane>>2).
+        // smem_sfa_ptr is linear: smem_sfa_ptr[m_row] = packed int32 for M-row m_row.
+        const int warp_m  = tidx_math / 32;
+        const int lane    = tidx_math & 31;
+        const int sfa_row = warp_m * 16 + 8 * (lane & 1) + (lane >> 2);
+        tCrSFA(0, 0, 0)  = smem_sfa_ptr[sfa_row];
+      }
+      auto tCrSFA_frg = BS1::transform_fragment_for_qmma(tCrSFA);
+
+      // Q preload: issued before the mbarrier wait so its LDSM latency overlaps with
+      // the K TMA spin.  tCrQ stays live across the wait (16 extra regs, within the
+      // 56-reg headroom under setmaxnreg=224 / current peak 168).
+      Tensor tCrQ = thr_mma_g1.partition_fragment_A(sQ_persist_pi);
+      load_a_z_pattern(sQ_persist_pi, tCrQ, 0, kHeadDim / 32);
+
       // Wait for TMA K[nb]+Vt[nb]+SFB[nb]+SFV[nb] to land.
       {
         const int cur_parity = math_stage ? tma_parity1 : tma_parity0;
@@ -870,12 +898,8 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       // reuse by the load warp.  Compiler barrier suffices.
       asm volatile("" ::: "memory");
 
-      int32_t* smem_sfb_cur = smem_sfa_ptr + 2 * kBlockM + math_stage * kBlockN;
       Tensor sSFB_ = make_tensor(make_smem_ptr(smem_sfb_cur), SmemLayoutSFB{});
       auto sSFB = as_position_independent_swizzle_tensor(sSFB_);
-
-      FP8Elem* sK_cur  = reinterpret_cast<FP8Elem*>(smem_q) + math_stage * 2 * kSmemKVElems;
-      FP8Elem* sVt_cur = reinterpret_cast<FP8Elem*>(smem_q) + kSmemKVElems + math_stage * 2 * kSmemKVElems;
 
       // GEMM1: acc_s += Q × K^T (block-scaled QMMA).
       // Full-K=128 copy: make_tiled_copy_A/B expects the full TiledMMA tile;
@@ -885,18 +909,6 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
 
       auto sK_cur_pi = as_position_independent_swizzle_tensor(
           make_tensor(make_smem_ptr(sK_cur), SmemLayoutK_SW128{}));
-
-      Tensor tCrSFA = BS1::partition_fragment_SFA(sSFA(_,_,_0{}), thr_mma_g1);
-      {
-        // load_a_z_pattern: m_row0 = warp_m*16 + (lane>>2), m_row1 = m_row0+8.
-        // SFA must match AtomLayoutSFA_TV: T_contrib = 8*(lane&1) + (lane>>2).
-        // smem_sfa_ptr is linear: smem_sfa_ptr[m_row] = packed int32 for M-row m_row.
-        const int warp_m  = tidx_math / 32;
-        const int lane    = tidx_math & 31;
-        const int sfa_row = warp_m * 16 + 8 * (lane & 1) + (lane >> 2);
-        tCrSFA(0, 0, 0)  = smem_sfa_ptr[sfa_row];
-      }
-      auto tCrSFA_frg = BS1::transform_fragment_for_qmma(tCrSFA);
 
       Tensor tCrSFB = BS1::partition_fragment_SFB(sSFB(_,_,_0{}), thr_mma_g1);
       {
@@ -917,11 +929,8 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       auto tCrSFB_frg = BS1::transform_fragment_for_qmma(tCrSFB);
 
       // GEMM1: acc_s += Q × K^T (block-scaled QMMA).
-      // load_b_z_pattern replaces make_tiled_copy_B (ldmatrix.x4) which is incompatible
-      // with AtomLayout <_8,_1,_1> ThrN=1. Direct uint32 reads bypass ldmatrix entirely.
-      // linear_idx = reg + 2*nr + 32*kb matches SM120 BLayout under <_8,_1,_1>.
-      Tensor tCrQ = thr_mma_g1.partition_fragment_A(sQ_persist_pi);
-      load_a_z_pattern(sQ_persist_pi, tCrQ, 0, kHeadDim / 32);
+      // tCrQ was preloaded before the mbarrier wait above; its LDSM latency is now
+      // hidden under the K TMA spin.  K is loaded here (after wait) from TMA data.
       Tensor tCrK = thr_mma_g1.partition_fragment_B(sK_cur_pi);
       load_b_z_pattern(sK_cur_pi, tCrK, 0, kHeadDim / 32);
       cute::gemm(tiled_mma_g1,

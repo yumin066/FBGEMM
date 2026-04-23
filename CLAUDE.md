@@ -99,8 +99,107 @@
 | 13 | AtomLayout `<_8,_1,_1>` + 消除 P staging（warp shuffle） | ✅ | seq≥1024 全面 +10~30%（2026-04-22）|
 | **14** | setmaxnreg 224/56 + 消除全部 LDL/STL reg spill（math+load warp 零 spill） | ✅ | FP8 突破 1 TFLOPS（2026-04-22）|
 | **15** | Q+SFA TMA 迁移到 math warp，直接打到 sQ_persist，删除 load warp Q copy + bar.sync | ✅ | FP8/BF16 比值 1.633（2026-04-22）|
+| **16** | Q+SFA preload 移到 mbarrier wait 前，隐藏 LDSM latency，减少 No Eligible stall | ✅ | causal +1~3%，全验证通过（2026-04-23）|
 
-详细历史记录见 `HISTORY.md`。最新基线性能（Phase 14，benchmark 047，锁频 2407 MHz）：seq=4096 causal，FP8 **1068.7 TFLOPS** vs BF16 661.2 TFLOPS（**+61.6%**）；seq=4096 full：FP8 **619.2 TFLOPS** vs BF16 366.7 TFLOPS（**+68.9%**）。Phase 15（benchmark 049，未锁频）：FP8/BF16 比值 1.633，无退化。
+详细历史记录见 `HISTORY.md`。最新基线性能（Phase 16，benchmark 052，锁频 2407MHz）：seq=4096 causal，FP8 **1077.7 TFLOPS** vs BF16 646.1 TFLOPS（**+66.8%**）；seq=4096 full：FP8 **611.8 TFLOPS** vs BF16 362.1 TFLOPS（**+69.0%**）。
+
+---
+
+## Phase 16 COMPLETE：Q+SFA preload 移到 mbarrier wait 前（2026-04-23）
+
+### 优化目标
+
+**NCU Profile 050（Phase 15 基线）关键发现**：
+
+| 指标 | 数值 | 说明 |
+|------|------|------|
+| SM Busy | 61.49% | SM 整体利用率 |
+| No Eligible stall | **59.85%** | 主要瓶颈：调度器无可发射 warp |
+| Registers/Thread | 168 | 静态 max = 224，有余量 |
+| SMEM 占用 | 85 KB / CTA | Block Limit SMEM = 1（绑定） |
+| SMEM Bank Conflicts | 7.9-way（epilogue）| **实际贡献 ~0.44%**，可忽略 |
+
+**No Eligible 59.85% 根本原因**：math warp 在主循环每次迭代中，必须等 K/V TMA 数据就绪（`mbarrier.test_wait` 自旋），这段时间 12 个 math warp 全部阻塞，调度器无可发射指令，直接体现为 "No Eligible" stall。
+
+**优化方案**：将以下与 TMA 无关、仅依赖 `sQ_persist` 和 `smem_sfa_ptr` 的计算移到 mbarrier wait 前：
+- 指针计算：`smem_sfb_cur`、`sK_cur`、`sVt_cur`（纯算术，无内存依赖）
+- SFA 加载：`tCrSFA` 从 `smem_sfa_ptr[sfa_row]`（sQ persist 缓冲区，主循环前已就绪）
+- Q 预加载：`load_a_z_pattern(sQ_persist_pi, tCrQ, ...)` （`sQ_persist` 主循环前已就绪）
+
+**预期收益**：Q LDSM 延迟（~80 cycles，16 regs × ~5 cycle/reg SMEM load）隐藏在 K TMA 等待时间（~100-200 cycles）中，减少 No Eligible stall 约 40-80 cycles/iteration。
+
+### 代码变更
+
+**文件**：`hstu_fwd_kernel_fp8_ws.h`，主循环 mbarrier wait 区域
+
+**变更前**（原始结构）：
+```cpp
+// Wait for TMA K/V/SFB/SFV
+{ mbarrier.test_wait spin loop }
+if (math_stage) { tma_parity1 ^= 1; } else { tma_parity0 ^= 1; }
+asm volatile("" ::: "memory");
+// 所有指针计算 + SFA + Q 加载在 wait 之后
+int32_t* smem_sfb_cur = smem_sfa_ptr + 2*kBlockM + math_stage*kBlockN;
+FP8Elem* sK_cur = ...; FP8Elem* sVt_cur = ...;
+Tensor tCrSFA = ...; tCrSFA(0,0,0) = smem_sfa_ptr[sfa_row];
+Tensor tCrQ = ...; load_a_z_pattern(sQ_persist_pi, tCrQ, 0, kHeadDim/32);
+// GEMM1...
+```
+
+**变更后**（Phase 16）：
+```cpp
+// Phase 16: 指针计算 + SFA + Q 预加载 — 在 mbarrier wait 前发射 LDSM
+int32_t* smem_sfb_cur = smem_sfa_ptr + 2*kBlockM + math_stage*kBlockN;
+FP8Elem* sK_cur = ...; FP8Elem* sVt_cur = ...;
+Tensor tCrSFA = ...; tCrSFA(0,0,0) = smem_sfa_ptr[sfa_row];
+Tensor tCrQ = ...; load_a_z_pattern(sQ_persist_pi, tCrQ, 0, kHeadDim/32);
+// Wait for TMA K/V/SFB/SFV（Q LDSM latency 在此期间隐藏）
+{ mbarrier.test_wait spin loop }
+if (math_stage) { tma_parity1 ^= 1; } else { tma_parity0 ^= 1; }
+asm volatile("" ::: "memory");
+// SFB + K 加载（依赖 TMA 数据，必须在 wait 后）
+Tensor tCrSFB = ...; auto tCrSFB_frg = ...;
+Tensor tCrK = ...; load_b_z_pattern(sK_cur_pi, tCrK, 0, kHeadDim/32);
+// GEMM1...
+```
+
+### 寄存器压力分析
+
+| 阶段 | 新增寄存器 | 峰值 | 余量（vs 224） |
+|------|-----------|------|--------------|
+| Wait 前预加载 Q（16 regs） + SFA（1 reg） | +17 | 168+17=185 | 39 |
+| Wait 后与原有变量重叠 | 0 | 185 | 39 |
+
+寄存器不超 224，无 spill 风险。
+
+### 预期效果
+
+| 指标 | Phase 15 基线 | Phase 16 目标 |
+|------|-------------|-------------|
+| No Eligible stall | 59.85% | < 45%（隐藏约 40-80 cycles/iter） |
+| FP8 TFLOPS（seq=4096 causal）| ~1060 | 预计 +3-8% |
+| FP8 TFLOPS（seq=4096 full）| ~620 | 预计 +3-8% |
+| LDL/STL（SASS）| 0 | 保持 0 |
+
+### 验证结果
+
+- [x] 代码已修改、编译通过
+- [x] sweep_accuracy.py：全部 fp8_gt_cos ≥ 0.9996（`1test_results/086_phase16_q_preload.log`）
+- [x] run_hstu8_examples.sh：14/14 PASS
+- [x] benchmark 052（锁频 2407MHz）：见下表
+
+**性能结果（benchmark 052，锁频 2407MHz，RTX PRO 6000 Blackwell SM120）**：
+
+| Config | BF16 TFLOPS | FP8 TFLOPS | FP8 vs BF16 |
+|--------|-------------|------------|-------------|
+| bs=8 seq=4096 h=16 causal | 646 | **1077.7** | **+66.8%** |
+| bs=4 seq=4096 h=16 causal | 620 | **1028.4** | **+65.9%** |
+| bs=1 seq=4096 h=16 causal | 471 | **808.0** | **+71.7%** |
+| bs=8 seq=4096 h=16 full | 362 | **611.8** | **+69.0%** |
+| bs=8 seq=2048 h=16 full | 334 | **579.1** | **+73.5%** |
+
+vs Phase 15（048，无锁频）：causal 配置 FP8/BF16 比值 +1~3pp；full 配置基本持平。  
+实际收益低于预期（3-8%）：ptxas 可能已做部分指令前移，或实际 TMA wait 窗口不足以完全隐藏 Q LDSM 延迟。
 
 ---
 

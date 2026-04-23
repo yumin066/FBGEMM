@@ -1,157 +1,242 @@
-# Phase 13 调试计划：AtomLayout `<_8,_1,_1>` 精度修复
+# Phase 16 实现计划：Q+SFA Preload 隐藏 mbarrier Wait Latency
 
-> 最后更新：2026-04-20（换机器前存档）
-
----
-
-## 当前状态
-
-**Branch**: sm120  
-**cos_sim**: ~0.97（目标 ≥ 0.995）  
-**编译状态**: 通过  
-**上一次有效 log**: `1test_results/091_phase13_revert_load_patterns.log`
-
-### 本次会话做了什么
-
-1. 实施并验证了 Codex 建议的 `load_a_z_pattern` / `load_b_z_pattern` 字节级 gather "修复"
-2. 结果 cos_sim 从 0.97 跌至 0.054 → 证明 Codex 分析错误
-3. 回滚到 K-major 格式（uint32 连续 K 字节加载），cos_sim 恢复 0.97
-4. 重编译成功，`091_...log` 确认状态
+> 最后更新：2026-04-23
 
 ---
 
-## 已确认正确的部分
+## 背景与问题
 
-| 组件 | 状态 | 根据 |
-|------|------|------|
-| `load_a_z_pattern` K-major 公式 | ✅ | cos_sim=0.97 vs 0.054（M-major/字节 gather） |
-| `load_b_z_pattern` K-major + PermMmaTileN 顺序 | ✅ | N_base=(nr%4)*32+(nr/4)*8 正确 |
-| SFB N_base 公式 | ✅ | 与 load_b_z_pattern 对称，两者一致 |
-| P staging 写入（thr_mma_g1.partition_C 直接映射） | ✅ | [DBG][SPBUF]=[DBG][TCRP] 一致 |
-| PermMmaTileN 推导 | ✅ | 数学验证：nr=0→N=0, nr=1→N=32, nr=4→N=8... |
+### NCU Profile 050（Phase 15 基线）瓶颈分析
+
+```
+SM Busy:          61.49%
+No Eligible:      59.85%   ← 主要瓶颈
+Math Throttle:    13.4%
+Long Scoreboard:   3.1%
+Registers/Thread: 168（static max = 224）
+SMEM:             85 KB / CTA
+Occupancy:        25%（Block Limit SMEM = 1，binding）
+```
+
+**No Eligible 59.85% 的根本原因**：
+
+math warp 主循环每次迭代开头必须等待 K/V TMA 数据落入 SMEM（`mbarrier.test_wait` 自旋）。在此等待期间，所有 12 个 math warp 同时阻塞，调度器无任何可发射指令 → "No Eligible" 计数飙升。
+
+典型 K TMA 延迟估算（seq=4096，kBlockN=128）：
+- K tile 大小：128×128 bytes = 16 KB FP8
+- SM120 TMA 带宽 ≈ ~1 TB/s → 每 K-tile 约 16 ns ≈ 40 cycles（锁频 2407 MHz）
+- 实际 mbarrier wait 含调度 overhead，约 100-200 cycles/iteration
+
+### SMEM Bank Conflict 分析（次要）
+
+NCU 报告 epilogue partition_C scatter-write 7.9-way conflicts，NCU 估计 42.92% 加速。
+**实际贡献重新计算**：
+- 超额 wavefront: ~1.835M
+- 总 SM cycles: ~109M（由 FP8 kernel duration 估算）
+- 实际占比: 1.835M / 109M ≈ **0.44%**
+
+→ NCU 高估了 epilogue 影响（误用了峰值 cycle 而非实际占比）。**本 Phase 不处理 bank conflict**。
 
 ---
 
-## 最可能的 bug（待验证）
+## 优化策略
 
-### Bug 1：SFV 缺少 `n_row_sfv` 偏移（高置信度）
+### 核心思路：LDSM 延迟隐藏
 
-**位置**：`hstu_fwd_kernel_fp8_ws.h` 约 1127-1130 行
+将主循环中与 TMA 无关的操作提前到 mbarrier wait 前发射：
 
-**当前代码（可能错误）**：
-```cpp
-for (int nr = 0; nr < kNAtomsSFV; ++nr) {
-  const int N_base = (nr % 4) * 32 + (nr / 4) * 8;
-  tCrSFV(0, nr, 0) = smem_sfv_ptr[math_stage][N_base];   // ← 缺少 n_row 偏移！
-}
+| 操作 | TMA 依赖？ | 可提前？ | 说明 |
+|------|-----------|---------|------|
+| 指针算术（sfb_cur, sK_cur, sVt_cur）| 否 | ✅ | 纯整数加减 |
+| SFA load（smem_sfa_ptr[sfa_row]）| 否 | ✅ | 主循环前已就绪 |
+| Q LDSM（sQ_persist → tCrQ）| 否 | ✅ | sQ_persist 主循环前已就绪且只读 |
+| SFB load（smem_sfb_cur[...]）| **是** | ❌ | 来自 TMA 写入的 SMEM 区域 |
+| K LDSM（sK_cur → tCrK）| **是** | ❌ | TMA 数据 |
+| V LDSM（sVt_cur → tCrV）| **是** | ❌ | TMA 数据 |
+
+**收益估算**：
+- Q LDSM 延迟：16 regs × ~5 cycles/reg = ~80 cycles
+- K TMA wait：~100-200 cycles
+- 这 80 cycles 完全隐藏于 wait 内 → 无额外 No Eligible stall
+- 理论减少 No Eligible：~80 cycles / 每迭代 → 在 total cycle 占比中减少 ~5-8%
+
+### 寄存器压力
+
+预加载 Q+SFA 在 wait 前需额外持有 17 regs（Q=16, SFA=1）：
+
+```
+Phase 15 baseline peak:  168 regs（主循环内）
+Phase 16 wait 前峰值:    168 + 17 = 185 regs
+静态分配上限（setmaxnreg）: 224 regs
+余量:                    39 regs
 ```
 
-**对比 SFB（正确，有 n_row_sfb）**：
-```cpp
-const int n_row_sfb = (tidx_math & 31) >> 2;
-tCrSFV(0, nr, 0) = smem_sfb_ptr[math_stage][N_base + n_row_sfb];
-```
-
-**分析**：
-- GEMM2 中 B 操作数 = V^T，N-轴 = head-dim（d 方向，0..127）
-- SFBLayout: `T_contrib = 0*(t%4) + 1*(t/4) = t/4 = lane/4`
-- 每个 N-atom 内 8 个线程持有不同 d-位置，各需不同 SFV
-- 应加 `n_row_sfv = lane >> 2`（与 SFB 相同公式）
-
-**修复**：
-```cpp
-const int n_row_sfv = (tidx_math & 31) >> 2;
-for (int nr = 0; nr < kNAtomsSFV; ++nr) {
-  const int N_base = (nr % 4) * 32 + (nr / 4) * 8;
-  tCrSFV(0, nr, 0) = smem_sfv_ptr[math_stage][N_base + n_row_sfv];
-}
-```
-
-**为什么当前 cos_sim 是 0.97 而不是 0.054**：  
-测试数据中 SFV 值基本均匀（诊断输出 `sfv[0][0..3]=0x79797979`），偏差小时错误小。  
-非均匀 scale 会放大误差。
-
-### Bug 2：SFA 公式可能错误（中置信度，待确认）
-
-**位置**：`hstu_fwd_kernel_fp8_ws.h` 约 853-856 行
-
-**当前代码**：
-```cpp
-const int warp_m  = tidx_math / 32;
-const int t0      = tidx_math % 4;
-const int sfa_row = warp_m * 16 + t0 * 2;
-tCrSFA(0, 0, 0)  = smem_sfa_ptr[sfa_row];
-```
-
-**SFALayout 要求**：
-```
-SFALayout: T_contrib = 8*(t%2) + t/4
-→ SFA M-position = 8*(lane%2) + (lane/4)
-→ 正确公式应为: sfa_row = warp_m*16 + 8*(lane&1) + (lane>>2)
-```
-
-**当前公式错误情况**：
-- lane=0: 当前=0, 正确=0 ✓
-- lane=1: 当前=2, 正确=8 ✗
-- lane=2: 当前=4, 正确=0 ✗
-- lane=4: 当前=0, 正确=1 ✗
-
-**注意**：当前测试数据所有 SFA 均为 0x78（均匀），无法从 cos_sim 验证此 bug。  
-可能是次要误差源，或在 SFV bug 修复后通过 all-ones 测试进一步验证。
+**无 spill 风险**。
 
 ---
 
-## 下一步执行顺序
+## 代码变更详情
 
-### Step A：修复 SFV n_row_sfv（先做，影响更大）
+**文件**：`fbgemm_gpu/experimental/hstu/src/hstu_blackwell_sm120/hstu_fwd_kernel_fp8_ws.h`
 
-修改 `hstu_fwd_kernel_fp8_ws.h` 约 1127-1130：
+**主循环 mbarrier wait 区域重构**：
+
 ```cpp
-const int n_row_sfv = (tidx_math & 31) >> 2;
-for (int nr = 0; nr < kNAtomsSFV; ++nr) {
-  const int N_base = (nr % 4) * 32 + (nr / 4) * 8;
-  tCrSFV(0, nr, 0) = smem_sfv_ptr[math_stage][N_base + n_row_sfv];
-}
+// ============================================================
+// Phase 16：将 stage-invariant 指针计算 + SFA + Q 提前到 wait 前
+// ============================================================
+
+// [提前] 指针计算（纯算术，无 TMA 依赖）
+int32_t* smem_sfb_cur = smem_sfa_ptr + 2 * kBlockM + math_stage * kBlockN;
+FP8Elem* sK_cur  = reinterpret_cast<FP8Elem*>(smem_q)
+                   + math_stage * 2 * kSmemKVElems;
+FP8Elem* sVt_cur = reinterpret_cast<FP8Elem*>(smem_q)
+                   + kSmemKVElems + math_stage * 2 * kSmemKVElems;
+
+// [提前] SFA 加载（smem_sfa_ptr 主循环前已就绪，只读）
+Tensor tCrSFA = BS1::partition_fragment_SFA(sSFA(_,_,_0{}), thr_mma_g1);
+tCrSFA(0, 0, 0) = smem_sfa_ptr[sfa_row];
+auto tCrSFA_frg = BS1::transform_fragment_for_qmma(tCrSFA);
+
+// [提前] Q 预加载（sQ_persist 主循环前已就绪，只读）
+// LDSM 发射后，其 ~80-cycle 延迟隐藏于下方的 mbarrier wait 中
+Tensor tCrQ = thr_mma_g1.partition_fragment_A(sQ_persist_pi);
+load_a_z_pattern(sQ_persist_pi, tCrQ, 0, kHeadDim / 32);
+
+// Wait for K/V/SFB/SFV TMA to land（Q LDSM latency 在此期间被隐藏）
+{ /* mbarrier.test_wait spin loop */ }
+if (math_stage) { tma_parity1 ^= 1; } else { tma_parity0 ^= 1; }
+asm volatile("" ::: "memory");
+
+// 以下操作依赖 TMA 数据，必须在 wait 后
+Tensor sSFB_ = make_tensor(make_smem_ptr(smem_sfb_cur), SmemLayoutSFB{});
+auto   sSFB  = as_position_independent_swizzle_tensor(sSFB_);
+Tensor tCrSFB = BS1::partition_fragment_SFB(sSFB, thr_mma_g1);
+{ /* SFB load 循环 */ }
+auto tCrSFB_frg = BS1::transform_fragment_for_qmma(tCrSFB);
+
+Tensor acc_s = partition_fragment_C(tiled_mma_g1, ...);
+clear(acc_s);
+
+auto sK_cur_pi = as_position_independent_swizzle_tensor(...);
+Tensor tCrK = thr_mma_g1.partition_fragment_B(sK_cur_pi);
+load_b_z_pattern(sK_cur_pi, tCrK, 0, kHeadDim / 32);
+
+cute::gemm(tiled_mma_g1, zip(tCrQ, tCrSFA_frg), zip(tCrK, tCrSFB_frg), acc_s);
 ```
 
-编译 → `sweep_accuracy.py` → 看 cos_sim 是否提升。
+**不变量确认**：
+1. `sQ_persist` 在 Phase 15 的 preamble TMA（math warp thread 0 发出）完成后保持只读 → 主循环内提前读取安全
+2. `smem_sfa_ptr` 指向 SMEM preamble 区，主循环内不被覆写 → 提前读取安全
+3. 指针算术中的 `math_stage`（0/1）在本次迭代开头已确定 → 提前计算安全
 
-### Step B：若 Step A 后 cos_sim 仍 < 0.995，修复 SFA 公式
+---
 
-修改 `hstu_fwd_kernel_fp8_ws.h` 约 853-856：
-```cpp
-const int sfa_row = warp_m * 16 + 8*(lane & 1) + (lane >> 2);
-tCrSFA(0, 0, 0)  = smem_sfa_ptr[sfa_row];
+## 实现状态
+
+### 已完成
+
+- [x] **代码修改**：主循环 mbarrier wait 前插入 Q+SFA+指针计算（见代码变更详情）
+- [x] **编译通过**：`HSTU_ARCH_LIST="12.0" pip install --no-build-isolation ...`（无 error/warning）
+
+### 待完成
+
+- [x] **数值验证**：`sweep_accuracy.py` → 全部 fp8_gt_cos ≥ 0.9996（`1test_results/086_phase16_q_preload.log`）
+- [x] **example 验证**：`run_hstu8_examples.sh` → 14/14 PASS
+- [x] **benchmark（未锁频）**：`2benchmark_results/051_phase16_q_preload.log`；FP8/BF16 比值 causal 配置 +2-5pp，无退化
+- [x] **benchmark（锁频 2407MHz）**：`2benchmark_results/052_phase16_q_preload_lgc2407.log`；causal +1~3pp，full 持平
+- [ ] **profile**：ncu 确认 No Eligible stall 下降（可选，已验证正确性）
+
+---
+
+## 验证命令
+
+### 数值验证
+
+```bash
+# 命令1
+mkdir -p /tmp/claude
+
+# 命令2
+cd /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/fbgemm_gpu/experimental/hstu
+
+# 命令3（编译，如需重编）
+PYTHONUSERBASE=/home/scratch.minyu_gpu/project/.cache/pip-user HSTU_ARCH_LIST="12.0" HSTU_DISABLE_BACKWARD=TRUE HSTU_DISABLE_DETERMINISTIC=FALSE HSTU_DISABLE_HDIM32=TRUE HSTU_DISABLE_HDIM64=TRUE HSTU_DISABLE_HDIM256=TRUE MAX_JOBS=32 pip install --no-build-isolation --config-settings editable_mode=compat -e . 2>&1 | grep -E "error:|note:|static_assert" | head -60
 ```
 
-### Step C：若上述修复后 cos_sim ≥ 0.995，运行完整验证
+```bash
+HSTU_SWEEP_FP8_QUANT_MODE=2 python /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/sweep_accuracy.py 2>&1 | tee /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/1test_results/086_phase16_q_preload.log
+```
+
+**通过条件**：所有配置 `fp8_gt_cos ≥ 0.995`
+
+### Example 验证
 
 ```bash
 bash /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/run_hstu8_examples.sh
 ```
 
+**通过条件**：`14/14 passed`
+
+### Benchmark
+
+```bash
+PYTHONUSERBASE=/home/scratch.minyu_gpu/project/.cache/pip-user python /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/fbgemm_gpu/experimental/hstu/benchmark/bench_hstu_attn_sm120.py 2>&1 | tee /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/2benchmark_results/051_phase16_q_preload.log
+```
+
+### SASS 验证（确认无新增 spill）
+
+```bash
+cd /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu
+./dump_sass_fp8_ws.sh
+grep -c "LDL\|STL" 4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full.sass
+```
+
+**目标**：LDL+STL 计数维持 0。
+
+### NCU Profile
+
+```bash
+cd /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu
+./run_profile.sh 051 phase16_q_preload
+```
+
+**关注指标**：No Eligible stall（目标 < 45%）、SM Busy、Math Throttle。
+
 ---
 
-## 关键文件位置
+## 预期结果
 
-- 主 kernel：`fbgemm_gpu/experimental/hstu/src/hstu_blackwell_sm120/hstu_fwd_kernel_fp8_ws.h`
-- QMMA builder：`fbgemm_gpu/experimental/hstu/src/hstu_blackwell_sm120/sm120_qmma_builder.h`
-- SFV bug 行号：约 1121-1131（`tCrSFV` 加载循环）
-- SFA bug 行号：约 853-856（`tCrSFA` 直接加载）
+| 指标 | Phase 15 基线（050） | Phase 16 目标 |
+|------|-------------------|-------------|
+| No Eligible stall | 59.85% | < 45% |
+| SM Busy | 61.49% | > 65% |
+| FP8 TFLOPS（seq=4096 causal） | ~1060 | +3-8% |
+| FP8 TFLOPS（seq=4096 full） | ~620 | +3-8% |
+| LDL/STL（SASS） | 0 | 0（不变） |
+| fp8_gt_cos | ≥ 0.9996 | ≥ 0.9996 |
 
-## 编译命令（三条独立 Bash 调用）
+---
 
-```bash
-# 1
-mkdir -p /tmp/claude
-# 2
-cd /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/fbgemm_gpu/experimental/hstu
-# 3
-PYTHONUSERBASE=/home/scratch.minyu_gpu/project/.cache/pip-user HSTU_ARCH_LIST="12.0" HSTU_DISABLE_BACKWARD=TRUE HSTU_DISABLE_HDIM32=TRUE HSTU_DISABLE_HDIM64=TRUE HSTU_DISABLE_HDIM256=TRUE MAX_JOBS=32 pip install --no-build-isolation --config-settings editable_mode=compat -e .
+## 风险与决策树
+
+```
+数值验证通过？
+  ├─ 否 → debug（Q 预加载是否读到正确数据？sQ_persist 地址是否正确？）
+  │        → 检查 sQ_persist_pi 在提前到 wait 前后是否变化
+  └─ 是 →
+       benchmark 提升？
+         ├─ 是（+3%以上）→ 完成 Phase 16，进入 Phase 17
+         └─ 否（<1%）→
+              NCU 确认 No Eligible 是否下降：
+                ├─ 下降但 TFLOPS 无变化 → 瓶颈已转移，分析新主导 stall
+                └─ 无下降 → ptxas 可能已做了同样优化，考虑 pipeline overlap
 ```
 
-## 精度验证命令
+---
 
-```bash
-PYTHONUSERBASE=/home/scratch.minyu_gpu/project/.cache/pip-user HSTU_SWEEP_FP8_QUANT_MODE=2 python /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/sweep_accuracy.py 2>&1 | tee /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/1test_results/092_phase13_fix_sfv_nrow.log
-```
+## 关键文件
+
+| 文件 | 修改位置 | 变更内容 |
+|------|---------|---------|
+| `hstu_fwd_kernel_fp8_ws.h` | 主循环 mbarrier wait 前（约 856-940 行） | 指针计算 + SFA + Q 提前到 wait 前 |
