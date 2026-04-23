@@ -963,18 +963,25 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       static_assert(kAccSElems % 4 == 0, "kAccSElems must be a multiple of 4");
       uint32_t acc_s_packed[kAccSElems / 4];  // 16 registers (vs. 64 for F32)
       {
-        cutlass::NumericConverter<FP8Elem, float> fp32_to_fp8;
+        // Use cvt.e4m3x2: 2 F32→FP8 per instruction (vs. 4 scalar conversions).
+        // Each cvt packs a pair into 16 bits; mov.b32 combines two pairs into uint32.
+        // PTX operand order: cvt d, srcHi, srcLo → d[15:8]=FP8(srcHi), d[7:0]=FP8(srcLo)
         CUTE_UNROLL
         for (int flat = 0; flat < kAccSElems; flat += 4) {
-          auto get_fp8 = [&](int f) -> uint8_t {
-            FP8Elem v = fp32_to_fp8(static_cast<float>(acc_s(f)));
-            return *reinterpret_cast<const uint8_t*>(&v);
-          };
-          acc_s_packed[flat / 4] =
-              (uint32_t)get_fp8(flat)            |
-              ((uint32_t)get_fp8(flat + 1) <<  8) |
-              ((uint32_t)get_fp8(flat + 2) << 16) |
-              ((uint32_t)get_fp8(flat + 3) << 24);
+          uint32_t out;
+          asm volatile(
+              "{\n"
+              ".reg .b16 lo, hi;\n"
+              "cvt.rn.satfinite.e4m3x2.f32 lo, %2, %1;\n"
+              "cvt.rn.satfinite.e4m3x2.f32 hi, %4, %3;\n"
+              "mov.b32 %0, {lo, hi};\n"
+              "}\n"
+              : "=r"(out)
+              : "f"(static_cast<float>(acc_s(flat + 0))),
+                "f"(static_cast<float>(acc_s(flat + 1))),
+                "f"(static_cast<float>(acc_s(flat + 2))),
+                "f"(static_cast<float>(acc_s(flat + 3))));
+          acc_s_packed[flat / 4] = out;
         }
       }
       // acc_s (64 F32 regs) is now DEAD.

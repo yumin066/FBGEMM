@@ -100,8 +100,115 @@
 | **14** | setmaxnreg 224/56 + 消除全部 LDL/STL reg spill（math+load warp 零 spill） | ✅ | FP8 突破 1 TFLOPS（2026-04-22）|
 | **15** | Q+SFA TMA 迁移到 math warp，直接打到 sQ_persist，删除 load warp Q copy + bar.sync | ✅ | FP8/BF16 比值 1.633（2026-04-22）|
 | **16** | Q+SFA preload 移到 mbarrier wait 前，隐藏 LDSM latency，减少 No Eligible stall | ✅ | causal +1~3%，全验证通过（2026-04-23）|
+| **17** | 同步点精简：删 S3、S2→wait_mbar_parity、q_tma_mbar 迁 math warp、S5→bar.sync 1,256 | ✅ | bs=1 causal +6.7%，全验证通过（2026-04-23）|
+| **18** | cvt.e4m3x2 双路 FP8 转换：F2FP 指令数 64→32，打包链 IMAD+LOP3+PRMT+IADD→mov.b32 | ✅ | FP8 全面 +1-4%（2026-04-23）|
 
-详细历史记录见 `HISTORY.md`。最新基线性能（Phase 16，benchmark 052，锁频 2407MHz）：seq=4096 causal，FP8 **1077.7 TFLOPS** vs BF16 646.1 TFLOPS（**+66.8%**）；seq=4096 full：FP8 **611.8 TFLOPS** vs BF16 362.1 TFLOPS（**+69.0%**）。
+详细历史记录见 `HISTORY.md`。最新基线性能（Phase 18，benchmark 054）：seq=4096 causal，FP8 **1113.0 TFLOPS** vs BF16 644.2 TFLOPS（**+72.8%**）；seq=4096 full：FP8 **630.8 TFLOPS** vs BF16 362.5 TFLOPS（**+74.0%**）。
+
+---
+
+## Phase 18 COMPLETE：cvt.e4m3x2 双路 FP8 转换（2026-04-23）
+
+### 优化目标
+
+`F2FP.SATFINITE.E4M3.F32.PACK_AB_MERGE_C` 支持同时转两个 FP32→FP8（srcA+srcB），但原始代码传 srcB=RZ，浪费一路。改用 PTX `cvt.rn.satfinite.e4m3x2.f32` 同时转一对，并用 `mov.b32 {lo, hi}` 拼装，消除了原先复杂的 `IMAD+LOP3+PRMT+IADD` 打包链。
+
+### 代码变更（`hstu_fwd_kernel_fp8_ws.h`）
+
+```cpp
+// Before: 4× scalar F2FP + IMAD+LOP3+PRMT+IADD packing chain
+// After: 2× cvt.e4m3x2 + mov.b32
+CUTE_UNROLL
+for (int flat = 0; flat < kAccSElems; flat += 4) {
+  uint32_t out;
+  asm volatile(
+      "{\n"
+      ".reg .b16 lo, hi;\n"
+      "cvt.rn.satfinite.e4m3x2.f32 lo, %2, %1;\n"
+      "cvt.rn.satfinite.e4m3x2.f32 hi, %4, %3;\n"
+      "mov.b32 %0, {lo, hi};\n"
+      "}\n"
+      : "=r"(out)
+      : "f"(float(acc_s(flat+0))), "f"(float(acc_s(flat+1))),
+        "f"(float(acc_s(flat+2))), "f"(float(acc_s(flat+3))));
+  acc_s_packed[flat / 4] = out;
+}
+```
+
+### 验证结果
+
+- [x] sweep_accuracy.py：全部 fp8_gt_cos ≥ 0.9996（日志 `1test_results/087_phase18_fp8_cvt2.log`）
+- [x] run_hstu8_examples.sh：14/14 PASS
+- [x] benchmark 054：见下表
+
+**性能结果（benchmark 054，RTX PRO 6000 Blackwell SM120）**：
+
+| Config | BF16 TFLOPS | FP8 TFLOPS | FP8 vs BF16 | vs Phase 17 |
+|--------|-------------|------------|-------------|-------------|
+| bs=8 seq=4096 h=16 causal | 644.2 | **1113.0** | **+72.8%** | **+2.9%** |
+| bs=4 seq=4096 h=16 causal | 619.2 | **1059.4** | **+71.1%** | **+2.2%** |
+| bs=1 seq=4096 h=16 causal | 492.7 | **872.1** | **+77.0%** | +1.2% |
+| bs=8 seq=4096 h=16 full | 362.5 | **630.8** | **+74.0%** | **+2.5%** |
+| bs=8 seq=2048 h=16 full | 340.8 | **610.7** | **+79.2%** | **+3.6%** |
+
+---
+
+## Phase 17 COMPLETE：同步点精简 — 删 S3 / S2→mbarrier wait / S5→bar.sync（2026-04-23）
+
+### 优化目标
+
+NCU Profile 052（Phase 16 基线）显示 No Eligible stall 仍达 **59.76%**，与 Phase 15 几乎相同，说明 mbarrier wait 依然是主瓶颈。在此基础上分析 CTA 内全部同步点，发现存在三类冗余：
+
+| 同步点 | 原实现 | 问题 | 新实现 |
+|--------|--------|------|--------|
+| S3 | `__syncthreads()` | 纯集合点，无数据依赖，load/math 双方都不需要 | **删除** |
+| S2 | `__syncthreads()` | Q+SFA TMA 等待本质是 math warp 内部事务，无需阻塞 load warp | `bar.sync 2,256` + `wait_mbar_parity(q_tma_mbar_ptr,0)` |
+| q_tma_mbar init | load warp thread 256 初始化，再经 S1 同步 | 增加无谓 CTA 同步；q_tma_mbar 完全属于 math warp | 迁移至 math warp thread 0（含 `fence.proxy.async.shared::cta`） |
+| S5 | `__syncthreads()` | epilogue 只有 math warp 参与，3 个 idle load warp 被白白锁死 | `bar.sync 1,256`（math-warp-only），load warp 提前退出 |
+
+### 关键 bug：bar.sync 2,256 修复 race condition
+
+thread 0 初始化 `q_tma_mbar_ptr`（SMEM write）后，threads 1-255 立即调用 `wait_mbar_parity`，但 SMEM 写入对其他线程不可见（无隐式 coherence）。修复：在 `if (tidx_math == 0)` 块之后、`wait_mbar_parity` 之前插入 `asm volatile("bar.sync 2, 256;\n")` 使 init 写入对全部 256 个 math thread 可见。未修复前表现为 flaky crash（非确定性，0-100% 概率出现）。
+
+### 代码变更（`hstu_fwd_kernel_fp8_ws.h`）
+
+**同步点 map（变更后）**：
+```
+S_arb : __syncthreads()         — Is_arbitrary 分支
+S1    : __syncthreads()         — load warp 初始化 tma_mbar/math_mbar 后
+S2    : bar.sync 2,256 + wait_mbar_parity(q_tma_mbar_ptr,0)  — math warp only
+S3    : 删除
+S5    : bar.sync 1,256          — math warp only；load warp 主循环结束后直接退出
+```
+
+**load warp 变更**：
+- 删除 q_tma_mbar 初始化块（从 thread 256 的 mbarrier.init 和 arrive 语句）
+- 删除 S3 `__syncthreads()`
+- 删除 S5 `__syncthreads()`，load warp 主循环结束后直接 return
+
+**math warp 变更**：
+- thread 0 的 Q+SFA TMA preamble 中新增 `mbarrier.init`（含 `fence.proxy.async.shared::cta`）
+- S2 从 `__syncthreads()` 改为 `bar.sync 2, 256` + 所有 256 线程自旋 `wait_mbar_parity`
+- 删除 S3 `__syncthreads()`
+- S5 从 `__syncthreads()` 改为 `asm volatile("bar.sync 1, 256;\n")`
+
+### 验证结果
+
+- [x] sweep_accuracy.py：全部 fp8_gt_cos ≥ 0.9996
+- [x] run_hstu8_examples.sh：14/14 PASS（连续 5 次全部通过）
+- [x] benchmark 053：见下表
+
+**性能结果（benchmark 053，RTX PRO 6000 Blackwell SM120）**：
+
+| Config | BF16 TFLOPS | FP8 TFLOPS | FP8 vs BF16 | vs Phase 16 |
+|--------|-------------|------------|-------------|-------------|
+| bs=8 seq=4096 h=16 causal | 644.3 | **1081.8** | **+67.9%** | +0.4% |
+| bs=4 seq=4096 h=16 causal | 619.8 | **1036.6** | **+67.2%** | +0.8% |
+| bs=1 seq=4096 h=16 causal | 476.4 | **861.9** | **+80.9%** | **+6.7%** |
+| bs=8 seq=4096 h=16 full | 362.3 | **615.4** | **+69.8%** | +0.6% |
+| bs=8 seq=2048 h=16 full | 340.1 | **589.5** | **+73.3%** | +1.8% |
+
+bs=1 causal 收益最大（+6.7%），因为该配置 CTA 数少、load warp idle 占比更高，释放后 scheduler 调度收益更明显。
 
 ---
 
