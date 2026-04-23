@@ -126,9 +126,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
   //   warps 9-11 (tidx 288-383): idle — dec registers, sync, then idle after S3
   // ============================================================
   if (is_load_warp) {
-    //printf("load warp, befor setmaxnreg, %d\n", tidx);
     asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" : : "n"(56));
-    //printf("load warp, after setmaxnreg, %d\n", tidx);
     // is_active_load: true only for warp 8 (threads 256-287)
     const bool is_active_load = (tidx < kNMathThreads + 32);
 
@@ -329,76 +327,76 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     // Only active load warp (warp 8) participates.
     // Idle load warps (9-11) skip this entire section and go directly to S5.
     if (is_active_load) {
-    int math_wait_parity0 = 0;
-    int math_wait_parity1 = 0;
+      int math_wait_parity0 = 0;
+      int math_wait_parity1 = 0;
 
-    // Preamble: wait math_mbar[0] (pre-satisfied), then issue tile n_block_max-1 into stage 0.
-    {
-      uint32_t maddr = static_cast<uint32_t>(__cvta_generic_to_shared(math_mbar_ptr0));
-      uint32_t done = 0;
-      do {
-        asm volatile("{.reg .pred p;\nmbarrier.test_wait.parity.shared::cta.b64 p, [%1], %2;\nselp.u32 %0, 1, 0, p;}\n"
-                     : "=r"(done) : "r"(maddr), "r"((uint32_t)math_wait_parity0));
-      } while (!done);
-    }
-    math_wait_parity0 ^= 1;
-
-    if (tidx == kNMathThreads) {
-      const int nb0     = Is_arbitrary ? int(sValidBlockIds[n_block_max - 1]) : (n_block_max - 1);
-      const int nb_abs0 = binfo.sum_s_k / kBlockN + nb0;
-      uint32_t taddr0   = static_cast<uint32_t>(__cvta_generic_to_shared(tma_mbar_ptr0));
-      asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"
-                   : : "r"(taddr0), "r"(kSmemKVtSFBBytes));
-      cute::copy(params.tma_k.with(*tma_mbar_ptr0),   tKgK_tma(_, _, _, nb_abs0),    tKsK_d_0);
-      cute::copy(params.tma_vt.with(*tma_mbar_ptr0),  tVtgVt_tma(_, _, _, nb_abs0),  tVtsVt_d_0);
-      cute::copy(params.tma_sfb.with(*tma_mbar_ptr0), tSFBgSFB_tma(_, _, _, nb_abs0), tSFBsSFB_d_0);
-      cute::copy(params.tma_sfv.with(*tma_mbar_ptr0), tSFVgSFV_tma(_, _, _, nb_abs0), tSFVsSFV_d_0);
-    }
-
-    int load_n_valid_init = n_block_max - 1;
-    if (is_jump && (n_masking_steps - 1 == 0))
-      load_n_valid_init = std::min(load_n_valid_init, n_block_history);
-    load_n_valid_init -= 1;
-
-    int load_stage = 1;
-    for (int n_valid = load_n_valid_init, masking_step_load = 1; n_valid >= n_block_min;
-         ++masking_step_load, --n_valid) {
-      const int nb = Is_arbitrary ? int(sValidBlockIds[n_valid]) : n_valid;
-
+      // Preamble: wait math_mbar[0] (pre-satisfied), then issue tile n_block_max-1 into stage 0.
       {
-        const int cur_math_parity = load_stage ? math_wait_parity1 : math_wait_parity0;
-        uint32_t maddr = static_cast<uint32_t>(__cvta_generic_to_shared(math_mbar_ptr0)) + (uint32_t)(load_stage * 8);
+        uint32_t maddr = static_cast<uint32_t>(__cvta_generic_to_shared(math_mbar_ptr0));
         uint32_t done = 0;
         do {
           asm volatile("{.reg .pred p;\nmbarrier.test_wait.parity.shared::cta.b64 p, [%1], %2;\nselp.u32 %0, 1, 0, p;}\n"
-                       : "=r"(done) : "r"(maddr), "r"((uint32_t)cur_math_parity));
+                       : "=r"(done) : "r"(maddr), "r"((uint32_t)math_wait_parity0));
         } while (!done);
       }
-      if (load_stage) { math_wait_parity1 ^= 1; } else { math_wait_parity0 ^= 1; }
+      math_wait_parity0 ^= 1;
 
       if (tidx == kNMathThreads) {
-        const int nb_abs = binfo.sum_s_k / kBlockN + nb;
-        uint32_t taddr   = static_cast<uint32_t>(__cvta_generic_to_shared(tma_mbar_ptr0)) + (uint32_t)(load_stage * 8);
+        const int nb0     = Is_arbitrary ? int(sValidBlockIds[n_block_max - 1]) : (n_block_max - 1);
+        const int nb_abs0 = binfo.sum_s_k / kBlockN + nb0;
+        uint32_t taddr0   = static_cast<uint32_t>(__cvta_generic_to_shared(tma_mbar_ptr0));
         asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"
-                     : : "r"(taddr), "r"(kSmemKVtSFBBytes));
-        if (load_stage == 0) {
-          cute::copy(params.tma_k.with(*tma_mbar_ptr0),   tKgK_tma(_, _, _, nb_abs),    tKsK_d_0);
-          cute::copy(params.tma_vt.with(*tma_mbar_ptr0),  tVtgVt_tma(_, _, _, nb_abs),  tVtsVt_d_0);
-          cute::copy(params.tma_sfb.with(*tma_mbar_ptr0), tSFBgSFB_tma(_, _, _, nb_abs), tSFBsSFB_d_0);
-          cute::copy(params.tma_sfv.with(*tma_mbar_ptr0), tSFVgSFV_tma(_, _, _, nb_abs), tSFVsSFV_d_0);
-        } else {
-          cute::copy(params.tma_k.with(*tma_mbar_ptr1),   tKgK_tma(_, _, _, nb_abs),    tKsK_d_1);
-          cute::copy(params.tma_vt.with(*tma_mbar_ptr1),  tVtgVt_tma(_, _, _, nb_abs),  tVtsVt_d_1);
-          cute::copy(params.tma_sfb.with(*tma_mbar_ptr1), tSFBgSFB_tma(_, _, _, nb_abs), tSFBsSFB_d_1);
-          cute::copy(params.tma_sfv.with(*tma_mbar_ptr1), tSFVgSFV_tma(_, _, _, nb_abs), tSFVsSFV_d_1);
-        }
+                     : : "r"(taddr0), "r"(kSmemKVtSFBBytes));
+        cute::copy(params.tma_k.with(*tma_mbar_ptr0),   tKgK_tma(_, _, _, nb_abs0),    tKsK_d_0);
+        cute::copy(params.tma_vt.with(*tma_mbar_ptr0),  tVtgVt_tma(_, _, _, nb_abs0),  tVtsVt_d_0);
+        cute::copy(params.tma_sfb.with(*tma_mbar_ptr0), tSFBgSFB_tma(_, _, _, nb_abs0), tSFBsSFB_d_0);
+        cute::copy(params.tma_sfv.with(*tma_mbar_ptr0), tSFVgSFV_tma(_, _, _, nb_abs0), tSFVsSFV_d_0);
       }
 
-      if (is_jump && masking_step_load == n_masking_steps - 1)
-        n_valid = std::min(n_valid, n_block_history);
+      int load_n_valid_init = n_block_max - 1;
+      if (is_jump && (n_masking_steps - 1 == 0))
+        load_n_valid_init = std::min(load_n_valid_init, n_block_history);
+      load_n_valid_init -= 1;
 
-      load_stage ^= 1;
-    }
+      int load_stage = 1;
+      for (int n_valid = load_n_valid_init, masking_step_load = 1; n_valid >= n_block_min;
+           ++masking_step_load, --n_valid) {
+        const int nb = Is_arbitrary ? int(sValidBlockIds[n_valid]) : n_valid;
+
+        {
+          const int cur_math_parity = load_stage ? math_wait_parity1 : math_wait_parity0;
+          uint32_t maddr = static_cast<uint32_t>(__cvta_generic_to_shared(math_mbar_ptr0)) + (uint32_t)(load_stage * 8);
+          uint32_t done = 0;
+          do {
+            asm volatile("{.reg .pred p;\nmbarrier.test_wait.parity.shared::cta.b64 p, [%1], %2;\nselp.u32 %0, 1, 0, p;}\n"
+                         : "=r"(done) : "r"(maddr), "r"((uint32_t)cur_math_parity));
+          } while (!done);
+        }
+        if (load_stage) { math_wait_parity1 ^= 1; } else { math_wait_parity0 ^= 1; }
+
+        if (tidx == kNMathThreads) {
+          const int nb_abs = binfo.sum_s_k / kBlockN + nb;
+          uint32_t taddr   = static_cast<uint32_t>(__cvta_generic_to_shared(tma_mbar_ptr0)) + (uint32_t)(load_stage * 8);
+          asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"
+                       : : "r"(taddr), "r"(kSmemKVtSFBBytes));
+          if (load_stage == 0) {
+            cute::copy(params.tma_k.with(*tma_mbar_ptr0),   tKgK_tma(_, _, _, nb_abs),    tKsK_d_0);
+            cute::copy(params.tma_vt.with(*tma_mbar_ptr0),  tVtgVt_tma(_, _, _, nb_abs),  tVtsVt_d_0);
+            cute::copy(params.tma_sfb.with(*tma_mbar_ptr0), tSFBgSFB_tma(_, _, _, nb_abs), tSFBsSFB_d_0);
+            cute::copy(params.tma_sfv.with(*tma_mbar_ptr0), tSFVgSFV_tma(_, _, _, nb_abs), tSFVsSFV_d_0);
+          } else {
+            cute::copy(params.tma_k.with(*tma_mbar_ptr1),   tKgK_tma(_, _, _, nb_abs),    tKsK_d_1);
+            cute::copy(params.tma_vt.with(*tma_mbar_ptr1),  tVtgVt_tma(_, _, _, nb_abs),  tVtsVt_d_1);
+            cute::copy(params.tma_sfb.with(*tma_mbar_ptr1), tSFBgSFB_tma(_, _, _, nb_abs), tSFBsSFB_d_1);
+            cute::copy(params.tma_sfv.with(*tma_mbar_ptr1), tSFVgSFV_tma(_, _, _, nb_abs), tSFVsSFV_d_1);
+          }
+        }
+
+        if (is_jump && masking_step_load == n_masking_steps - 1)
+          n_valid = std::min(n_valid, n_block_history);
+
+        load_stage ^= 1;
+      }
     }  // end if (is_active_load)
     // Load warps exit here; epilogue is math-warp-only (bar.sync 1, 256).
 
@@ -406,9 +404,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
   } else {
   // MATH WARP PATH  (warps 0-7, threads 0-255)
   // ============================================================
-    //printf("math warp, befor setmaxnreg, %d\n", tidx);
     asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" : : "n"(224));
-    //printf("math warp, after setmaxnreg, %d\n", tidx);
 
     constexpr bool Is_causal    = Kernel_traits::Is_causal;
     constexpr bool Is_target    = Kernel_traits::Is_target;
