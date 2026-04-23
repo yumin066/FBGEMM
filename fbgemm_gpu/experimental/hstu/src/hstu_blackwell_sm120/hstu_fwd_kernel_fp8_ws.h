@@ -14,10 +14,10 @@
 //
 // CTA-level __syncthreads__ map (must match between branches):
 //   S_arb : Is_arbitrary only — math warp 1 writes sValidBlockIds; load warp just syncs
-//   S1    : after load warp inits barriers + fence
-//   S2    : after math warp thread 0 issues Q+SFA TMA and waits (Q visible to all math warps)
-//   S3    : before main WS loop
-//   S5    : epilogue — after math warps write acc_o to SMEM (sO visible for GMEM copy)
+//   S1    : after load warp inits tma_mbar/math_mbar + fence; q_tma_mbar is now math-warp-local
+//   S2→   : replaced by wait_mbar_parity(q_tma_mbar_ptr,0) for all 256 math threads (no CTA sync)
+//   S3    : removed (was a no-op rendezvous with no real data dependency)
+//   S5    : replaced by bar.sync 1,256 (math-warp-only); load warps exit after main loop
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -201,13 +201,10 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       n_block_min = 0;
     }
 
-    // Early exit 2 (after Is_arbitrary): both branches exit with 4 syncs ahead.
+    // Early exit 2 (after Is_arbitrary): both branches exit with 1 sync ahead (S1).
     if (((Is_causal || Is_local || Is_arbitrary) && n_block_max <= n_block_min) ||
         m_block * kBlockM >= actual_seqlen_q) {
       __syncthreads();  // S1
-      __syncthreads();  // S2
-      __syncthreads();  // S3
-      __syncthreads();  // S5
       return;
     }
 
@@ -235,7 +232,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     uint64_t* tma_mbar_ptr1  = reinterpret_cast<uint64_t*>(smem_ + kSmemMbar0Offset + 8);
     uint64_t* math_mbar_ptr0 = reinterpret_cast<uint64_t*>(smem_ + kSmemMbar0Offset + 16);
     uint64_t* math_mbar_ptr1 = reinterpret_cast<uint64_t*>(smem_ + kSmemMbar0Offset + 24);
-    uint64_t* q_tma_mbar_ptr = reinterpret_cast<uint64_t*>(smem_ + kSmemMbar0Offset + 32);
+    // q_tma_mbar_ptr is now initialized by math warp thread 0, not here.
 
     // SF SMEM pointers.
     static constexpr int kSmemSFOffset_WS = Kernel_traits::kSmemWsDataSizePadded;
@@ -251,26 +248,23 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     };
 
     // Barrier init: only thread kNMathThreads (load warp's first thread).
+    // Initializes tma_mbar0/1 and math_mbar0/1 only; q_tma_mbar is initialized by math warp thread 0.
     if (tidx == kNMathThreads) {
       uint32_t tm0 = static_cast<uint32_t>(__cvta_generic_to_shared(tma_mbar_ptr0));
       uint32_t tm1 = static_cast<uint32_t>(__cvta_generic_to_shared(tma_mbar_ptr1));
       uint32_t mm0 = static_cast<uint32_t>(__cvta_generic_to_shared(math_mbar_ptr0));
       uint32_t mm1 = static_cast<uint32_t>(__cvta_generic_to_shared(math_mbar_ptr1));
-      uint32_t qm0 = static_cast<uint32_t>(__cvta_generic_to_shared(q_tma_mbar_ptr));
       asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" : : "r"(tm0), "r"(1));
       asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" : : "r"(tm1), "r"(1));
       asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" : : "r"(mm0), "r"(8));
       asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" : : "r"(mm1), "r"(8));
-      asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" : : "r"(qm0), "r"(1));
       for (int i = 0; i < 8; i++) {
         asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" : : "r"(mm0));
         asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" : : "r"(mm1));
       }
     }
     asm volatile("fence.proxy.async.shared::cta;\n" : : : "memory");
-    __syncthreads();  // S1: barriers initialized and visible to all warps.
-
-    __syncthreads();  // S2: CTA rendezvous before K/V TMA setup; math warp issues Q+SFA TMA after split.
+    __syncthreads();  // S1: tma_mbar0/1 and math_mbar0/1 initialized and visible to all warps.
 
     // TMA tensor setup for K, V^T, SFB, SFV (load warp only).
     const int bidh_kv = bidh / params.h_h_k_ratio;
@@ -330,8 +324,6 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     Tensor sValidBlockIds = make_tensor(
         make_smem_ptr(reinterpret_cast<int*>(smem_ + Kernel_traits::kSmemWsValidBlockIdsOffset)),
         typename Kernel_traits::SmemLayoutValidBlockIds{});
-
-    __syncthreads();  // S3: before main loop; Q+SFA preamble TMA complete, all SMEM state visible.
 
     // ===== LOAD WARP DOUBLE-BUFFER TMA PRODUCER =====
     // Only active load warp (warp 8) participates.
@@ -408,10 +400,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       load_stage ^= 1;
     }
     }  // end if (is_active_load)
-    // Idle load warps (9-11) reach here immediately after S3.
-    // All 4 load warps (+ math warps) meet at S5 when everyone is done.
-    __syncthreads();  // S5: epilogue — wait for math warps to write acc_o to SMEM.
-    // All load warps idle while math warps copy sO to GMEM.
+    // Load warps exit here; epilogue is math-warp-only (bar.sync 1, 256).
 
   // ============================================================
   } else {
@@ -559,7 +548,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       n_block_min = 0;
     }
 
-    // Early exit 2 (after Is_arbitrary): math warps write zeros; both branches have 4 syncs ahead.
+    // Early exit 2 (after Is_arbitrary): math warps write zeros; both branches have 1 sync ahead (S1).
     if (((Is_causal || Is_local || Is_arbitrary) && n_block_max <= n_block_min) ||
         m_block * kBlockM >= actual_seqlen_q) {
       using OutElement = typename Kernel_traits::OutputType;
@@ -578,9 +567,6 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       flash::copy<false, false, false>(gmem_tiled_copy_O, tOrO, tOgO, tOcO,
           actual_seqlen_q_padded - m_block * kBlockM);
       __syncthreads();  // S1
-      __syncthreads();  // S2
-      __syncthreads();  // S3
-      __syncthreads();  // S5
       return;
     }
 
@@ -714,7 +700,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       }
     };
 
-    __syncthreads();  // S1: barriers initialized by load warp; math warps can now use them.
+    __syncthreads();  // S1: tma_mbar0/1 and math_mbar0/1 visible to all warps; math warps can use them.
 
     Tensor sQ_persist = make_tensor(
         make_smem_ptr(reinterpret_cast<FP8Elem*>(
@@ -722,7 +708,8 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         SmemLayoutQ_SW128{});
     auto sQ_persist_pi = as_position_independent_swizzle_tensor(sQ_persist);
 
-    // Q+SFA TMA preamble: math warp thread 0 issues TMA directly into sQ_persist and smem_sfa_ptr.
+    // Q+SFA TMA preamble: math warp thread 0 initializes q_tma_mbar and issues TMA directly into
+    // sQ_persist and smem_sfa_ptr.  q_tma_mbar is math-warp-local; no cross-warp sync needed.
     // kSmemWsQPersistOffset is 2048B-aligned, so TMA's absolute SW128 write addresses and
     // PI-swizzled LDSM read addresses are identical for all mask patterns (PI == non-PI).
     {
@@ -748,14 +735,22 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
             make_tensor(make_smem_ptr(smem_sfa_ptr), SmemLayoutSFA_TMA_t{}));
         auto tSFAgSFA_tma  = tma_slice_SFA.partition_S(gSFA_tiles(_, _, _, Int<0>{}));
         uint32_t qaddr = static_cast<uint32_t>(__cvta_generic_to_shared(q_tma_mbar_ptr));
+        // Init q_tma_mbar here (math-warp-local); fence ensures TMA proxy sees the write.
+        asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" : : "r"(qaddr), "r"(1));
+        asm volatile("fence.proxy.async.shared::cta;\n" : : : "memory");
         asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"
                      : : "r"(qaddr), "r"(kSmemQBytes + kSmemSFABytes));
         cute::copy(params.tma_q.with(*q_tma_mbar_ptr),   tQgQ_tma(_, _, _, m_abs),     tQsQ_d);
         cute::copy(params.tma_sfa.with(*q_tma_mbar_ptr), tSFAgSFA_tma(_, _, _, m_abs), tSFAsSFA_d);
-        wait_mbar_parity(q_tma_mbar_ptr, 0);  // spin until Q+SFA TMA complete
       }
     }
-    __syncthreads();  // S2: Q+SFA TMA complete; Q resident in sQ_persist, SFA in smem_sfa_ptr.
+    // bar.sync 2,256: make thread 0's mbarrier.init write visible to all 256 math threads
+    // before they spin on wait_mbar_parity. Without this, threads 1-255 may see stale/garbage
+    // barrier state (SMEM is not implicitly coherent across threads without a barrier).
+    asm volatile("bar.sync 2, 256;\n" : : : "memory");
+    // All 256 math threads wait for Q+SFA TMA completion. mbarrier.test_wait is non-destructive
+    // and provides acquire semantics: SMEM data written by TMA is visible to all waiters.
+    wait_mbar_parity(q_tma_mbar_ptr, 0);
 
     // Mask lambda (captures variables from math warp scope).
     auto col_limit_right = [&](int row) {
@@ -830,8 +825,6 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         }
       }
     };
-
-    __syncthreads();  // S3: before main loop; load warp ready to issue K/Vt TMA preamble.
 
     // SFP (unit scale for P) — separate buffer so real SFA SMEM stays valid for per-tile GEMM1 s2r.
     for (int i = tidx_math; i < kBlockM; i += kNMathThreads)
@@ -1162,7 +1155,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       for (int i = 0; i < size(rO); ++i) tOsO(i) = rO(i);
     }
 
-    __syncthreads();  // S5: sO visible to all; load warp arrives here after its loop ends.
+    asm volatile("bar.sync 1, 256;\n" : : : "memory");  // S5: all 256 math threads see sO_flat writes.
 
     // Copy sO to GMEM.
     Tensor mO = make_tensor(
