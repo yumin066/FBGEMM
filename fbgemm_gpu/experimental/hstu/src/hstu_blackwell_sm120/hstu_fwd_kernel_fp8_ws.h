@@ -832,43 +832,40 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     // 16B alignment: d_start = nw*32+d_mat ∈ multiples of 16, XOR swizzle_xor also multiple of 16.
     static_assert(kHeadDim % 32 == 0 && kBlockN % 16 == 0,
         "LDSM_T requires kHeadDim divisible by 32 and kBlockN divisible by 16.");
+    // ── N-loop tile-invariants (Opt A): hoisted from per-tile load ───────────────────────
+    // Q (sQ_persist) and SFA are written by TMA before the loop (guaranteed visible after
+    // wait_mbar_parity at S2) and never change.  Hoisting eliminates 4 ldmatrix + 1 LDS
+    // per N-tile.
+    // NOTE: tCrSFP is NOT hoisted — smem_sfp_ptr is written by distributed thread writes
+    // (not TMA) and requires the long per-tile gap (mbarrier wait + GEMM1, ~500 cycles)
+    // to guarantee visibility.  Hoisting would introduce a race with no explicit barrier.
+    Tensor tCrSFA = BS1::partition_fragment_SFA(sSFA(_,_,_0{}), thr_mma_g1);
+    {
+      const int warp_m  = tidx_math / 32;
+      const int lane    = tidx_math & 31;
+      const int sfa_row = warp_m * 16 + 8 * (lane & 1) + (lane >> 2);
+      tCrSFA(0, 0, 0)  = smem_sfa_ptr[sfa_row];
+    }
+    auto tCrSFA_frg = BS1::transform_fragment_for_qmma(tCrSFA);
+
+    Tensor tCrQ = thr_mma_g1.partition_fragment_A(sQ_persist_pi);
+    load_a_z_pattern(sQ_persist_pi, tCrQ, 0, kHeadDim / 32);
+
     int tma_parity0 = 0;  // parity for mbar[0]: first K TMA preamble arrives at parity 0
     int tma_parity1 = 0;  // parity for mbar[1]: first V TMA preamble arrives at parity 0
-    int math_stage = 0;
+    int math_stage  = 0;
 
-    for (int n_valid = n_block_max - 1, masking_step = 0; n_valid >= n_block_min;
-         ++masking_step, --n_valid) {
-      const int nb = Is_arbitrary ? int(sValidBlockIds[n_valid]) : n_valid;
-      const bool is_masking = masking_step < n_masking_steps ||
-          (nb + 1) * kBlockN > actual_seqlen_h;
+    // Per-tile lambda (Opt C): instantiated with kIsMasking=true (Phase 1, causal diagonal)
+    // and kIsMasking=false (Phase 2, steady-state unmasked) to allow compile-time dead-code
+    // elimination of apply_mask_bs in the hot path.  n_valid_ref is modified in-place by
+    // the is_jump adjustment; math_stage ^= 1 executes at the end of every tile path.
+    auto run_n_tile = [&](int nb, int& n_valid_ref, int masking_step, auto kIsMasking_c) {
+      constexpr bool kIsMasking = decltype(kIsMasking_c)::value;
 
-      // Phase 16: preload stage-invariant GEMM1 inputs before the K/V TMA wait.
-      // smem_sfb_cur/sK_cur/sVt_cur are pure pointer arithmetic (no TMA data read).
-      // SFA (Q scale) and Q live in persistent SMEM filled by the preamble — both are
-      // independent of the per-tile K/V TMA, so their LDSM latency is fully hidden
-      // under the ~100-200 cycle mbarrier spin below.  Verified safe: smem_sfa_ptr and
-      // sQ_persist_pi are always valid from S2 onwards.
+      // Stage-dependent SMEM pointers — pure pointer arithmetic, no TMA dependency.
       int32_t* smem_sfb_cur = smem_sfa_ptr + 2 * kBlockM + math_stage * kBlockN;
       FP8Elem* sK_cur  = reinterpret_cast<FP8Elem*>(smem_q) + math_stage * 2 * kSmemKVElems;
       FP8Elem* sVt_cur = reinterpret_cast<FP8Elem*>(smem_q) + kSmemKVElems + math_stage * 2 * kSmemKVElems;
-
-      Tensor tCrSFA = BS1::partition_fragment_SFA(sSFA(_,_,_0{}), thr_mma_g1);
-      {
-        // load_a_z_pattern: m_row0 = warp_m*16 + (lane>>2), m_row1 = m_row0+8.
-        // SFA must match AtomLayoutSFA_TV: T_contrib = 8*(lane&1) + (lane>>2).
-        // smem_sfa_ptr is linear: smem_sfa_ptr[m_row] = packed int32 for M-row m_row.
-        const int warp_m  = tidx_math / 32;
-        const int lane    = tidx_math & 31;
-        const int sfa_row = warp_m * 16 + 8 * (lane & 1) + (lane >> 2);
-        tCrSFA(0, 0, 0)  = smem_sfa_ptr[sfa_row];
-      }
-      auto tCrSFA_frg = BS1::transform_fragment_for_qmma(tCrSFA);
-
-      // Q preload: issued before the mbarrier wait so its LDSM latency overlaps with
-      // the K TMA spin.  tCrQ stays live across the wait (16 extra regs, within the
-      // 56-reg headroom under setmaxnreg=224 / current peak 168).
-      Tensor tCrQ = thr_mma_g1.partition_fragment_A(sQ_persist_pi);
-      load_a_z_pattern(sQ_persist_pi, tCrQ, 0, kHeadDim / 32);
 
       // Wait for TMA K[nb]+Vt[nb]+SFB[nb]+SFV[nb] to land.
       {
@@ -917,9 +914,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       }
       auto tCrSFB_frg = BS1::transform_fragment_for_qmma(tCrSFB);
 
-      // GEMM1: acc_s += Q × K^T (block-scaled QMMA).
-      // tCrQ was preloaded before the mbarrier wait above; its LDSM latency is now
-      // hidden under the K TMA spin.  K is loaded here (after wait) from TMA data.
+      // GEMM1: tCrQ and tCrSFA_frg are N-loop invariants hoisted above the loop.
       Tensor tCrK = thr_mma_g1.partition_fragment_B(sK_cur_pi);
       load_b_z_pattern(sK_cur_pi, tCrK, 0, kHeadDim / 32);
       cute::gemm(tiled_mma_g1,
@@ -934,12 +929,19 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
           asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" : : "r"(maddr));
         }
         if (is_jump && masking_step == n_masking_steps - 1)
-          n_valid = std::min(n_valid, n_block_history);
+          n_valid_ref = std::min(n_valid_ref, n_block_history);
         math_stage ^= 1;
-        continue;
+        return;
       }
 
-      if (Is_arbitrary || Is_local || is_masking) apply_mask_bs(acc_s, nb);
+      // Masking (Opt C: compile-time specialized).
+      // kIsMasking=true  (Phase 1): always apply_mask_bs (causal diagonal or Is_arbitrary/Is_local).
+      // kIsMasking=false (Phase 2): steady-state; skip diagonal masking; varlen-end check only.
+      if constexpr (Is_arbitrary || Is_local || kIsMasking) {
+        apply_mask_bs(acc_s, nb);
+      } else {
+        if ((nb + 1) * kBlockN > actual_seqlen_h) apply_mask_bs(acc_s, nb);
+      }
       for (int i = 0; i < size(acc_s); ++i) acc_s(i) *= params.alpha;
       fast_silu(acc_s);
 
@@ -1092,7 +1094,9 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         }
       }
 
-      // s2r SFP (unit) and SFV.
+      // s2r SFP (unit scale) and SFV.
+      // tCrSFP is per-tile: smem_sfp_ptr is thread-written (not TMA); the mbarrier wait +
+      // GEMM1 above (~500 cycles) ensure all write-thread SFP commits are visible here.
       Tensor tCrSFP = BS2::partition_fragment_SFA(sSFP(_,_,_0{}), thr_mma_g2);
       {
         auto tXsSFP = s2r_thr_SFP.partition_S(sSFP);
@@ -1125,17 +1129,43 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" : : "r"(maddr));
       }
 
-      // GEMM2: acc_o += P × V^T (block-scaled) — overlaps with load warp's next TMA.
+      // GEMM2: acc_o += P × V^T (block-scaled, tCrSFP_frg hoisted).
       cute::gemm(tiled_mma_g2,
           make_zip_tensor(tCrP, tCrSFP_frg(_,_,_,_0{})),
           make_zip_tensor(tCrV, tCrSFV_frg(_,_,_,_0{})),
           acc_o);
-      } // tCrV, tCrSFV, tCrSFP freed here.
+      } // tCrV, tCrSFV freed here.
 
+      // End-of-tile cleanup: is_jump adjustment and double-buffer flip.
       if (is_jump && masking_step == n_masking_steps - 1)
-        n_valid = std::min(n_valid, n_block_history);
-
+        n_valid_ref = std::min(n_valid_ref, n_block_history);
       math_stage ^= 1;
+    };  // end run_n_tile lambda
+
+    // N-loop (Opt C): for causal (not arbitrary, not local), split into masked Phase 1
+    // (n_masking_steps tiles) and unmasked Phase 2 (steady-state) to allow compile-time
+    // dead-code elimination of apply_mask_bs in the hot path.
+    if constexpr (Is_causal && !Is_arbitrary && !Is_local) {
+      int n_valid    = n_block_max - 1;
+      int masking_step = 0;
+      // Phase 1: causal diagonal tiles — apply_mask_bs compiled in (kIsMasking=true).
+      for (; n_valid >= n_block_min && masking_step < n_masking_steps; ++masking_step, --n_valid)
+        run_n_tile(n_valid, n_valid, masking_step, std::true_type{});
+      // Phase 2: steady-state tiles — apply_mask_bs compile-time eliminated (kIsMasking=false).
+      for (; n_valid >= n_block_min; ++masking_step, --n_valid)
+        run_n_tile(n_valid, n_valid, masking_step, std::false_type{});
+    } else if constexpr (Is_arbitrary || Is_local) {
+      // Every tile needs masking: pass true_type so apply_mask_bs is always compiled in.
+      for (int n_valid = n_block_max - 1, masking_step = 0; n_valid >= n_block_min;
+           ++masking_step, --n_valid) {
+        const int nb = Is_arbitrary ? int(sValidBlockIds[n_valid]) : n_valid;
+        run_n_tile(nb, n_valid, masking_step, std::true_type{});
+      }
+    } else {
+      // Full attention (!Is_causal, !Is_arbitrary, !Is_local): varlen-end check only.
+      for (int n_valid = n_block_max - 1, masking_step = 0; n_valid >= n_block_min;
+           ++masking_step, --n_valid)
+        run_n_tile(n_valid, n_valid, masking_step, std::false_type{});
     }
 
     // ===== EPILOGUE =====

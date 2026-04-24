@@ -103,8 +103,76 @@
 | **17** | 同步点精简：删 S3、S2→wait_mbar_parity、q_tma_mbar 迁 math warp、S5→bar.sync 1,256 | ✅ | bs=1 causal +6.7%，全验证通过（2026-04-23）|
 | **18** | cvt.e4m3x2 双路 FP8 转换：F2FP 指令数 64→32，打包链 IMAD+LOP3+PRMT+IADD→mov.b32 | ✅ | FP8 全面 +1-4%（2026-04-23）|
 | **19** | TMA Store Output：epilogue SMEM→GMEM 改为 thread 0 单线程 TMA bulk store，255 线程提前退出 | ✅ | bs=8 causal +0.95%，全验证通过（2026-04-23）|
+| **20** | kBlockM=256 M-direction Streaming（尝试后因寄存器压力导致严重性能回退，暂时搁置） | ⏸️ | 搁置（2026-04-24）|
+| **21** | Opt A（N-loop 不变量提升：tCrQ+tCrSFA 移出循环）+ Opt C（split N-loop + if constexpr masking） | ✅ | bs=8 causal +0.7%，full +1.6%（2026-04-24）|
 
-详细历史记录见 `HISTORY.md`。最新基线性能（Phase 19，benchmark 055）：seq=4096 causal，FP8 **1123.6 TFLOPS** vs BF16 644.7 TFLOPS（**+74.3%**）；seq=4096 full：FP8 **629.7 TFLOPS** vs BF16 362.3 TFLOPS（**+73.8%**）。
+详细历史记录见 `HISTORY.md`。最新基线性能（Phase 21，benchmark 056）：seq=4096 causal，FP8 **1131.8 TFLOPS** vs BF16 647.0 TFLOPS（**+74.9%**）；seq=4096 full：FP8 **640.0 TFLOPS** vs BF16 365.6 TFLOPS（**+75.1%**）。
+
+---
+
+## Phase 21 COMPLETE：Opt A + Opt C — N-loop 不变量提升 + split N-loop（2026-04-24）
+
+### 优化内容
+
+**Opt A（N-loop 不变量提升）**：将 `tCrQ`（Q fragment，16 regs，来自 sQ_persist TMA）和 `tCrSFA`/`tCrSFA_frg`（Q scale factor，来自 smem_sfa_ptr TMA）从每 N-tile 重复加载改为在 N-loop 前一次性加载，消除每个 N-tile 的 4× ldmatrix + 1× LDS。
+
+- 安全性保证：`sQ_persist` 和 `smem_sfa_ptr` 由 Q+SFA TMA 写入（Phase 15 迁移到 math warp），在 S2 `wait_mbar_parity(q_tma_mbar_ptr, 0)` 之后对全部 math warp 可见，N-loop 期间不再修改。
+- **不提升 tCrSFP**：`smem_sfp_ptr` 由分布式线程写（`for i = tidx_math: smem_sfp_ptr[i] = 0x7f7f7f7f`），提升后 SFP copy 在写入后无显式 barrier，导致 H=4 配置出现 fp8_gt_cos=0.9918 的 race condition。已恢复 per-tile（利用 mbarrier wait + GEMM1 ~500 cycles 隐式可见性）。
+
+**Opt C（split N-loop + if constexpr masking）**：将 N-loop 主体封装为 `run_n_tile` lambda（`auto kIsMasking_c` 模板参数），对 `Is_causal && !Is_arbitrary && !Is_local` 拆分为：
+- Phase 1：前 `n_masking_steps` 个 tile，`kIsMasking=true`，`apply_mask_bs` 编译入
+- Phase 2：剩余 tile，`kIsMasking=false`，`if constexpr` 死代码消除 `apply_mask_bs` 调用
+
+### 验证结果
+
+- [x] sweep_accuracy.py：全部 fp8_gt_cos ≥ 0.9996（日志 `1test_results/090_phase21_optA_optC_fix.log`）
+- [x] run_hstu8_examples.sh：14/14 PASS
+- [x] benchmark 056：见下表
+
+**性能结果（benchmark 056，RTX PRO 6000 Blackwell SM120）**：
+
+| Config | BF16 TFLOPS | FP8 TFLOPS | FP8 vs BF16 | vs Phase 19 |
+|--------|-------------|------------|-------------|-------------|
+| bs=8 seq=4096 h=16 causal | 647.0 | **1131.8** | **+74.9%** | **+0.7%** |
+| bs=4 seq=4096 h=16 causal | 621.4 | **1075.7** | **+73.1%** | +0.7% |
+| bs=1 seq=4096 h=16 causal | 476.1 | 853.3 | +79.2% | -2.2% |
+| bs=8 seq=4096 h=16 full | 365.6 | **640.0** | **+75.1%** | **+1.6%** |
+| bs=8 seq=2048 h=16 full | 335.2 | 612.0 | +82.6% | ~0% |
+
+收益主要来自大 batch（bs=8）：减少每 tile 的 SMEM load 指令数，SMEM bank 压力略降，IPC 微升。bs=1 小幅回退可能是 GPU 调度 variance。主瓶颈（No Eligible stall ~63%，mbarrier wait 主导）未变。
+
+---
+
+## Phase 20 搁置记录：kBlockM=256 M-direction Streaming（2026-04-24）
+
+### 搁置原因
+
+**根本约束**：kNMSubtiles=2 时，`acc_o_0`（64 F32）和 `acc_o_1`（64 F32）共 128 个寄存器全程活跃，是不可规避的硬性约束。
+
+**寄存器压力分析**：
+
+| 阶段 | 固定活跃 regs | 峰值额外 | 总峰值 | vs 232（setmaxnreg math） |
+|------|-------------|---------|--------|------------------------|
+| GEMM1（全 K） | acc_o_0+o_1=128, acc_s=64, SFA/SFB=20, 杂项=15 | tCrK=128 | **355** | +123 → **严重 spill** |
+| GEMM2（全 K） | acc_o_0+o_1=128, acc_s_packed=16, SFP/SFV=16, 杂项=15 | tCrV=128 | **303** | +71 → **严重 spill** |
+
+**N-streaming=2 分析**（尝试将 N-loop 内 tCrK live range 从 128 降至 32）：
+- GEMM1 k_step peak = 128+64+4+32+20+15 = **263 regs > 232** → GEMM1 仍 spill
+- GEMM2 k_step peak = 128+16+4+32+16+15 = **211 regs < 232** → GEMM2 可 fit
+- 结论：即使做 K-step streaming，GEMM1 阶段仍无法避免 spill，kBlockM=256 根本不可行
+
+**实测性能（benchmark 057/058）**：
+
+| 版本 | bs=8 seq=4096 h=16 causal | vs Phase 19 |
+|------|--------------------------|-------------|
+| Phase 19 基线 | **1123.6 TFLOPS** | — |
+| Phase 20b（kBlockM=256 直接实现） | ~524 TFLOPS | **-53%** |
+| Fix A（K-step streaming） | ~524 TFLOPS | **-53%** |
+| Fix B（进一步调整） | ~366 TFLOPS | **-67%** |
+
+### 结论
+
+kBlockM=256 路线在当前 setmaxnreg=232 约束下不可行。唯一突破路径是大幅削减 acc_o 之外的寄存器用量（例如将 K/V fragment 完全流式化到 SMEM，每步只保留极少 regs），目前尚无可行方案。**暂时搁置，维持 Phase 19 为当前基线。**
 
 ---
 
