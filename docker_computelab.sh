@@ -14,9 +14,11 @@ docker run -p 9527:22 --rm \
         --gpus all \
         --shm-size=512m \
         -it \
-        --name trtllm_minyu \
+        --name minyu \
         -v /home/scratch.minyu_gpu/:/home/scratch.minyu_gpu/ \
         -v /home/scratch.trt_llm_data/:/home/scratch.trt_llm_data/ \
+        -v /home/scratch.svc_compute_arch/:/home/scratch.svc_compute_arch/ \
+        -v /home/scratch.junyiq_gpu_1/:/home/scratch.junyiq_gpu_1/ \
         -v /home/minyu/:/home/minyu/ \
         -v /home/tools_ai/:/home/tools_ai/ \
         hstu:minyu

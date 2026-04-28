@@ -1,0 +1,18 @@
+# workload_hstu_sm120.yml — Smart Amodel workload for HSTU SM120 FP8 WS kernel.
+#
+# Used by launch_smart_hstu.sh in --workload mode (alternative to trace collection).
+# The binary runs on LSF compute nodes — ensure all paths are accessible on NFS.
+#
+# DumpControl captures the 4th invocation (frange=3:3, 0-indexed) of any
+# hstu_fwd_kernel_sm120_fp8_ws_tma* instantiation.
+#
+# Adjust PYTHONUSERBASE and paths to match your scratch space if different.
+
+hstu_sm120:
+  fp8-ws-causal:
+    binary: /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/perfsim/run_hstu_kernel_once.sh
+    DumpControl: "(func=hstu_fwd_kernel_sm120_fp8_ws_tma\\w*&frange=3:3)"
+    env:
+      PYTHONUSERBASE: /home/scratch.minyu_gpu/project/.cache/pip-user
+      HSTU_ARCH_PYSITE: /home/scratch.minyu_gpu/project/.cache/pip-user/lib/python3.12/site-packages
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
