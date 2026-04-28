@@ -100,7 +100,7 @@ constexpr std::tuple<int, int, int> get_tile_size_fwd_sm120() {
       if constexpr (Headdim <= 64) {
         return {128, 64, 8};
       } else if constexpr (Headdim == 128) {
-        return {128, 64, 8};
+        return {128, 128, 8};
       } else {
         return {64, 64, 8};
       }

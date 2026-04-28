@@ -264,28 +264,28 @@ for D in [128]:  # D=64 disabled in this build (HSTU_DISABLE_HDIM64=TRUE)
 
             if GEMM1_ONLY:
                 # Python reference: accumulate Q×K^T tiles the same way the kernel does.
-                # Each tile [kBlockM × kBlockN] is summed into a [kBlockM × kHeadDim] buffer.
-                kBM, kBN = 128, 128
-                q_f = q.float()   # [SEQ, H, D]
-                k_f = k.float()
-                n_m = (SEQ + kBM - 1) // kBM
-                n_n = (SEQ + kBN - 1) // kBN
-                gt_b = torch.zeros(SEQ, H, D, dtype=torch.float32, device=DEVICE)
-                gt_f = torch.zeros(SEQ, H, D, dtype=torch.float32, device=DEVICE)
-                for im in range(n_m):
-                    q_tile = q_f[im*kBM:(im+1)*kBM]   # [kBM, H, D]
-                    qfp_tile = q.to(torch.float8_e4m3fn).float()[im*kBM:(im+1)*kBM]
-                    for in_ in range(n_n):
-                        k_tile = k_f[in_*kBN:(in_+1)*kBN]  # [kBN, H, D]
-                        kfp_tile = k.to(torch.float8_e4m3fn).float()[in_*kBN:(in_+1)*kBN]
-                        # s_tile: [actual_m, H, actual_n] → accumulate into [:actual_n] cols
-                        s_b_tile = torch.einsum("mhd,nhd->mhn", q_tile, k_tile)
-                        s_f_tile = torch.einsum("mhd,nhd->mhn", qfp_tile, kfp_tile)
-                        actual_n = s_b_tile.shape[2]  # may be < kBN at sequence boundary
-                        gt_b[im*kBM:(im+1)*kBM, :, :actual_n] += s_b_tile
-                        gt_f[im*kBM:(im+1)*kBM, :, :actual_n] += s_f_tile
-                gt_b = (gt_b / SEQ).flatten()
-                gt_f = (gt_f / SEQ).flatten()
+                # Each tile [kBlockM × kBlockN] is summed into a [kBlockM × kHeadDim]
+                # buffer starting at column 0.  BF16 and FP8 can use different kBlockN
+                # on SM120, so build their debug references separately.
+                def gemm1_debug_reference(q_src: torch.Tensor, k_src: torch.Tensor, k_bn: int):
+                    k_bm = 128
+                    q_f = q_src.float()
+                    k_f = k_src.float()
+                    n_m = (SEQ + k_bm - 1) // k_bm
+                    n_n = (SEQ + k_bn - 1) // k_bn
+                    gt = torch.zeros(SEQ, H, D, dtype=torch.float32, device=DEVICE)
+                    for im in range(n_m):
+                        q_tile = q_f[im*k_bm:(im+1)*k_bm]
+                        for in_ in range(n_n):
+                            k_tile = k_f[in_*k_bn:(in_+1)*k_bn]
+                            s_tile = torch.einsum("mhd,nhd->mhn", q_tile, k_tile)
+                            actual_n = s_tile.shape[2]
+                            gt[im*k_bm:(im+1)*k_bm, :, :actual_n] += s_tile
+                    return (gt / SEQ).flatten()
+
+                gt_b = gemm1_debug_reference(q, k, 128)
+                gt_f = gemm1_debug_reference(
+                    q.to(torch.float8_e4m3fn), k.to(torch.float8_e4m3fn), 128)
                 cos_b_gt, me_b_gt, _ = metric_report(o_b, gt_b)
                 cos_f_gt, me_f_gt, _ = metric_report(o_f, gt_f)
                 print(
