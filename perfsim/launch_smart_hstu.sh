@@ -21,6 +21,28 @@ TRACE="${PERFSIM_DIR}/traces/hstu_latest_cuda.tgz"
 USE_SMART2=1
 export PATH="${PERFSIM_DIR}/tools:${PATH}"
 
+LSF_PROFILE="${LSF_PROFILE:-/home/lsf_linux/conf/profile.lsf}"
+if [[ -z "${LSF_SERVERDIR:-}" ]]; then
+    if [[ ! -f "${LSF_PROFILE}" ]]; then
+        echo "ERROR: LSF_SERVERDIR is unset and LSF profile not found: ${LSF_PROFILE}" >&2
+        exit 1
+    fi
+
+    echo "Loading LSF profile: ${LSF_PROFILE}"
+    set +e
+    set +u
+    # flow.smart submits LSF jobs in later stages; some login shells do not load LSF.
+    # shellcheck source=/home/lsf_linux/conf/profile.lsf
+    source "${LSF_PROFILE}"
+    LSF_SOURCE_STATUS=$?
+    set -euo pipefail
+
+    if [[ -z "${LSF_SERVERDIR:-}" ]]; then
+        echo "ERROR: failed to initialize LSF from ${LSF_PROFILE} (status=${LSF_SOURCE_STATUS})" >&2
+        exit 1
+    fi
+fi
+
 if [[ ! -x "${FLOW_SMART}" ]]; then
     echo "ERROR: flow.smart not found at: ${FLOW_SMART}" >&2
     exit 1
