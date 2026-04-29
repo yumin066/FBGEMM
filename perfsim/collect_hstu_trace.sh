@@ -51,12 +51,12 @@ strip_ld_path_entry() {
 }
 
 # ── Parse args ────────────────────────────────────────────────────────────────
-BS=8
-SEQ=4096
-HEADS=16
+BS=1
+SEQ=1024
+HEADS=1
 HEADDIM=128
-CAUSAL_FLAG="--causal"
-FRANGE="3:6"      # 4th invocation (skip 3 init/warmup launches), 0-indexed
+CAUSAL_FLAG=""
+FRANGE="3:3"      # 4th invocation (skip 3 init/warmup launches), 0-indexed
 ITERS=6           # total invocations (must be > frange end)
 
 while [[ $# -gt 0 ]]; do
