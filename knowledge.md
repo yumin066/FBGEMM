@@ -65,6 +65,43 @@
 
 ---
 
+## 22. FP8 WS persistent wrapper 的 SMEM 对齐约束
+
+**现象**：把 FP8 WS kernel 改成 persistent loop 时，如果在 kernel wrapper 中新增普通 `__shared__ int` 保存 next tile，首个 FP8 case 会报 `misaligned address`。
+
+**原因**：
+- WS body 使用 `extern __shared__ char smem_[]` 作为 K/V/Q-persist/SF/mbarrier 的绝对地址基准。
+- K/V/Q-persist 路径依赖 SW128/TMA 的绝对地址对齐，尤其 Q-persist offset 按 2048B swizzle period 设计。
+- wrapper 里的 static shared memory 会改变 dynamic shared memory 的绝对起点；即使手动 padding static shared，也不能假设 compiler 最终布局满足 WS 的绝对对齐要求。
+
+**修复原则**：
+- persistent wrapper 不要新增普通 static shared memory。
+- 需要在 CTA 内广播 next tile 时，可以在 tile 结束、所有线程 `__syncthreads()` 后临时复用 dynamic SMEM 的首字节；读出 next tile 后再同步一次，确保没有线程进入下一轮 compute 覆写该位置。
+- 如果后续改为更高性能的 next-work prefetch，应把状态放进既有 WS shared layout 的显式保留区域，并把 offset 纳入 `Kernel_traits::kSmemSize`/alignment 计算。
+
+---
+
+## 23. FP8 WS causal 静态首尾配对 queue
+
+**结论**：对 pure causal no-RAB FP8 WS，首尾配对的静态 launch order 比 persistent wrapper 更稳。
+
+**有效做法**：
+- pure causal launch 使用一维 `grid.x = total_tiles`；
+- `blockIdx.x` 映射为 `0, total_tiles-1, 1, total_tiles-2, ...`；
+- full/local/context/target/arbitrary 保持原始三维 grid，避免无收益路径被 causal queue 影响。
+
+**原因**：
+- causal 的 M tile 工作量从重到轻变化，原始顺序容易在 wave/tail 上产生不均；
+- heavy/light 交错可以静态拉平 launch order；
+- 不把 `hstu_compute_attn_1rowblock_sm120_fp8_ws` 包进 persistent loop，就不会因为 inline body 跨 tile 循环而引入 `STACK`/`LDL`/`STL`。
+
+**已拒绝做法**：
+- dynamic persistent queue：correctness 可过，但需要 tile 间 CTA sync/atomic，收益小且波动；
+- paired persistent loop：causal 有单次高分，但 full 回退，SASS 出现 stack/local spill；
+- wrapper 中 static shared state：会移动 dynamic SMEM 起点，破坏 SW128/TMA 绝对对齐。
+
+---
+
 ## 15. Context Parallel（CP）原理与梯度缩放
 
 **定义**：Context Parallel（CP）是把序列维度（context/tokens）切分到多个 rank 上，每个 rank 只处理该序列的一段 token。与 TP（切 hidden 维）和 PP（切层）不同，CP 主要切的是 `seq_len` 维度。
@@ -423,11 +460,11 @@ Consumer warpgroup 直接用 WGMMA 从 SMEM 描述符读数据
 
 | 架构 | hdim=128, 无 RAB | hdim=128, 有 RAB |
 |------|-----------------|-----------------|
-| **SM120 BF16** | `{128, 64, 8}` | `{128, 64, 8}` |
-| **SM120 FP8** | `{128, 64, 8}` | `{128, 64, 4}` |
+| **SM120 BF16** | `{128, 128, 8}` | `{64, 64, 4}` |
+| **SM120 FP8** | `{128, 128, 8}` | `{128, 128, 8}` |
 | **SM80 BF16** | `{128, 64, 8}` | `{64, 64, 4}` |
 
-**注**：`{kBlockM, kBlockN, kNWarps}`。RAB（Relative Attention Bias）为 BF16，会占用额外 SMEM，导致 FP8 + RAB 的 kNWarps 从 8 降到 4。
+**注**：`{kBlockM, kBlockN, kNWarps}`。RAB（Relative Attention Bias）为 BF16，会占用额外 SMEM；具体 tile 以 `utils.h::get_tile_size_fwd_sm120` 为准。
 
 ---
 
@@ -1665,3 +1702,26 @@ HSTU FP8 的 V-operand bug 根因：
 - 代码侧：缩短 live range（`__syncthreads`/作用域拆分）、减少大块模板同时存活，比单纯依赖 `setmaxnreg` 更直接。
 
 ---
+
+## 18. Phase 22：BF16 默认路径优化结论
+
+Phase 22 第一轮结论：当前待提交 diff 只保留默认 BF16 cp.async 路径中的有效性能改动，不保留 BF16 WS/TMA 实验代码。
+
+保留结论：
+- BF16 no-RAB、headDim=128 默认主配置从 `{kBlockM=128, kBlockN=64, kNWarps=8}` 切到 `{kBlockM=128, kBlockN=128, kNWarps=8}`。
+- 长序列 benchmark 有实际收益：`bs=8 seq=4096 h=16 full` 约 `365.0 -> 377.8/379.1 TFLOPS`，causal 约 `648.3 -> 656.3/656.8 TFLOPS`。
+- BF16 GEMM1-only debug reference 必须跟随当前 BF16 `kBlockN`。Phase 22 默认 BF16 no-RAB headDim128 已切到 `kBlockN=128`。
+- BF16 默认路径已经使用 LDSM：Q/K 使用 `SM75_U32x4_LDSM_N`，V transposed view 使用 `SM75_U16x8_LDSM_T`。本轮性能提升不是由新增 LDSM 带来的。
+
+已回退的实验结论：
+- BF16 WS/TMA correctness 可以成立，但性能显著低于默认 cp.async；不作为当前性能路径。
+- Q SMEM reuse 可行，但需要严格延迟 release；过早释放会在随机数据 GEMM1 中出现不稳定错误。
+- BF16 O TMA store 可行，但 benchmark 基本不变，说明该实验路径的主要瓶颈不在 epilogue store。
+- FP8 WS 的手写 `stmatrix.sync.aligned.x4.m8n8.shared.b16` 输出路径不能直接用于 BF16。FP8 路径依赖 SM120 QMMA C fragment 的 `PermMmaTileN` 排列；BF16 使用 SM80 `mma.sync` C fragment，直接套用会导致输出重排，实测 `bf16_gt_cos` 约 0.27-0.36。
+- BF16 WS/TMA 若后续重启，需要先解决 TMA descriptor 对任意 `cu_seqlens` offset 的安全性，以及双缓冲 SMEM 压力和 load/math warp 同步开销。
+- 单缓冲 BF16 路径尝试把 K_next `cp.async` 提前到 GEMM1 后：不加 CTA barrier 会因为部分 warp 提前覆盖 `sK` 而导致 SEQ=512 BF16 correctness 下降；加 GEMM1 后 barrier 后 correctness 恢复，但 `bs=8 seq=4096 h=16` kernel-only 从 107 基线 full `377.8`/causal `656.3` TFLOPS 降到 full `369.3`/causal `644.5` TFLOPS。该单缓冲提前预取方案不保留。
+- K-only ping-pong SMEM 从容量上可行：BF16 no-RAB hdim128 当前 dynamic SMEM 为 64KB，额外 K stage 后约 96KB，低于 SM120 当前 100KB/SM 配置上限。实测 correctness 通过（`1test_results/261_phase22_bf16_konly_double_buffer_accuracy.log`、`262_phase22_bf16_konly_double_buffer_hstu_test_main.log`），但 benchmark 无稳定收益：`2benchmark_results/109_phase22_bf16_konly_double_buffer_kernel.log` 为 full `372.4`/causal `650.8` TFLOPS，repeat `110_phase22_bf16_konly_double_buffer_repeat.log` 为 full `370.6`/causal `648.0` TFLOPS，低于 107 基线 full `377.8`/causal `656.3`。该方案不保留。
+- BF16 no-RAB hdim128 causal 的 2CTA occupancy 候选 `{kBlockM=64, kBlockN=64, kNWarps=4}` 必须配合 `__launch_bounds__(128, 2)` 检查 SASS。当前候选 SASS：`4sass_dump_ws/hstu_fwd_kernel_sm120_bf16_hdim128_causal_tile64x64x4_lb2.sass`，`cuobjdump --dump-resource-usage` 显示 `REG:199 STACK:0 LOCAL:0`，SASS 中 `LDL/STL` 计数为 0；说明编成 2CTA 目标没有引入 register spill。该候选 benchmark 不稳定，不能只凭 quick run 认定有收益，后续必须用 NCU 确认实际 occupancy 和 stall 分布。
+- BF16 no-RAB hdim128 causal 的 `{kBlockM=128, kBlockN=64, kNWarps=4} + __launch_bounds__(128, 2)` 候选已验证不应保留。SASS：`4sass_dump_ws/hstu_fwd_kernel_sm120_bf16_hdim128_causal_tile128x64x4_lb2.sass`，`cuobjdump --dump-resource-usage` 为 `REG:255 STACK:200 LOCAL:0`，SASS 中 `LDL=57`、`STL=55`。`hstu_test.py` BF16 主用例通过（`1test_results/266_phase22_bf16_tile128x64x4_lb2_hstu_test_main.log`），但 `bs=8 seq=4096 h=16` kernel-only benchmark（`2benchmark_results/117_phase22_bf16_causal_tile128x64x4_lb2_kernel.log`）显示 full `376.8`、causal `496.7 TFLOPS`；causal 相对 107 基线 `656.3 TFLOPS` 大幅回退，主要原因是 2CTA launch bound 下寄存器压力过高导致 spill。
+- BF16 no-RAB hdim128 causal 的 `{64,128,4} + K/V SMEM alias + __launch_bounds__(128,2)` 已验证不保留。该方案把 K/V 共用同一块 SMEM，SASS 无 spill（`REG:230 STACK:0 LOCAL:0`，`LDL/STL=0`，`4sass_dump_ws/hstu_fwd_kernel_sm120_bf16_hdim128_causal_tile64x128x4_kv_alias_lb2.sass`），correctness 通过（`1test_results/268_phase22_bf16_tile64x128x4_kv_alias_lb2_hstu_test_main.log`、`269_phase22_bf16_tile64x128x4_kv_alias_lb2_accuracy.log`），但 benchmark `bs=8 seq=4096 h=16` causal 只有 `580.0 TFLOPS`（`2benchmark_results/119_phase22_bf16_tile64x128x4_kv_alias_lb2_kernel_repeat.log`）。NCU（`3profile_results/059_phase22_bf16_tile64x128x4_kv_alias_lb2_causal_ncu_bf16.csv`）显示 dynamic SMEM 为 `32768B`、active warps/scheduler 仍为 `1.93`，且 `No Eligible` 从 `{64,64,4}+lb2` 的 `78.12%` 恶化到 `81.02%`；延后 V load 破坏了原先 overlap。
+- BF16 no-RAB hdim128 causal 的 `{64,64,4} + __launch_bounds__(128,3)` 已验证不保留。该方案无 spill（`REG:168 STACK:0 LOCAL:0`，`LDL/STL=0`，`4sass_dump_ws/hstu_fwd_kernel_sm120_bf16_hdim128_causal_tile64x64x4_lb3.sass`），correctness 通过（`1test_results/270_phase22_bf16_tile64x64x4_lb3_hstu_test_main.log`、`271_phase22_bf16_tile64x64x4_lb3_accuracy.log`）。NCU（`3profile_results/060_phase22_bf16_tile64x64x4_lb3_causal_ncu_bf16.csv`）显示 active warps/scheduler 提升到 `2.80`、achieved occupancy `23.36%`、No Eligible 降到 `75.92%`；但同环境 benchmark 不赢默认 `{128,128,8}`：`bs=8 seq=4096 h=16` causal 为 `653.0 TFLOPS`（`2benchmark_results/120_phase22_bf16_tile64x64x4_lb3_kernel.log`），默认 baseline 为 `668.6 TFLOPS`（`2benchmark_results/121_phase22_bf16_baseline_kbn128_sameenv_kernel.log`）；`bs=4 seq=2048 h=16` causal 也基本持平/略低（`507.9` vs baseline `508.7 TFLOPS`，`122/123`）。提高 occupancy 本身不足以抵消更小 M/N tile 的额外开销。

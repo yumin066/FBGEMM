@@ -1281,8 +1281,32 @@ __global__ void __launch_bounds__(Kernel_traits::kNThreads, 1)
 hstu_fwd_kernel_sm120_fp8_ws_tma(
     __grid_constant__ Hstu_fwd_params_fp8_ws_tma<TMA_Q_t, TMA_K_t, TMA_Vt_t,
                                                   TMA_SFA_t, TMA_SFB_t, TMA_SFV_t, TMA_O_t> const params) {
-  int m_block = gridDim.x - blockIdx.x - 1;
-  int bidh    = blockIdx.y;
-  int bidb    = blockIdx.z;
+  constexpr int kBlockM = Kernel_traits::kBlockM;
+  const int num_m_block = (params.seqlen_q + kBlockM - 1) / kBlockM;
+  const int total_tiles = num_m_block * params.h * params.b;
+  constexpr bool Use_paired_static_queue =
+      Kernel_traits::Is_causal &&
+      !Kernel_traits::Is_target &&
+      !Kernel_traits::Is_context &&
+      !Kernel_traits::Is_local &&
+      !Kernel_traits::Is_arbitrary;
+
+  if constexpr (!Use_paired_static_queue) {
+    int m_block = gridDim.x - blockIdx.x - 1;
+    int bidh    = blockIdx.y;
+    int bidb    = blockIdx.z;
+    hstu_compute_attn_1rowblock_sm120_fp8_ws<Kernel_traits>(params, bidb, bidh, m_block);
+    return;
+  }
+
+  const int tile_pair = int(blockIdx.x) >> 1;
+  const bool use_paired_tile = (int(blockIdx.x) & 1) != 0;
+  const int tile = use_paired_tile ? (total_tiles - 1 - tile_pair) : tile_pair;
+  const int m_linear = tile % num_m_block;
+  const int bh = tile / num_m_block;
+  const int bidh = bh % params.h;
+  const int bidb = bh / params.h;
+  const int m_block = num_m_block - 1 - m_linear;
+
   hstu_compute_attn_1rowblock_sm120_fp8_ws<Kernel_traits>(params, bidb, bidh, m_block);
 }

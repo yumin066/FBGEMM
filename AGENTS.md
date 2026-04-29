@@ -24,6 +24,14 @@
 - Q/K 用于 GEMM1，K 方向为 headDim=128；V 用于 GEMM2，K 方向为 `kBlockN=128`。
 - scale factor 为 e8m0，每 128 个 K 元素对应 1 个 scale；4 个连续块打包为 1 个 `int32`。
 
+当前 FP8 WS Phase 23 状态：
+
+- FP8 WS pure causal no-RAB 路径使用静态首尾配对 launch queue：`blockIdx.x` 映射为 `0, total_tiles-1, 1, total_tiles-2, ...`，用于拉平 causal heavy/light tile 的 wave/tail。
+- FP8 WS full、local、context、target、arbitrary 等其他实例保持原始三维 grid：`dim3(num_m_block, h, b)`。
+- 不保留 dynamic persistent work queue：correctness 可过，但 tile 间需要 CTA sync/atomic，性能收益小且波动。
+- 不保留 paired persistent wrapper loop：causal 有单次高分，但会让 inline WS body 出现 `STACK`/`LDL`/`STL` spill，full 明显回退。
+- 若后续继续做真正 persistent kernel，应先把 `hstu_compute_attn_1rowblock_sm120_fp8_ws` 拆成 producer/consumer/store 三段，而不是在 wrapper 中循环调用整个 inline body。
+
 ## 核心路径
 
 主要代码目录：
@@ -86,7 +94,21 @@ pip install ... 2>&1 | grep -E "error:|note:|static_assert|undefined" | head -60
 HSTU_SWEEP_FP8_QUANT_MODE=2 python /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/sweep_accuracy.py 2>&1 | tee /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/1test_results/NNN_xxx.log
 ```
 
-判定标准：各配置 `fp8_gt_cos >= 0.995`，当前优良基线通常 `>= 0.9996`。
+判定标准：各配置 `fp8_gt_cos >= 0.995`，当前优良基线通常 `>= 0.9996`；BF16 路径应关注 `bf16_gt_cos` 和 `bf16_gt_max`，不要只看 `bf16_fp8_cos`。
+
+BF16 正确性应优先使用 `hstu_test.py` 的 `HSTU16Test`，不要用 `run_hstu8_examples.sh` 作为 BF16 结论。当前常用构建关闭了 hdim32/64/256，因此 BF16 定向测试应先选 `attn_hidden_dims=(128, 128)`：
+
+```bash
+PYTHONPATH=/home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/fbgemm_gpu/experimental/hstu python /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/fbgemm_gpu/experimental/hstu/test/hstu_test.py 2>&1 | tee /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/1test_results/NNN_bf16_hstu16_single.log
+```
+
+完整 Hypothesis BF16 测试入口如下；如果当前构建禁用了 hdim64，先不要直接跑完整入口，除非同步调整测试参数或重新构建启用 hdim64：
+
+```bash
+PYTHONPATH=/home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/fbgemm_gpu/experimental/hstu python -m pytest -q /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/fbgemm_gpu/experimental/hstu/test/hstu_test.py::HSTU16Test::test_hstu_attn 2>&1 | tee /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/1test_results/NNN_bf16_hstu16_hypothesis.log
+```
+
+BF16 WS/TMA 实验路径已验证 correctness 但性能低于默认 cp.async，不作为默认性能路径；当前 BF16 性能优化应优先针对默认 cp.async `kBlockN=128` 路径。
 
 example cases：
 
@@ -94,7 +116,7 @@ example cases：
 bash /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/run_hstu8_examples.sh
 ```
 
-判定标准：`14/14 passed`。
+该脚本覆盖 HSTU8/FP8 block-scale 示例，判定标准：`14/14 passed`；它不替代 BF16 的 `HSTU16Test`。
 
 benchmark：
 
@@ -124,6 +146,11 @@ cd /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu
 
 SASS 中重点搜索 `LDL`/`STL` 以定位 register spill。
 
+Phase 23 FP8 WS SASS 参考：
+
+- `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full_static_launch_pair.sass`：full 实例 `REG:168 STACK:0 LOCAL:0`，`LDL/STL=0`。
+- `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_causal_static_launch_pair.sass`：causal 实例 `REG:168 STACK:0 LOCAL:0`，`LDL/STL=0`。
+
 ## 性能分析重点
 
 - `launch__registers_per_thread`
@@ -135,6 +162,7 @@ SASS 中重点搜索 `LDL`/`STL` 以定位 register spill。
 - SM 利用率
 - SMEM bank conflict
 - Block Limit SMEM；当前 FP8 WS 路径受约 85KB SMEM/CTA 限制，通常为 1 CTA/SM。
+- FP8 WS static launch pair 下一步应跑 NCU，重点确认 tail wave 是否改善，以及 No Eligible/Long Scoreboard 是否变化。
 
 跑性能数据前可锁频：
 
@@ -155,7 +183,7 @@ sudo nvidia-smi -rgc
 1. `gemm1_only + all_ones`
    - 设置 `params.debug_gemm1_only=true`。
    - Q/K/SFA/SFB 全设为 1，e8m0 为 `0x3F`。
-   - 预期 `acc_o` 所有元素为 `kHeadDim = 128`。
+   - 预期应按当前 dtype 的 `kBlockN` 构造 reference：Phase 22 默认 BF16 no-RAB headDim128 已切到 `kBlockN=128`；FP8 no-RAB headDim128 通常也是 `kBlockN=128`。如果后续重新实验 BF16 `kBlockN=64`，必须同步更新 debug reference。
    - 失败则在 GEMM1 前后观察 Q/K/SFA/SFB fragment。
 
 2. `gemm1_only` 真实数据
@@ -165,7 +193,7 @@ sudo nvidia-smi -rgc
 
 3. 全链路 `all_ones`
    - Q/K/V/SFA/SFB/SFV 全设为 1。
-   - 预期输出为 `kBlockN * kHeadDim = 128 * 128 = 16384 * alpha * silu(alpha)`。
+   - 预期输出为 `actual_valid_k * kHeadDim * alpha * silu(alpha * kHeadDim)`；例如无 mask、seq=128、headDim=128、alpha=1 时为 `128 * 128 = 16384`。
 
 插入 printf 时使用 guard，避免刷屏：
 

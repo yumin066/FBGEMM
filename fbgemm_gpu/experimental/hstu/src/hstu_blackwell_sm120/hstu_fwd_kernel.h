@@ -1511,7 +1511,12 @@ void run_hstu_fwd_sm120_fp8_ws_tma_impl(Hstu_fwd_params& params, cudaStream_t st
 
   size_t smem_size = Kernel_traits::kSmemSize;
   const int num_m_block = (params.seqlen_q + kBlockM - 1) / kBlockM;
-  dim3 grid = dim3(num_m_block, params.h, params.b);
+  const int total_tiles = num_m_block * params.h * params.b;
+  static constexpr bool Use_paired_static_queue =
+      Is_causal && !Is_target && !Is_context && !Is_local && !Is_arbitrary;
+  dim3 grid = Use_paired_static_queue
+      ? dim3(total_tiles)
+      : dim3(num_m_block, params.h, params.b);
   auto kernel = &flash::hstu_fwd_kernel_sm120_fp8_ws_tma<
       Kernel_traits, TMA_Q_t, TMA_K_t, TMA_Vt_t, TMA_SFA_t, TMA_SFB_t, TMA_SFV_t, TMA_O_t>;
 
