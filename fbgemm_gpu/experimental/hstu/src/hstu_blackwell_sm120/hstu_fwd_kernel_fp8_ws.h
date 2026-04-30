@@ -1057,7 +1057,102 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       // and kIsMasking=false (Phase 2, steady-state unmasked) to allow compile-time dead-code
       // elimination of apply_mask_bs in the hot path.  n_valid_ref is modified in-place by
       // the is_jump adjustment; math_stage persists across tiles and flips after every N tile.
-      auto run_n_tile = [&](int nb, int& n_valid_ref, int masking_step, auto kIsMasking_c) {
+      constexpr bool kStoreOInMainloop =
+          Is_causal && !Is_target && !Is_context && !Is_arbitrary && !Is_local;
+      bool o_epilogue_done = false;
+      auto store_o_epilogue = [&]() {
+        for (int i = 0; i < size(acc_o); ++i) acc_o(i) /= params.scaling_seqlen;
+        using OutElement = typename Kernel_traits::OutputType;
+        Tensor rO = make_tensor_like<OutElement>(acc_o);
+        flash::convert_type_safe(acc_o, rO);
+
+        static_assert(
+            Kernel_traits::kSmemWsOBytes >= kBlockM * kHeadDim * (int)sizeof(OutElement),
+            "Independent O SMEM buffer is too small.");
+        char* smem_o = reinterpret_cast<char*>(smem_) + Kernel_traits::kSmemWsOOffset;
+
+        // Wait until the independent O buffer is no longer owned by the previous TMA store.
+        wait_mbar_parity(
+            smem_base32 + (uint32_t)kSmemMbar0Offset + 96u,
+            (uint32_t)o_empty_wait_parity);
+        o_empty_wait_parity ^= 1;
+        Tensor sO_flat = make_tensor(
+            make_smem_ptr(reinterpret_cast<OutElement*>(smem_o)),
+            Layout<Shape<Int<kBlockM>, Int<kHeadDim>>, Stride<Int<kHeadDim>, _1>>{});
+        {
+          // stmatrix.sync.aligned.x4.m8n8.shared.b16: 8 warp-cooperative stores replace 32 STS.32.
+          //
+          // Layout invariants this asm relies on:
+          //   AtomLayout <_8,_1,_1>  -> 8 math warps all in M direction, warp covers rows [warp_m*16, warp_m*16+15]
+          //   PermMmaTileN <_8,_4,_4>:<_1,_32,_8>  -> N_sorted[j] = 32*(j%4) + 8*(j/4) for j=0..15
+          //   C-atom SM80_16x8_Row  -> rO_u32[2*j + m_grp] covers (M=warp_m*16+m_grp*8+lq, N=N_sorted[j]+lqt*2)
+          //   OutElement is 2-byte (BF16); sO_flat row-stride = kHeadDim * sizeof(OutElement) = 256 bytes.
+          static_assert(sizeof(OutElement) == 2, "stmatrix.m8n8.b16 requires 2-byte elements");
+
+          auto rO_u32 = recast<uint32_t>(rO);
+
+          const int lane        = tidx_math & 31;
+          const int lq          = lane >> 2;   // lane-quad (0..7): selects data row within 8x8 matrix
+          const int lqt         = lane & 3;    // lane-quad-thread (0..3): selects data col-group
+          const int warp_m      = tidx_math >> 5;  // M-warp index (0..7)
+          const int addr_row    = ((lq & 1) << 2) | lqt;  // STSM address-row within matrix (0..7)
+          const int mat_in_lane = lq >> 1;                 // which of 4 matrices this thread addresses
+
+          const uint32_t smem_base  = static_cast<uint32_t>(__cvta_generic_to_shared(smem_o));
+          constexpr uint32_t row_bytes = kHeadDim * (uint32_t)sizeof(OutElement);  // 256
+
+          CUTE_UNROLL
+          for (int m_grp = 0; m_grp < 2; ++m_grp) {
+            const uint32_t m_bytes = (uint32_t)(warp_m * 16 + m_grp * 8 + addr_row) * row_bytes;
+
+            CUTE_UNROLL
+            for (int n_grp = 0; n_grp < 4; ++n_grp) {
+              // This thread addresses row addr_row of matrix mat_in_lane,
+              // starting at N-column (n_grp*32 + mat_in_lane*8).
+              uint32_t stsm_addr = smem_base
+                  + m_bytes
+                  + (uint32_t)(n_grp * 32 + mat_in_lane * 8) * (uint32_t)sizeof(OutElement);
+
+              // Data: rb_k carries the uint32 whose N_sorted position is n_grp*32 + k*8.
+              // N_sorted[n_grp + k*4] = 32*(n_grp+k*4)%4 + 8*(n_grp+k*4)/4 = 32*n_grp + 8*k.
+              uint32_t rb0 = rO_u32[2 * (n_grp     ) + m_grp];
+              uint32_t rb1 = rO_u32[2 * (n_grp +  4) + m_grp];
+              uint32_t rb2 = rO_u32[2 * (n_grp +  8) + m_grp];
+              uint32_t rb3 = rO_u32[2 * (n_grp + 12) + m_grp];
+
+              asm volatile(
+                  "stmatrix.sync.aligned.x4.m8n8.shared.b16 [%0], {%1, %2, %3, %4};\n"
+                  : : "r"(stsm_addr), "r"(rb0), "r"(rb1), "r"(rb2), "r"(rb3) : "memory");
+            }
+          }
+        }
+
+        // For partial tiles (last tile of a varlen sequence): zero SMEM rows [valid_rows, kBlockM)
+        // so TMA bulk store does not write garbage to GMEM beyond actual_seqlen_q.
+        const int valid_rows = actual_seqlen_q - m_block * kBlockM;
+        if (valid_rows < kBlockM) {
+          // Ensure all STSM stores are complete before any warp zeros OOB rows.
+          // Full tiles skip this: o_ready is initialized with count=8, so the O-store warp
+          // cannot proceed until each math warp has arrived after its own STSM stores.
+          asm volatile("bar.sync 1, 256;\n" : : : "memory");
+          const int oob_elems = (kBlockM - valid_rows) * kHeadDim;
+          OutElement* sO_raw = reinterpret_cast<OutElement*>(smem_o) + valid_rows * kHeadDim;
+          for (int i = tidx_math; i < oob_elems; i += kNMathThreads)
+            sO_raw[i] = OutElement(0);
+          asm volatile("bar.sync 1, 256;\n" : : : "memory");  // OOB zeros visible before TMA.
+        }
+
+        // Produce o_ready[0]. O-store warp owns the TMA store and releases
+        // o_empty[0] after the store completes.
+        if ((tidx_math & 31) == 0) {
+          const uint32_t o_ready_addr =
+              smem_base32 + (uint32_t)kSmemMbar0Offset + 80u;
+          arrive_mbar(o_ready_addr);
+        }
+      };
+
+      auto run_n_tile = [&](int nb, int& n_valid_ref, int masking_step, bool store_o_after,
+                            auto kIsMasking_c) {
         constexpr bool kIsMasking = decltype(kIsMasking_c)::value;
 
         // Stage-dependent SMEM pointers — pure pointer arithmetic, no TMA dependency.
@@ -1409,6 +1504,12 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         if (is_jump && masking_step == n_masking_steps - 1)
           n_valid_ref = std::min(n_valid_ref, n_block_history);
         math_stage ^= 1;
+        if constexpr (kStoreOInMainloop) {
+          if (store_o_after) {
+            store_o_epilogue();
+            o_epilogue_done = true;
+          }
+        }
       };  // end run_n_tile lambda
 
       // N-loop (Opt C): for causal (not arbitrary, not local), split into masked Phase 1
@@ -1419,113 +1520,33 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         int masking_step = 0;
         // Phase 1: causal diagonal tiles — apply_mask_bs compiled in (kIsMasking=true).
         for (; n_valid >= n_block_min && masking_step < n_masking_steps; ++masking_step, --n_valid)
-          run_n_tile(n_valid, n_valid, masking_step, std::true_type{});
+          run_n_tile(n_valid, n_valid, masking_step,
+              (!Is_target && !Is_context && n_valid == n_block_min), std::true_type{});
         // Phase 2: steady-state tiles — apply_mask_bs compile-time eliminated (kIsMasking=false).
         for (; n_valid >= n_block_min; ++masking_step, --n_valid)
-          run_n_tile(n_valid, n_valid, masking_step, std::false_type{});
+          run_n_tile(n_valid, n_valid, masking_step,
+              (!Is_target && !Is_context && n_valid == n_block_min), std::false_type{});
       } else if constexpr (Is_arbitrary || Is_local) {
         // Every tile needs masking: pass true_type so apply_mask_bs is always compiled in.
         for (int n_valid = n_block_max - 1, masking_step = 0; n_valid >= n_block_min;
              ++masking_step, --n_valid) {
           const int nb = Is_arbitrary ? int(sValidBlockIds[n_valid]) : n_valid;
-          run_n_tile(nb, n_valid, masking_step, std::true_type{});
+          run_n_tile(nb, n_valid, masking_step, false, std::true_type{});
         }
       } else {
         // Full attention (!Is_causal, !Is_arbitrary, !Is_local): varlen-end check only.
         for (int n_valid = n_block_max - 1, masking_step = 0; n_valid >= n_block_min;
              ++masking_step, --n_valid)
-          run_n_tile(n_valid, n_valid, masking_step, std::false_type{});
+          run_n_tile(n_valid, n_valid, masking_step, false, std::false_type{});
       }
 
-      // ===== EPILOGUE =====
-
-      for (int i = 0; i < size(acc_o); ++i) acc_o(i) /= params.scaling_seqlen;
-      using OutElement = typename Kernel_traits::OutputType;
-      Tensor rO = make_tensor_like<OutElement>(acc_o);
-      flash::convert_type_safe(acc_o, rO);
-
-      static_assert(
-          Kernel_traits::kSmemWsOBytes >= kBlockM * kHeadDim * (int)sizeof(OutElement),
-          "Independent O SMEM buffer is too small.");
-      char* smem_o = reinterpret_cast<char*>(smem_) + Kernel_traits::kSmemWsOOffset;
-
-      // Wait until the independent O buffer is no longer owned by the previous TMA store.
-      wait_mbar_parity(
-          smem_base32 + (uint32_t)kSmemMbar0Offset + 96u,
-          (uint32_t)o_empty_wait_parity);
-      o_empty_wait_parity ^= 1;
-      Tensor sO_flat = make_tensor(
-          make_smem_ptr(reinterpret_cast<OutElement*>(smem_o)),
-          Layout<Shape<Int<kBlockM>, Int<kHeadDim>>, Stride<Int<kHeadDim>, _1>>{});
-      {
-        // stmatrix.sync.aligned.x4.m8n8.shared.b16: 8 warp-cooperative stores replace 32 STS.32.
-        //
-        // Layout invariants this asm relies on:
-        //   AtomLayout <_8,_1,_1>  → 8 math warps all in M direction, warp covers rows [warp_m*16, warp_m*16+15]
-        //   PermMmaTileN <_8,_4,_4>:<_1,_32,_8>  → N_sorted[j] = 32*(j%4) + 8*(j/4) for j=0..15
-        //   C-atom SM80_16x8_Row  → rO_u32[2*j + m_grp] covers (M=warp_m*16+m_grp*8+lq, N=N_sorted[j]+lqt*2)
-        //   OutElement is 2-byte (BF16); sO_flat row-stride = kHeadDim * sizeof(OutElement) = 256 bytes.
-        static_assert(sizeof(OutElement) == 2, "stmatrix.m8n8.b16 requires 2-byte elements");
-
-        auto rO_u32 = recast<uint32_t>(rO);
-
-        const int lane        = tidx_math & 31;
-        const int lq          = lane >> 2;   // lane-quad (0..7): selects data row within 8×8 matrix
-        const int lqt         = lane & 3;    // lane-quad-thread (0..3): selects data col-group
-        const int warp_m      = tidx_math >> 5;  // M-warp index (0..7)
-        const int addr_row    = ((lq & 1) << 2) | lqt;  // STSM address-row within matrix (0..7)
-        const int mat_in_lane = lq >> 1;                 // which of 4 matrices this thread addresses
-
-        const uint32_t smem_base  = static_cast<uint32_t>(__cvta_generic_to_shared(smem_o));
-        constexpr uint32_t row_bytes = kHeadDim * (uint32_t)sizeof(OutElement);  // 256
-
-        CUTE_UNROLL
-        for (int m_grp = 0; m_grp < 2; ++m_grp) {
-          const uint32_t m_bytes = (uint32_t)(warp_m * 16 + m_grp * 8 + addr_row) * row_bytes;
-
-          CUTE_UNROLL
-          for (int n_grp = 0; n_grp < 4; ++n_grp) {
-            // This thread addresses row addr_row of matrix mat_in_lane,
-            // starting at N-column (n_grp*32 + mat_in_lane*8).
-            uint32_t stsm_addr = smem_base
-                + m_bytes
-                + (uint32_t)(n_grp * 32 + mat_in_lane * 8) * (uint32_t)sizeof(OutElement);
-
-            // Data: rb_k carries the uint32 whose N_sorted position is n_grp*32 + k*8.
-            // N_sorted[n_grp + k*4] = 32*(n_grp+k*4)%4 + 8*(n_grp+k*4)/4 = 32*n_grp + 8*k ✓
-            uint32_t rb0 = rO_u32[2 * (n_grp     ) + m_grp];
-            uint32_t rb1 = rO_u32[2 * (n_grp +  4) + m_grp];
-            uint32_t rb2 = rO_u32[2 * (n_grp +  8) + m_grp];
-            uint32_t rb3 = rO_u32[2 * (n_grp + 12) + m_grp];
-
-            asm volatile(
-                "stmatrix.sync.aligned.x4.m8n8.shared.b16 [%0], {%1, %2, %3, %4};\n"
-                : : "r"(stsm_addr), "r"(rb0), "r"(rb1), "r"(rb2), "r"(rb3) : "memory");
-          }
+      // Complex/full paths and debug_gemm1_only keep the old post-loop epilogue fallback.
+      if constexpr (kStoreOInMainloop) {
+        if (!o_epilogue_done) {
+          store_o_epilogue();
         }
-      }
-
-      // For partial tiles (last tile of a varlen sequence): zero SMEM rows [valid_rows, kBlockM)
-      // so TMA bulk store does not write garbage to GMEM beyond actual_seqlen_q.
-      const int valid_rows = actual_seqlen_q - m_block * kBlockM;
-      if (valid_rows < kBlockM) {
-        // Ensure all STSM stores are complete before any warp zeros OOB rows.
-        // Full tiles skip this: o_ready is initialized with count=8, so the O-store warp
-        // cannot proceed until each math warp has arrived after its own STSM stores.
-        asm volatile("bar.sync 1, 256;\n" : : : "memory");
-        const int oob_elems = (kBlockM - valid_rows) * kHeadDim;
-        OutElement* sO_raw = reinterpret_cast<OutElement*>(smem_o) + valid_rows * kHeadDim;
-        for (int i = tidx_math; i < oob_elems; i += kNMathThreads)
-          sO_raw[i] = OutElement(0);
-        asm volatile("bar.sync 1, 256;\n" : : : "memory");  // OOB zeros visible before TMA.
-      }
-
-      // Produce o_ready[0]. O-store warp owns the TMA store and releases
-      // o_empty[0] after the store completes.
-      if ((tidx_math & 31) == 0) {
-        const uint32_t o_ready_addr =
-            smem_base32 + (uint32_t)kSmemMbar0Offset + 80u;
-        arrive_mbar(o_ready_addr);
+      } else {
+        store_o_epilogue();
       }
     };
 
