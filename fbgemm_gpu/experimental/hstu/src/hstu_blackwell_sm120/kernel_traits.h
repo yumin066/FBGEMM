@@ -450,24 +450,31 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
   // Warp roles:
   //   warps 0..kNWarps_-1  = math warps  (WG0: warps 0-3, WG1: warps 4-7)
   //   warps kNWarps_..+3   = load warpgroup WG2 (warps 8-11, 4 warps = 1 complete warpgroup)
-  //     warp kNWarps_      = active load warp (issues TMA)
-  //     warps kNWarps_+1..3 = idle warps (dec registers then spin; needed to complete WG2)
+  //     warp kNWarps_      = Q/SFA TMA load
+  //     warp kNWarps_+1    = K/SFB TMA load
+  //     warp kNWarps_+2    = V/SFV TMA load
+  //     warp kNWarps_+3    = O TMA store
   // Having a complete WG2 allows setmaxnreg WARPSYNC.ALL retry loop to function correctly.
   static constexpr int kNMathWarps   = kNWarps_;     // 8 math warps
-  static constexpr int kNLoadWarps   = 4;            // 1 active load warp + 3 idle (WG2 complete)
-  static constexpr int kLoadWarpIdx  = kNWarps_;     // warp 8 is the active load warp
+  static constexpr int kNLoadWarps   = 4;            // Q, K, V, and O-specialized load/store warps
+  static constexpr int kLoadWarpIdx  = kNWarps_;     // warp 8 starts the load warpgroup
 
   // kNThreads overrides Base::kNThreads: total = 8 math + 4 load = 12 warps × 32 = 384.
   static constexpr int kNThreads     = (kNMathWarps + kNLoadWarps) * cutlass::NumThreadsPerWarp;  // 384
   // kNMathThreads: math-warp-only thread count used for per-warp layout arithmetic.
   static constexpr int kNMathThreads = kNMathWarps * cutlass::NumThreadsPerWarp;  // 256
 
-  // Double-buffer pipeline: 5 barriers, no load_mbar needed.
-  //   tma_mbar[0], tma_mbar[1]: TMA completion per stage (math warps wait these)
-  //   math_mbar[0], math_mbar[1]: SMEM consumed per stage (load warp waits these)
-  //   q_tma_mbar: Q+SFA preamble TMA completion (math warp thread 0 waits, expected=1)
-  // Each barrier is 8 bytes; total = 40 bytes.  Placed at the last 40 bytes of kSmemSize.
-  static constexpr int kSmemMbarSize = 40;
+  // Producer/consumer mbarriers: ready barriers model cnt=1, empty barriers model cnt=0.
+  //   k_ready[0/1]: K/SFK TMA completion per stage
+  //   v_ready[0/1]: V/SFV TMA completion per stage
+  //   k_empty[0/1]: K/SFK consumed into registers per stage
+  //   v_empty[0/1]: V/SFV consumed into registers per stage
+  //   q_ready: Q/SFA TMA completion
+  //   q_empty: Q/SFA consumed into registers
+  //   o_ready[0/1]: O SMEM ready for TMA store per reused K/V stage
+  //   o_empty[0/1]: O TMA store finished per reused K/V stage
+  // Each barrier is 8 bytes; total = 112 bytes.  Placed at the last 112 bytes of kSmemSize.
+  static constexpr int kSmemMbarSize = 112;
 
   // Double-buffer KV SMEM layout.
   // Each K or Vt tile is kBlockN * kHeadDim FP8 bytes (1 byte each).
@@ -481,7 +488,7 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
   //   [kSmemWsKVTotalBytes .. +ValidBl)   : ValidBlockIds (Is_arbitrary only)
   //   [.. + func region)                  : func arrays (Is_arbitrary only)
   //   [padded to 8B)                      : SFA(512B) + SFB(512B) = 1024B
-  //   [last kSmemMbarSize bytes)          : 5 mbarriers × 8B
+  //   [last kSmemMbarSize bytes)          : 14 mbarriers × 8B
   static constexpr int kSmemWsValidBlockIdsOffset = kSmemWsKVTotalBytes;
   static constexpr int kSmemWsFuncOffset = kSmemWsValidBlockIdsOffset +
       (Is_arbitrary_ ? (int)(size(typename Base::SmemLayoutValidBlockIds{}) * sizeof(int)) : 0);
@@ -509,6 +516,6 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
       "kNMathWarps * 16 must equal kBlockM (8 warps × 16 rows = 128)");
   static_assert(kNThreads == (kNMathWarps + kNLoadWarps) * 32,
       "kNThreads == (kNMathWarps + kNLoadWarps) * 32");  // 384
-  static_assert(kSmemMbarSize == 40,
-      "kSmemMbarSize must be 40 (five 8-byte mbarriers: tma_mbar[2] + math_mbar[2] + q_tma_mbar)");
+  static_assert(kSmemMbarSize == 112,
+      "kSmemMbarSize must be 112 (14 producer/consumer mbarriers)");
 };
