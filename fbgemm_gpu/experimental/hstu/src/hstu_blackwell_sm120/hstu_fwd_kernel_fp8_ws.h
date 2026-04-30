@@ -20,7 +20,7 @@
 //           once before the static scheduler loop, non-persistent paths keep the per-tile S1
 //   S2→   : replaced by wait_mbar_parity(q_ready_mbar_ptr, parity) for all 256 math threads
 //   S3    : removed (was a no-op rendezvous with no real data dependency)
-//   S5    : math-warp-only bar.sync 1,256 for O SMEM visibility; O-store handoff uses o_ready/o_empty.
+//   S5    : partial-tile-only math bar.sync; full O-store handoff uses o_ready/o_empty.
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -263,9 +263,9 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
           arrive_mbar(ve1);
           arrive_mbar(qe);
         }
-        // Do not pre-arrive o_empty. K/V warps skip o_empty until a real O-store
-        // is pending, so pre-arriving would let the first pending wait consume a
-        // stale initial phase and overwrite O SMEM before TMA store completion.
+        // Independent O buffer starts empty; math epilogue waits on this phase before
+        // writing O, and the O-store warp releases the next phase after TMA store wait.
+        arrive_mbar(oe0);
       }
       asm volatile("fence.proxy.async.shared::cta;\n" : : : "memory");
     };
@@ -275,12 +275,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     int v_empty_wait_parity0 = 0;
     int v_empty_wait_parity1 = 0;
     int q_empty_wait_parity = 0;
-    int o_empty_wait_parity0 = 0;
-    int o_empty_wait_parity1 = 0;
     int o_ready_wait_parity0 = 0;
-    int o_ready_wait_parity1 = 0;
-    bool o_pending0 = false;
-    bool o_pending1 = false;
     int kv_load_stage = 0;
     if constexpr (Use_persistent) {
       init_ws_mbarriers();
@@ -498,17 +493,9 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
           const int nb = Is_arbitrary ? int(sValidBlockIds[n_valid]) : n_valid;
 
           uint64_t* k_empty_mbar_ptr = kv_load_stage ? k_empty_mbar_ptr1 : k_empty_mbar_ptr0;
-          uint64_t* o_empty_mbar_ptr = kv_load_stage ? o_empty_mbar_ptr1 : o_empty_mbar_ptr0;
           int& k_empty_wait_parity = kv_load_stage ? k_empty_wait_parity1 : k_empty_wait_parity0;
-          int& o_empty_wait_parity = kv_load_stage ? o_empty_wait_parity1 : o_empty_wait_parity0;
-          bool& o_pending = kv_load_stage ? o_pending1 : o_pending0;
           wait_mbar_parity(k_empty_mbar_ptr, (uint32_t)k_empty_wait_parity);
           k_empty_wait_parity ^= 1;
-          if (o_pending) {
-            wait_mbar_parity(o_empty_mbar_ptr, (uint32_t)o_empty_wait_parity);
-            o_empty_wait_parity ^= 1;
-            o_pending = false;
-          }
 
           const int nb_abs = binfo.sum_s_k / kBlockN + nb;
           if (tidx == kNMathThreads + 32) {
@@ -528,13 +515,6 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
 
           kv_load_stage ^= 1;
         }
-
-        const int o_stage_this_tile = kv_load_stage ^ 1;
-        if (o_stage_this_tile) {
-          o_pending1 = true;
-        } else {
-          o_pending0 = true;
-        }
       }
 
       if (is_v_load_warp) {
@@ -543,17 +523,9 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
           const int nb = Is_arbitrary ? int(sValidBlockIds[n_valid]) : n_valid;
 
           uint64_t* v_empty_mbar_ptr = kv_load_stage ? v_empty_mbar_ptr1 : v_empty_mbar_ptr0;
-          uint64_t* o_empty_mbar_ptr = kv_load_stage ? o_empty_mbar_ptr1 : o_empty_mbar_ptr0;
           int& v_empty_wait_parity = kv_load_stage ? v_empty_wait_parity1 : v_empty_wait_parity0;
-          int& o_empty_wait_parity = kv_load_stage ? o_empty_wait_parity1 : o_empty_wait_parity0;
-          bool& o_pending = kv_load_stage ? o_pending1 : o_pending0;
           wait_mbar_parity(v_empty_mbar_ptr, (uint32_t)v_empty_wait_parity);
           v_empty_wait_parity ^= 1;
-          if (o_pending) {
-            wait_mbar_parity(o_empty_mbar_ptr, (uint32_t)o_empty_wait_parity);
-            o_empty_wait_parity ^= 1;
-            o_pending = false;
-          }
 
           const int nb_abs = binfo.sum_s_k / kBlockN + nb;
           if (tidx == kNMathThreads + 64) {
@@ -573,44 +545,19 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
 
           kv_load_stage ^= 1;
         }
-
-        const int o_stage_this_tile = kv_load_stage ^ 1;
-        if (o_stage_this_tile) {
-          o_pending1 = true;
-        } else {
-          o_pending0 = true;
-        }
       }
 
       if (is_o_store_warp) {
-        // Math warps own compute/softmax and write O to SMEM; O-store waits for
-        // o_ready[o_stage], then releases o_empty[o_stage] after the TMA store.
-        int n_tiles_this_m = n_block_max - n_block_min;
-        if constexpr (Is_target) {
-          if (is_jump) {
-            n_tiles_this_m = 0;
-            for (int n_valid = n_block_max - 1, masking_step_load = 0; n_valid >= n_block_min;
-                 ++masking_step_load, --n_valid) {
-              ++n_tiles_this_m;
-              if (masking_step_load == n_masking_steps - 1)
-                n_valid = std::min(n_valid, n_block_history);
-            }
-          }
-        }
-        const int o_stage = kv_load_stage ^ ((n_tiles_this_m - 1) & 1);
-        kv_load_stage ^= (n_tiles_this_m & 1);
-        uint64_t* o_ready_mbar_ptr = o_stage ? o_ready_mbar_ptr1 : o_ready_mbar_ptr0;
-        uint64_t* o_empty_mbar_ptr = o_stage ? o_empty_mbar_ptr1 : o_empty_mbar_ptr0;
-        int& o_ready_wait_parity = o_stage ? o_ready_wait_parity1 : o_ready_wait_parity0;
-        wait_mbar_parity(o_ready_mbar_ptr, (uint32_t)o_ready_wait_parity);
-        o_ready_wait_parity ^= 1;
+        // Math warps own compute/softmax and write O to independent SMEM; O-store waits
+        // for o_ready[0], then releases o_empty[0] after the TMA store completes.
+        wait_mbar_parity(o_ready_mbar_ptr0, (uint32_t)o_ready_wait_parity0);
+        o_ready_wait_parity0 ^= 1;
         if (tidx == kNMathThreads + 96) {
           asm volatile("fence.proxy.async.shared::cta;\n" : : : "memory");
           static_assert(
-              kBlockM * kHeadDim * (int)sizeof(OutElement) ==
-                  2 * kBlockN * kHeadDim * (int)sizeof(FP8Elem),
-              "O-store SMEM must fit exactly in one K/V stage.");
-          char* smem_o = smem_q + o_stage * 2 * kSmemKVElems * (int)sizeof(FP8Elem);
+              Kernel_traits::kSmemWsOBytes >= kBlockM * kHeadDim * (int)sizeof(OutElement),
+              "Independent O SMEM buffer is too small.");
+          char* smem_o = reinterpret_cast<char*>(smem_) + Kernel_traits::kSmemWsOOffset;
           using SmemLayoutO_TMA_t = cute::Layout<
               cute::Shape<cute::Int<kBlockM>, cute::Int<kHeadDim>>,
               cute::Stride<cute::Int<kHeadDim>, cute::_1>>;
@@ -627,7 +574,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
           cute::copy(params.tma_o, tOsO, tOgO_all(_, _, _, m_abs));
           cute::tma_store_arrive();
           cute::tma_store_wait<0>();
-          arrive_mbar(o_empty_mbar_ptr);
+          arrive_mbar(o_empty_mbar_ptr0);
         }
       }
     };
@@ -683,6 +630,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     int tma_parity0 = 0;  // Persistent K/V mbarrier parity for stage 0.
     int tma_parity1 = 0;  // Persistent K/V mbarrier parity for stage 1.
     int q_tma_parity = 0;
+    int o_empty_wait_parity = 0;
     int math_stage  = 0;
 
     if constexpr (Use_persistent) {
@@ -846,7 +794,6 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
           Shape<Int<kBlockM>, Int<kHeadDim>>{}));
       using SmemLayoutK_SW128  = decltype(tile_to_shape(typename BS1::SmemLayoutAtomB{},
           Shape<Int<kBlockN>, Int<kHeadDim>>{}));
-      using SmemLayoutVt_SW128 = typename Kernel_traits::SmemLayoutVt_TMA;
 
       constexpr int kSmemKVElems = kBlockN * kHeadDim;
 
@@ -866,6 +813,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
 
       using SmemLayoutSFA = typename BS1::SmemLayoutSFA;
       using SmemLayoutSFB = typename BS1::SmemLayoutSFB;
+      using SmemLayoutSFV = typename BS2::SmemLayoutSFB;
       Tensor sSFA_ = make_tensor(make_smem_ptr(smem_sfa_ptr), SmemLayoutSFA{});
       auto sSFA = as_position_independent_swizzle_tensor(sSFA_);
       Tensor sSFP_ = make_tensor(make_smem_ptr(smem_sfp_ptr), SmemLayoutSFA{});
@@ -892,6 +840,8 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       auto s2r_copy_SFP = make_tiled_copy_impl(typename BS2::SmemCopyAtomSF{},
           BS2::get_layoutSFA_TV(tiled_mma_g2), make_shape(size<0>(tile_shape(tiled_mma_g2)), _1{}));
       auto s2r_thr_SFP  = s2r_copy_SFP.get_thread_slice(tidx_math);
+      auto s2r_copy_B_g1 = make_tiled_copy_B(typename BS1::SmemCopyAtomB{}, tiled_mma_g1);
+      auto s2r_thr_B_g1  = s2r_copy_B_g1.get_thread_slice(tidx_math);
 
       // A-operand loader using ldmatrix.sync.aligned.m8n8.x4.shared.b16.
       //
@@ -947,25 +897,36 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         const uint32_t smem_base =
             static_cast<uint32_t>(__cvta_generic_to_shared(&sB_pi(0, 0)));
         auto tXrB = recast<uint32_t>(tCrB);
-        constexpr int kNGroups = kBlockN / 32;  // 4
+        constexpr int kNGroups = kBlockN / 32;  // 2 for BN64, 4 for BN128
         CUTE_UNROLL
         for (int kb = 0; kb < k_block_count; ++kb) {
           CUTE_UNROLL
           for (int g = 0; g < kNGroups; ++g) {
-            const uint32_t N_row   = static_cast<uint32_t>(g * 32 + mat_num * 8 + mat_row);
-            const int frag_base    = 32 * kb + 2 * g;
+            const uint32_t N_row = static_cast<uint32_t>(g * 32 + mat_num * 8 + mat_row);
             CUTE_UNROLL
             for (int K_half = 0; K_half < 2; ++K_half) {
               const int K_start  = (k_block_base + kb) * 32 + K_half * 16;
               const uint32_t addr =
                   smem_base + N_row * 128 + static_cast<uint32_t>(K_start ^ (mat_row << 4));
-              asm volatile(
-                  "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3},[%4];\n"
-                  : "=r"(tXrB(frag_base + K_half +  0)),
-                    "=r"(tXrB(frag_base + K_half +  8)),
-                    "=r"(tXrB(frag_base + K_half + 16)),
-                    "=r"(tXrB(frag_base + K_half + 24))
-                  : "r"(addr));
+              if constexpr (kBlockN == 64) {
+                const int frag_base64 = 16 * kb + 8 * g;
+                asm volatile(
+                    "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3},[%4];\n"
+                    : "=r"(tXrB(frag_base64 + K_half + 0)),
+                      "=r"(tXrB(frag_base64 + K_half + 2)),
+                      "=r"(tXrB(frag_base64 + K_half + 4)),
+                      "=r"(tXrB(frag_base64 + K_half + 6))
+                    : "r"(addr));
+              } else {
+                const int frag_base = 32 * kb + 2 * g;
+                asm volatile(
+                    "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3},[%4];\n"
+                    : "=r"(tXrB(frag_base + K_half +  0)),
+                      "=r"(tXrB(frag_base + K_half +  8)),
+                      "=r"(tXrB(frag_base + K_half + 16)),
+                      "=r"(tXrB(frag_base + K_half + 24))
+                    : "r"(addr));
+              }
             }
           }
         }
@@ -1147,7 +1108,13 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
 
         // GEMM1: tCrQ and tCrSFA_frg are N-loop invariants hoisted above the loop.
         Tensor tCrK = thr_mma_g1.partition_fragment_B(sK_cur_pi);
-        load_b_z_pattern(sK_cur_pi, tCrK, 0, kHeadDim / 32);
+        if constexpr (kBlockN == 64) {
+          auto tXsK = s2r_thr_B_g1.partition_S(sK_cur_pi);
+          auto tXrK = s2r_thr_B_g1.retile_D(tCrK);
+          cute::copy(s2r_copy_B_g1, tXsK, tXrK);
+        } else {
+          load_b_z_pattern(sK_cur_pi, tCrK, 0, kHeadDim / 32);
+        }
         if ((tidx_math & 31) == 0) {
           uint32_t k_empty_addr =
               smem_base32 + (uint32_t)kSmemMbar0Offset + 32u + (uint32_t)(math_stage * 8);
@@ -1202,13 +1169,13 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         // (last read is here), so its 64 registers are freed and available to the
         // LOP3 address computation, eliminating the acc_o spill.
         //
-        // kAccSElems = 64 for kBlockM=kBlockN=128 / kNMathThreads=256.
+        // kAccSElems = 64 for BM128/BN128 and 32 for BM128/BN64 at 256 math threads.
         // Packing order matches the flat C-fragment order of thr_mma_g1.partition_C(...).
         // Under AtomLayout <_8,_1,_1>, the old select<1,2,0,3>-based regrouping is not a
         // valid (M,N) mapping; use acc_s(flat) directly to preserve C-fragment order.
-        constexpr int kAccSElems = kBlockM * kBlockN / kNMathThreads;  // = 64
+        constexpr int kAccSElems = kBlockM * kBlockN / kNMathThreads;
         static_assert(kAccSElems % 4 == 0, "kAccSElems must be a multiple of 4");
-        uint32_t acc_s_packed[kAccSElems / 4];  // 16 registers (vs. 64 for F32)
+        uint32_t acc_s_packed[kAccSElems / 4];
         {
           // Use cvt.e4m3x2: 2 F32→FP8 per instruction (vs. 4 scalar conversions).
           // Each cvt packs a pair into 16 bits; mov.b32 combines two pairs into uint32.
@@ -1231,19 +1198,32 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
             acc_s_packed[flat / 4] = out;
           }
         }
-        // acc_s (64 F32 regs) is now DEAD.
+        // acc_s is now DEAD.
         //
         // Build GEMM2 A-fragment P directly in registers via warp shuffle.
-        // With AtomLayout <_8,_1,_1> (1 N-warp), all 128 N-columns of P live in each
+        // With AtomLayout <_8,_1,_1> (1 N-warp), all N-columns of P live in each
         // warp's own registers — no cross-warp SMEM staging or bar.sync is needed.
         // sPbuf_pi is defined for partition_fragment_A shape inference only; sK_cur is
         // not written and remains available for the load warp's next TMA fill.
-        Tensor sPbuf  = make_tensor(make_smem_ptr(sK_cur), SmemLayoutQ_SW128{});
-        auto sPbuf_pi = as_position_independent_swizzle_tensor(sPbuf);
+        auto sPbuf_pi = [&]() {
+          if constexpr (kBlockN == 64) {
+            using SmemLayoutP_SW64 = decltype(tile_to_shape(
+                GMMA::Layout_K_SW64_Atom<FP8Elem>{},
+                Shape<Int<kBlockM>, Int<kBlockN>>{}));
+            Tensor sPbuf = make_tensor(make_smem_ptr(sK_cur), SmemLayoutP_SW64{});
+            return as_position_independent_swizzle_tensor(sPbuf);
+          } else {
+            using SmemLayoutP_SW128 = decltype(tile_to_shape(
+                typename BS2::SmemLayoutAtomA{},
+                Shape<Int<kBlockM>, Int<kBlockN>>{}));
+            Tensor sPbuf = make_tensor(make_smem_ptr(sK_cur), SmemLayoutP_SW128{});
+            return as_position_independent_swizzle_tensor(sPbuf);
+          }
+        }();
         Tensor tCrP = thr_mma_g2.partition_fragment_A(sPbuf_pi);
         {
-          // Warp shuffle: rearrange acc_s_packed (C-fragment, 16 uint32) into
-          // tCrP (A-fragment, 16 uint32) without SMEM staging or bar.sync.
+          // Warp shuffle: rearrange acc_s_packed (C-fragment) into
+          // tCrP (A-fragment) without SMEM staging or bar.sync.
           //
           // Each (kb,c) pair selects TWO compile-time acc_s_packed slots (pk0 for
           // tiq∈{0,2}, pk1 for tiq∈{1,3}), shuffles them from the correct quad-lane
@@ -1261,31 +1241,52 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
           //   tiq=1,3 → src_lane0=quad+2, src_lane1=quad+3
           const unsigned src_lane0 = quad_base | ((tiq & 1u) << 1u);
           const unsigned src_lane1 = src_lane0 + 1u;
-          // kLut{0,1}[kb][c]: compile-time acc_s_packed indices for K-half h=0 and h=1.
-          //   kLut0[kb][c] = kb + 4*(2*c + 0) = kb + 8*c
-          //   kLut1[kb][c] = kb + 4*(2*c + 1) = kb + 8*c + 4
-          constexpr uint8_t kLut0[4][2] = {{ 0, 8}, { 1, 9}, { 2, 10}, { 3, 11}};
-          constexpr uint8_t kLut1[4][2] = {{ 4,12}, { 5,13}, { 6, 14}, { 7, 15}};
-          CUTE_UNROLL
-          for (int kb = 0; kb < 4; ++kb) {
+          if constexpr (kBlockN == 64) {
             CUTE_UNROLL
-            for (int c = 0; c < 2; ++c) {
-              // Both indices are compile-time constants after CUTE_UNROLL expansion;
-              // NVCC keeps acc_s_packed in registers and emits a predicated SHFL pair.
-              const uint32_t pk0 = acc_s_packed[kLut0[kb][c]];
-              const uint32_t pk1 = acc_s_packed[kLut1[kb][c]];
-              // Shuffle BOTH halves first, then select: src_lane's tiq determines which
-              // N-atom register IT holds, which may differ from the destination's h-half.
-              const uint32_t a0  = __shfl_sync(0xFFFFFFFFu, pk0, src_lane0);
-              const uint32_t b0  = __shfl_sync(0xFFFFFFFFu, pk0, src_lane1);
-              const uint32_t a1  = __shfl_sync(0xFFFFFFFFu, pk1, src_lane0);
-              const uint32_t b1  = __shfl_sync(0xFFFFFFFFu, pk1, src_lane1);
-              const uint32_t a   = (tiq >> 1u) ? a1 : a0;
-              const uint32_t b   = (tiq >> 1u) ? b1 : b0;
-              // byte_perm 0x5410 = {a.b0,a.b1,b.b0,b.b1} → mr=0 (row = quad)
-              // byte_perm 0x7632 = {a.b2,a.b3,b.b2,b.b3} → mr=1 (row = 8+quad)
-              tXrP(4 * kb + 2 * c + 0) = __byte_perm(a, b, 0x5410u);
-              tXrP(4 * kb + 2 * c + 1) = __byte_perm(a, b, 0x7632u);
+            for (int kb = 0; kb < 2; ++kb) {
+              CUTE_UNROLL
+              for (int c = 0; c < 2; ++c) {
+                // Linear 64-wide PermMmaTileN: N-atom order is 0,8,16,...,56.
+                // For a 4-column A-fragment slice, tiq selects lower/upper atom pair.
+                const uint32_t pk0 = acc_s_packed[4 * kb + 2 * c + 0];
+                const uint32_t pk1 = acc_s_packed[4 * kb + 2 * c + 1];
+                const uint32_t a0  = __shfl_sync(0xFFFFFFFFu, pk0, src_lane0);
+                const uint32_t b0  = __shfl_sync(0xFFFFFFFFu, pk0, src_lane1);
+                const uint32_t a1  = __shfl_sync(0xFFFFFFFFu, pk1, src_lane0);
+                const uint32_t b1  = __shfl_sync(0xFFFFFFFFu, pk1, src_lane1);
+                const uint32_t a   = (tiq >> 1u) ? a1 : a0;
+                const uint32_t b   = (tiq >> 1u) ? b1 : b0;
+                tXrP(4 * kb + 2 * c + 0) = __byte_perm(a, b, 0x5410u);
+                tXrP(4 * kb + 2 * c + 1) = __byte_perm(a, b, 0x7632u);
+              }
+            }
+          } else {
+            // kLut{0,1}[kb][c]: compile-time acc_s_packed indices for K-half h=0 and h=1.
+            //   kLut0[kb][c] = kb + 4*(2*c + 0) = kb + 8*c
+            //   kLut1[kb][c] = kb + 4*(2*c + 1) = kb + 8*c + 4
+            constexpr uint8_t kLut0[4][2] = {{ 0, 8}, { 1, 9}, { 2, 10}, { 3, 11}};
+            constexpr uint8_t kLut1[4][2] = {{ 4,12}, { 5,13}, { 6, 14}, { 7, 15}};
+            CUTE_UNROLL
+            for (int kb = 0; kb < 4; ++kb) {
+              CUTE_UNROLL
+              for (int c = 0; c < 2; ++c) {
+                // Both indices are compile-time constants after CUTE_UNROLL expansion;
+                // NVCC keeps acc_s_packed in registers and emits a predicated SHFL pair.
+                const uint32_t pk0 = acc_s_packed[kLut0[kb][c]];
+                const uint32_t pk1 = acc_s_packed[kLut1[kb][c]];
+                // Shuffle BOTH halves first, then select: src_lane's tiq determines which
+                // N-atom register IT holds, which may differ from the destination's h-half.
+                const uint32_t a0  = __shfl_sync(0xFFFFFFFFu, pk0, src_lane0);
+                const uint32_t b0  = __shfl_sync(0xFFFFFFFFu, pk0, src_lane1);
+                const uint32_t a1  = __shfl_sync(0xFFFFFFFFu, pk1, src_lane0);
+                const uint32_t b1  = __shfl_sync(0xFFFFFFFFu, pk1, src_lane1);
+                const uint32_t a   = (tiq >> 1u) ? a1 : a0;
+                const uint32_t b   = (tiq >> 1u) ? b1 : b0;
+                // byte_perm 0x5410 = {a.b0,a.b1,b.b0,b.b1} → mr=0 (row = quad)
+                // byte_perm 0x7632 = {a.b2,a.b3,b.b2,b.b3} → mr=1 (row = 8+quad)
+                tXrP(4 * kb + 2 * c + 0) = __byte_perm(a, b, 0x5410u);
+                tXrP(4 * kb + 2 * c + 1) = __byte_perm(a, b, 0x7632u);
+              }
             }
           }
         }
@@ -1320,7 +1321,19 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
           //     r2 → slot base+16 (nr=dg+8,  k_h)
           //     r3 → slot base+24 (nr=dg+12, k_h)
           //   Covers all 128 uint32 slots (16 N-atoms × 4 K-blocks × 2 regs). ✓
-          auto sVt_ns = make_tensor(make_smem_ptr(sVt_cur), SmemLayoutVt_SW128{});
+          auto sVt_ns = [&]() {
+            if constexpr (kBlockN == 64) {
+              using SmemLayoutVt_SW64 = decltype(tile_to_shape(
+                  GMMA::Layout_K_SW64_Atom<FP8Elem>{},
+                  Shape<Int<kHeadDim>, Int<kBlockN>>{}));
+              return make_tensor(make_smem_ptr(sVt_cur), SmemLayoutVt_SW64{});
+            } else {
+              using SmemLayoutVt_SW128 = decltype(tile_to_shape(
+                  typename BS2::SmemLayoutAtomB{},
+                  Shape<Int<kHeadDim>, Int<kBlockN>>{}));
+              return make_tensor(make_smem_ptr(sVt_cur), SmemLayoutVt_SW128{});
+            }
+          }();
           Tensor tCrV = thr_mma_g2.partition_fragment_B(sVt_ns);
           {
             auto tXrV = recast<uint32_t>(tCrV);
@@ -1359,20 +1372,21 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
           }
           auto tCrSFP_frg = BS2::transform_fragment_for_qmma(tCrSFP);
           int32_t* smem_sfv_cur = smem_sfa_ptr + 2 * kBlockM + 2 * kBlockN + math_stage * kBlockN;
-          Tensor sSFV_ = make_tensor(make_smem_ptr(smem_sfv_cur), SmemLayoutSFB{});
+          Tensor sSFV_ = make_tensor(make_smem_ptr(smem_sfv_cur), SmemLayoutSFV{});
           auto sSFV = as_position_independent_swizzle_tensor(sSFV_);
           Tensor tCrSFV = BS2::partition_fragment_SFB(sSFV(_,_,_0{}), thr_mma_g2);
           {
-            // Same degeneracy as SFB: ThrN=1 → all threads → position 0 via stride-0 btile.
-            // Direct load from smem_sfv_ptr; N-atoms span the head-dim (d) direction for V^T.
-            // Same scale-fragment compaction rule as SFB: fragment nr -> N_base = 8*nr (LINEAR).
+            // SFV TMA loads one scale vector per K/V tile stage (kBlockN entries).
+            // GEMM2's B operand is V^T, so BS2 expects SFV across the head-dim N atoms.
+            // The HSTU FP8 path stores the same V scale across the tile entries; for BN64,
+            // reading nr*8 would run past the 64-entry stage. Broadcast a valid entry.
             // AtomLayoutSFB_TV = (4,8):(0,1): lane>>2 indexes the within-atom N-column offset.
             const int n_row_sfv = (tidx_math & 31) >> 2;
+            const int sfv = smem_sfv_cur[n_row_sfv];
             constexpr int kNAtomsSFV = kHeadDim / 8;
             CUTE_UNROLL
             for (int nr = 0; nr < kNAtomsSFV; ++nr) {
-              const int N_base = nr * 8;  // LINEAR: 0, 8, 16, ..., 120
-              tCrSFV(0, nr, 0) = smem_sfv_cur[N_base + n_row_sfv];
+              tCrSFV(0, nr, 0) = sfv;
             }
           }
           auto tCrSFV_frg = BS2::transform_fragment_for_qmma(tCrSFV);
@@ -1431,16 +1445,15 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       flash::convert_type_safe(acc_o, rO);
 
       static_assert(
-          kBlockM * kHeadDim * (int)sizeof(OutElement) ==
-              2 * kBlockN * kHeadDim * (int)sizeof(FP8Elem),
-          "O-store SMEM must fit exactly in one K/V stage.");
-      // math_stage was flipped after every N tile; after the loop it points to the
-      // next stage, so the last consumed K/V stage is math_stage ^ 1.
-      const int o_stage = math_stage ^ 1;
-      char* smem_o = smem_q + o_stage * 2 * kSmemKVElems * (int)sizeof(FP8Elem);
+          Kernel_traits::kSmemWsOBytes >= kBlockM * kHeadDim * (int)sizeof(OutElement),
+          "Independent O SMEM buffer is too small.");
+      char* smem_o = reinterpret_cast<char*>(smem_) + Kernel_traits::kSmemWsOOffset;
 
-      // bar.sync among 256 math warps: all must exit loop before any warp overwrites O stage.
-      asm volatile("bar.sync 1, 256;\n" : : : "memory");
+      // Wait until the independent O buffer is no longer owned by the previous TMA store.
+      wait_mbar_parity(
+          smem_base32 + (uint32_t)kSmemMbar0Offset + 96u,
+          (uint32_t)o_empty_wait_parity);
+      o_empty_wait_parity ^= 1;
       Tensor sO_flat = make_tensor(
           make_smem_ptr(reinterpret_cast<OutElement*>(smem_o)),
           Layout<Shape<Int<kBlockM>, Int<kHeadDim>>, Stride<Int<kHeadDim>, _1>>{});
@@ -1492,12 +1505,14 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         }
       }
 
-      asm volatile("bar.sync 1, 256;\n" : : : "memory");  // S5: all 256 math threads see sO_flat writes.
-
       // For partial tiles (last tile of a varlen sequence): zero SMEM rows [valid_rows, kBlockM)
       // so TMA bulk store does not write garbage to GMEM beyond actual_seqlen_q.
       const int valid_rows = actual_seqlen_q - m_block * kBlockM;
       if (valid_rows < kBlockM) {
+        // Ensure all STSM stores are complete before any warp zeros OOB rows.
+        // Full tiles skip this: o_ready is initialized with count=8, so the O-store warp
+        // cannot proceed until each math warp has arrived after its own STSM stores.
+        asm volatile("bar.sync 1, 256;\n" : : : "memory");
         const int oob_elems = (kBlockM - valid_rows) * kHeadDim;
         OutElement* sO_raw = reinterpret_cast<OutElement*>(smem_o) + valid_rows * kHeadDim;
         for (int i = tidx_math; i < oob_elems; i += kNMathThreads)
@@ -1505,11 +1520,11 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         asm volatile("bar.sync 1, 256;\n" : : : "memory");  // OOB zeros visible before TMA.
       }
 
-      // Produce o_ready[o_stage]. O-store warp owns the TMA store and releases
-      // o_empty[o_stage] after the store completes.
+      // Produce o_ready[0]. O-store warp owns the TMA store and releases
+      // o_empty[0] after the store completes.
       if ((tidx_math & 31) == 0) {
         const uint32_t o_ready_addr =
-            smem_base32 + (uint32_t)kSmemMbar0Offset + 80u + (uint32_t)(o_stage * 8);
+            smem_base32 + (uint32_t)kSmemMbar0Offset + 80u;
         arrive_mbar(o_ready_addr);
       }
     };

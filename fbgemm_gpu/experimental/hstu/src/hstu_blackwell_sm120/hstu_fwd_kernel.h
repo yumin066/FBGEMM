@@ -1577,8 +1577,8 @@ void run_hstu_fwd_sm120(Hstu_fwd_params& params, cudaStream_t stream) {
   };
 
   if constexpr (Is_fp8_type) {
-    if constexpr ((kBlockN % 128) == 0) {
-      if constexpr (!Has_rab) {
+    if constexpr (!Has_rab) {
+      if constexpr ((kHeadDim == 128 && kBlockN == 64) || (kBlockN % 128) == 0) {
         // WS TMA kernel: load warp issues TMA for Q/K/V^T/SFB/SFV; math warps do QMMA.
         // Has_rab=true is not supported in WS kernel; handled by cp.async fallback below.
         run_hstu_fwd_sm120_fp8_ws_tma_impl<
@@ -1586,6 +1586,13 @@ void run_hstu_fwd_sm120(Hstu_fwd_params& params, cudaStream_t stream) {
             Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc, Has_rab,
             Is_Q_in_regs, Share_Q_K_smem>(params, stream);
       } else {
+        TORCH_CHECK(
+            false,
+            "SM120 FP8 WS blockscaled path currently requires headDim128+kBlockN64 or kBlockN divisible by 128, got kBlockN=",
+            kBlockN);
+      }
+    } else {
+      if constexpr ((kBlockN % 128) == 0) {
         // cp.async fallback for Has_rab=true (WS kernel does not support RAB).
         using Kernel_traits = Hstu_fwd_kernel_traits_sm120_fp8<
             kHeadDim, kBlockM, kBlockN, kNWarps,
@@ -1593,13 +1600,13 @@ void run_hstu_fwd_sm120(Hstu_fwd_params& params, cudaStream_t stream) {
             Is_Q_in_regs, Share_Q_K_smem, cutlass::half_t>;
         auto kernel = &flash::hstu_fwd_kernel_sm120<Kernel_traits, Hstu_fwd_params>;
         launch_kernel(kernel, Kernel_traits::kNThreads, Kernel_traits::kSmemSize);
+      } else {
+        // Compile-time gate: do not instantiate FP8 blockscaled fallback for unsupported N tiles.
+        TORCH_CHECK(
+            false,
+            "SM120 FP8 blockscaled fallback currently requires kBlockN divisible by 128, got kBlockN=",
+            kBlockN);
       }
-    } else {
-      // Compile-time gate: do not instantiate FP8 blockscaled kernel for unsupported N tiles.
-      TORCH_CHECK(
-          false,
-          "SM120 FP8 blockscaled path currently requires kBlockN divisible by 128, got kBlockN=",
-          kBlockN);
     }
   } else {
     using Kernel_traits = Hstu_fwd_kernel_traits_sm120<

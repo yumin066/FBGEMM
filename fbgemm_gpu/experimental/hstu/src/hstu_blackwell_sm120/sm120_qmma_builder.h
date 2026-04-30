@@ -36,6 +36,7 @@
 #include <cute/config.hpp>
 #include <cute/tensor.hpp>
 #include <cutlass/numeric_types.h>            // float_e4m3_t, float_ue8m0_t
+#include <type_traits>
 
 namespace hstu {
 
@@ -73,9 +74,14 @@ struct SM120QmmaBuilder {
   // ====== MMA atom and tiled MMA ======
   // Replicates SM120BlockScaledBuilder::TiledMma exactly.
   // AtomLayout <_2,_4,_1>: 2×4 warp grid (8 warps in the math warpgroup).
-  // PermMmaTileN swizzles N-tiles for SM120 QMMA optimal bank layout.
+  // PermMmaTileN swizzles 128-wide N-tiles for SM120 QMMA optimal bank layout.
+  // The 64-wide experiment uses a linear 64-wide N tile; callers with hand-written
+  // fragment placement must branch on kTileN because the N-atom order changes.
   using PermMmaTileM = Int<32>;
-  using PermMmaTileN = Layout<Shape<_8, _4, _4>, Stride<_1, _32, _8>>;
+  using PermMmaTileN = std::conditional_t<
+      (kTileN == 64),
+      Int<64>,
+      Layout<Shape<_8, _4, _4>, Stride<_1, _32, _8>>>;
   using PermMmaTileK = Underscore;
 
   using MmaAtom = MMA_Atom<SM120::BLOCKSCALED::SM120_16x8x32_TN_VS<
@@ -95,9 +101,9 @@ struct SM120QmmaBuilder {
       "TileM must be divisible by PermMmaTileM (32)");
   static_assert(
       kTileN % cute::size(PermMmaTileN{}) == 0,
-      "TileN must be divisible by PermMmaTileN (128)");
+      "TileN must be divisible by PermMmaTileN");
 
-  static constexpr int kNumMathThreads = size(TiledMma::ThrLayoutVMNK{});
+  static constexpr int kNumMathThreads = size(typename TiledMma::ThrLayoutVMNK{});
   static constexpr int kNumMathWarps   = kNumMathThreads / 32;
 
   // ====== SMEM → RF copy atoms ======

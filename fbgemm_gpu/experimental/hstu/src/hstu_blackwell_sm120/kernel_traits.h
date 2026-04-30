@@ -471,8 +471,8 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
   //   v_empty[0/1]: V/SFV consumed into registers per stage
   //   q_ready: Q/SFA TMA completion
   //   q_empty: Q/SFA consumed into registers
-  //   o_ready[0/1]: O SMEM ready for TMA store per reused K/V stage
-  //   o_empty[0/1]: O TMA store finished per reused K/V stage
+  //   o_ready[0]: O SMEM ready for TMA store
+  //   o_empty[0]: independent O SMEM buffer is free for math epilogue writes
   // Each barrier is 8 bytes; total = 112 bytes.  Placed at the last 112 bytes of kSmemSize.
   static constexpr int kSmemMbarSize = 112;
 
@@ -503,8 +503,13 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
       kBlockM_ * kHeadDim_ * (int)sizeof(typename Base::Element);
   static constexpr int kSmemWsQPersistOffset = ((kSmemWsFuncEnd + 2047) / 2048) * 2048;
   static constexpr int kSmemWsAfterQPersist = kSmemWsQPersistOffset + kSmemQPersistBytes;
+  static constexpr int kSmemWsAfterQPersistPadded = ((kSmemWsAfterQPersist + 127) / 128) * 128;
+  static constexpr int kSmemWsOOffset = kSmemWsAfterQPersistPadded;
+  static constexpr int kSmemWsOBytes =
+      kBlockM_ * kHeadDim_ * (int)sizeof(out_type);
+  static constexpr int kSmemWsAfterO = kSmemWsOOffset + kSmemWsOBytes;
   // WS data region padded to 128B; SF (TMA targets) starts at this offset from smem_.
-  static constexpr int kSmemWsDataSizePadded = ((kSmemWsAfterQPersist + 127) / 128) * 128;
+  static constexpr int kSmemWsDataSizePadded = ((kSmemWsAfterO + 127) / 128) * 128;
   // WS SF SMEM: SFA(512B) + SFP unit(512B) + SFB[0]+[1] + SFV[0]+[1] (each 512B @ 128) = 3072B.
   // SFP is separate so real SFA SMEM is never clobbered — enables per-tile s2r of SFA for GEMM1.
   static constexpr int kSmemWsSFSize =
