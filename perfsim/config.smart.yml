@@ -775,6 +775,9 @@ Smart:
     # for knobfiles, the smart release chip-specific base_knobs.txt is always prepended
     # this is for only a single tpc to be enabled
     --knobfile: ${knobfile_chip}_single_tpc.cfg
+    --Knob:
+      - failOnUninitializedSharedRead=0
+      - failOnUninitializedRegisterRead=0
     # this is for all tpcs in a gpc to be enabled
     # --knobfile: ${knobfile_chip}_single_full_gpc.cfg
 
@@ -819,4 +822,3 @@ PIC_Analysis:
   pic-smart:
     --dump-all-morph-tpc: false
     --barrier-analysis: true
-
