@@ -171,6 +171,28 @@ def time_kernel(fn, warmup=WARMUP, iters=ITERS):
     return sum(lats) / len(lats), min(lats), max(lats)
 
 
+def attention_flops(
+    batch_size: int,
+    seqlen: int,
+    nheads: int,
+    headdim: int,
+    window_size: Tuple[int, int],
+) -> float:
+    """FWD attention FLOPs for GEMM1 + GEMM2 over valid (query, key) pairs."""
+    left, right = window_size
+    if left < 0 and right < 0:
+        pairs_per_sequence = seqlen * seqlen
+    else:
+        pairs_per_sequence = 0
+        for q_idx in range(seqlen):
+            k_begin = 0 if left < 0 else max(0, q_idx - left)
+            k_end = seqlen - 1 if right < 0 else min(seqlen - 1, q_idx + right)
+            if k_end >= k_begin:
+                pairs_per_sequence += k_end - k_begin + 1
+
+    return 4.0 * batch_size * pairs_per_sequence * nheads * headdim
+
+
 # ---------------------------------------------------------------------------
 # Kernel-only benchmark: measures only the CUDA attention kernel time
 # ---------------------------------------------------------------------------
@@ -184,7 +206,7 @@ def bench_kernel_only(
 ) -> dict:
     """
     Returns dict with keys: bf16_ms, fp8_ms, bf16_tflops, fp8_tflops, speedup_pct.
-    Total FLOPs = 4 * B * S_q * S_k * H * D (FWD attention: GEMM1 + GEMM2).
+    Total FLOPs = 4 * valid_attention_pairs * H * D (FWD attention: GEMM1 + GEMM2).
     """
     result = {}
 
@@ -230,7 +252,7 @@ def bench_kernel_only(
         result["fp8_error"] = str(e)
 
     # Compute TFLOPS
-    total_flops = 4.0 * batch_size * seqlen * seqlen * nheads * headdim
+    total_flops = attention_flops(batch_size, seqlen, nheads, headdim, window_size)
     if "bf16_ms" in result:
         result["bf16_tflops"] = total_flops / (result["bf16_ms"] * 1e-3) / 1e12
     if "fp8_ms" in result:
@@ -293,7 +315,9 @@ def bench_e2e(
         )
         result["bf16_ms"] = bf16_avg
 
-        total_flops_e2e = 4.0 * batch_size * seqlen * seqlen * nheads * headdim
+        total_flops_e2e = attention_flops(
+            batch_size, seqlen, nheads, headdim, window_size
+        )
         result["bf16_tflops"] = total_flops_e2e / (bf16_avg * 1e-3) / 1e12
 
     except Exception as e:
@@ -309,7 +333,9 @@ def bench_e2e(
         )
         result["fp8_ms"] = fp8_avg
 
-        total_flops_e2e = 4.0 * batch_size * seqlen * seqlen * nheads * headdim
+        total_flops_e2e = attention_flops(
+            batch_size, seqlen, nheads, headdim, window_size
+        )
         result["fp8_tflops"] = total_flops_e2e / (fp8_avg * 1e-3) / 1e12
 
     except Exception as e:
