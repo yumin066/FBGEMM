@@ -122,14 +122,14 @@ def quantize_fp8_bs(q_bf16, k_bf16, v_bf16, batch_size, seqlen, nheads, headdim)
 
 def make_paged_kv_raw_inputs(batch_size, seqlen, nheads, headdim, window_size):
     """
-    Build an equivalent paged-KV causal case for the same benchmark shape.
+    Build an equivalent paged-KV case for the same benchmark shape.
 
-    Current SM120 FP8 paged KV support is decode/target-style and requires a
-    causal right window.  To keep the shape identical to the existing causal
-    benchmark, use target_len=0 and place the whole K/V sequence in the cache.
+    For causal, use target_len=0 and place the whole K/V sequence in the cache.
+    For full, pass num_targets=None so the dispatcher instantiates the full
+    paged-history path.
     """
-    if window_size != (-1, 0):
-        raise ValueError("paged KV is supported only for causal benchmark cases")
+    if window_size not in {(-1, 0), (-1, -1)}:
+        raise ValueError("paged KV benchmark supports only causal (-1,0) and full (-1,-1)")
     if headdim != 128:
         raise ValueError("SM120 FP8 paged KV benchmark requires headDim=128")
 
@@ -157,7 +157,11 @@ def make_paged_kv_raw_inputs(batch_size, seqlen, nheads, headdim, window_size):
 
     cu_q = make_cu_seqlens(batch_size, seqlen)
     cu_k = make_cu_seqlens(batch_size, seqlen)
-    num_targets = torch.zeros(batch_size, dtype=torch.int32, device="cuda")
+    num_targets = (
+        torch.zeros(batch_size, dtype=torch.int32, device="cuda")
+        if window_size == (-1, 0)
+        else None
+    )
 
     page_offsets = torch.zeros(batch_size + 1, dtype=torch.int32, device="cuda")
     page_offsets[1:] = torch.arange(
@@ -612,7 +616,7 @@ def print_kernel_table(
                             print(f"    BF16 ERROR: {res['bf16_error']}")
                         if "fp8_error" in res:
                             print(f"    FP8  ERROR: {res['fp8_error']}")
-                        if "paged_error" in res and ws == (-1, 0):
+                        if "paged_error" in res:
                             print(f"    PAGED ERROR: {res['paged_error']}")
     print()
 
@@ -624,7 +628,9 @@ def print_e2e_table(
     print("END-TO-END BENCHMARK  (includes FP8 quantization overhead)")
     print("=" * 100)
     hdr = (f"{'Config':<56} {'BF16(ms)':>9} {'BF16 TFLOPS':>12}"
-           f" {'FP8 e2e(ms)':>11} {'FP8 TFLOPS':>12} {'Speedup':>9}")
+           f" {'FP8 e2e(ms)':>11} {'FP8 TFLOPS':>12}"
+           f" {'Paged(ms)':>10} {'Paged TFLOPS':>13} {'Paged/F8':>9}"
+           f" {'Speedup':>9}")
     print(hdr)
     print("-" * len(hdr))
 
@@ -649,18 +655,32 @@ def print_e2e_table(
                         fp8_tf = (f"{res['fp8_tflops']:12.1f}"
                                   if "fp8_tflops" in res
                                   else f"{'ERR':>12}")
+                        paged_str = (f"{res['paged_ms']:10.3f}"
+                                     if "paged_ms" in res
+                                     else f"{'N/A':>10}")
+                        paged_tf = (f"{res['paged_tflops']:13.1f}"
+                                    if "paged_tflops" in res
+                                    else f"{'N/A':>13}")
+                        paged_vs = (f"{res['paged_vs_fp8_pct']:+8.1f}%"
+                                    if "paged_vs_fp8_pct" in res
+                                    else f"{'N/A':>9}")
                         speedup_raw = res.get("speedup_pct")
                         if speedup_raw is not None:
                             speedup = f"{speedup_raw:+8.1f}%"
                         else:
                             speedup = f"{'N/A':>9}"
 
-                        print(f"  {cfg:<54} {bf16_str} {bf16_tf} {fp8_str} {fp8_tf} {speedup}")
+                        print(
+                            f"  {cfg:<54} {bf16_str} {bf16_tf} {fp8_str} {fp8_tf}"
+                            f" {paged_str} {paged_tf} {paged_vs} {speedup}"
+                        )
 
                         if "bf16_error" in res:
                             print(f"    BF16 ERROR: {res['bf16_error']}")
                         if "fp8_error" in res:
                             print(f"    FP8  ERROR: {res['fp8_error']}")
+                        if "paged_error" in res:
+                            print(f"    PAGED ERROR: {res['paged_error']}")
     print()
 
 

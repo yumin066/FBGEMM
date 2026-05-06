@@ -34,6 +34,7 @@ total = BS * SEQ
 cu = torch.zeros(BS + 1, dtype=torch.int32, device="cuda")
 cu[1:] = torch.cumsum(torch.full((BS,), SEQ, dtype=torch.int32, device="cuda"), dim=0)
 num_targets0 = torch.zeros(BS, dtype=torch.int32, device="cuda")
+paged_num_targets = num_targets0 if args.window == "causal" else None
 
 q = torch.randn(total, H, D, dtype=torch.bfloat16, device="cuda")
 k = torch.randn(total, H, D, dtype=torch.bfloat16, device="cuda")
@@ -87,7 +88,7 @@ def run_fp8():
 def run_paged():
     out, _ = torch.ops.fbgemm.hstu_varlen_fwd_120(
         q_fp8, k_fp8, v_fp8, cu, cu, None, None,
-        SEQ, SEQ, SEQ, None, num_targets0, 1, -1, 0, 1.0,
+        SEQ, SEQ, SEQ, None, paged_num_targets, 1, WINDOW[0], WINDOW[1], 1.0,
         None, None, 2,
         q_dsc, k_dsc, v_dsc,
         sf_q, sf_k_paged, sf_v_paged,

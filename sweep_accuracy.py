@@ -10,9 +10,9 @@ sys.path.insert(0, "/home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/fbgemm_gp
 sys.path.insert(0, "/home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/fbgemm_gpu/experimental/hstu/test")
 import hstu  # noqa
 from hstu.cuda_hstu_attention import (
-    hstu_attn_varlen_func,
     quantize_for_block_scale_qk_along_d,
     quantize_for_block_scale_v_along_n,
+    quantize_paged_kv_cache_for_block_scale,
     pack_descale_to_e8m0x4_int32,
 )
 from hstu_test import generate_paged_kv_input, _hstu_paged_kv_attention
@@ -116,6 +116,201 @@ def e8m0_dequant(fp8_tensor: torch.Tensor, descale: torch.Tensor,
     return out.to(torch.bfloat16)
 
 
+def dequantize_paged_kv_cache(kv_cache_raw: torch.Tensor,
+                              kv_cache_fp8: torch.Tensor,
+                              block_size: int) -> torch.Tensor:
+    pages, _, page_size, heads, dim = kv_cache_raw.shape
+    assert page_size == block_size
+    fp8_max = 448.0
+
+    k_raw = kv_cache_raw[:, 0].contiguous()
+    v_raw = kv_cache_raw[:, 1].contiguous()
+    k_fp8 = kv_cache_fp8[:, 0].float()
+    v_fp8 = kv_cache_fp8[:, 1].float()
+
+    k_view = k_raw.view(pages * page_size, heads, dim // 128, 128)
+    k_scale = torch.amax(k_view.abs(), dim=3).to(torch.float32) / fp8_max
+    k_scale = torch.pow(2.0, torch.ceil(torch.log2(k_scale.clamp(min=1e-38))))
+    k_deq = (
+        k_fp8.view(pages * page_size, heads, dim // 128, 128)
+        * k_scale.unsqueeze(-1)
+    ).view(pages, page_size, heads, dim)
+
+    v_scale = torch.amax(v_raw.abs(), dim=(1, 3)).to(torch.float32) / fp8_max
+    v_scale = torch.pow(2.0, torch.ceil(torch.log2(v_scale.clamp(min=1e-38))))
+    v_deq = v_fp8 * v_scale[:, None, :, None]
+
+    kv_cache_deq = torch.empty_like(kv_cache_raw, dtype=torch.bfloat16)
+    kv_cache_deq[:, 0] = k_deq.to(torch.bfloat16)
+    kv_cache_deq[:, 1] = v_deq.to(torch.bfloat16)
+    return kv_cache_deq
+
+
+def quantize_paged_inputs_for_block_scale(q, k, v, kv_cache, cu, block_size):
+    q_fp8, q_descale, cu_q_blk = quantize_for_block_scale_qk_along_d(
+        q, cu, fp8_type=torch.float8_e4m3fn)
+    k_fp8, k_descale, cu_k_blk = quantize_for_block_scale_qk_along_d(
+        k, cu, fp8_type=torch.float8_e4m3fn)
+    v_fp8, v_descale, cu_v_blk = quantize_for_block_scale_v_along_n(
+        v, cu, block_size=block_size, fp8_type=torch.float8_e4m3fn)
+
+    sf_q = pack_descale_to_e8m0x4_int32(q_descale)
+    sf_k = pack_descale_to_e8m0x4_int32(k_descale)
+    sf_v = pack_descale_to_e8m0x4_int32(v_descale).repeat_interleave(block_size, dim=1)
+
+    kv_cache_fp8, sf_k_cache, sf_v_cache = quantize_paged_kv_cache_for_block_scale(
+        kv_cache, block_size=block_size, fp8_type=torch.float8_e4m3fn)
+    sf_k = torch.cat([sf_k_cache, sf_k], dim=1).contiguous()
+    sf_v = torch.cat([sf_v_cache, sf_v], dim=1).contiguous()
+
+    q_deq = e8m0_dequant(q_fp8, q_descale, q.shape[0])
+    k_deq = e8m0_dequant(k_fp8, k_descale, k.shape[0])
+    v_deq = e8m0_dequant(v_fp8, v_descale, v.shape[0])
+    kv_cache_deq = dequantize_paged_kv_cache(kv_cache, kv_cache_fp8, block_size)
+
+    return {
+        "q_fp8": q_fp8, "k_fp8": k_fp8, "v_fp8": v_fp8,
+        "kv_cache_fp8": kv_cache_fp8,
+        "q_descale": q_descale, "k_descale": k_descale, "v_descale": v_descale,
+        "sf_q": sf_q, "sf_k": sf_k, "sf_v": sf_v,
+        "cu_q_blk": cu_q_blk, "cu_k_blk": cu_k_blk, "cu_v_blk": cu_v_blk,
+        "q_deq": q_deq, "k_deq": k_deq, "v_deq": v_deq,
+        "kv_cache_deq": kv_cache_deq,
+    }
+
+
+def quantize_nonpaged_inputs_for_block_scale(q, k, v, cu, block_size):
+    q_fp8, q_descale, cu_q_blk = quantize_for_block_scale_qk_along_d(
+        q, cu, fp8_type=torch.float8_e4m3fn)
+    k_fp8, k_descale, cu_k_blk = quantize_for_block_scale_qk_along_d(
+        k, cu, fp8_type=torch.float8_e4m3fn)
+    v_fp8, v_descale, cu_v_blk = quantize_for_block_scale_v_along_n(
+        v, cu, block_size=block_size, fp8_type=torch.float8_e4m3fn)
+
+    return {
+        "q_fp8": q_fp8, "k_fp8": k_fp8, "v_fp8": v_fp8,
+        "q_descale": q_descale, "k_descale": k_descale, "v_descale": v_descale,
+        "sf_q": pack_descale_to_e8m0x4_int32(q_descale),
+        "sf_k": pack_descale_to_e8m0x4_int32(k_descale),
+        "sf_v": pack_descale_to_e8m0x4_int32(v_descale).repeat_interleave(block_size, dim=1),
+        "cu_q_blk": cu_q_blk, "cu_k_blk": cu_k_blk, "cu_v_blk": cu_v_blk,
+    }
+
+
+def run_nonpaged_attn_quantized(tensors, cu, seqlen, num_targets, window_size):
+    out, _ = torch.ops.fbgemm.hstu_varlen_fwd_120(
+        tensors["q_fp8"], tensors["k_fp8"], tensors["v_fp8"],
+        cu, cu, None, None,
+        seqlen, seqlen, -1,
+        None, num_targets, 1,
+        window_size[0], window_size[1],
+        ALPHA,
+        None, None,
+        2,
+        tensors["q_descale"], tensors["k_descale"], tensors["v_descale"],
+        tensors["sf_q"], tensors["sf_k"], tensors["sf_v"],
+        tensors["cu_q_blk"], tensors["cu_k_blk"], tensors["cu_v_blk"],
+    )
+    return out
+
+
+def run_paged_attn_quantized(
+    tensors,
+    cu_q,
+    cu_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    num_targets,
+    window_size,
+    page_offsets,
+    page_ids,
+    last_page_lens,
+):
+    out, _ = torch.ops.fbgemm.hstu_varlen_fwd_120(
+        tensors["q_fp8"], tensors["k_fp8"], tensors["v_fp8"],
+        cu_q, cu_k, None, None,
+        max_seqlen_q, max_seqlen_k, -1,
+        None, num_targets, 1,
+        window_size[0], window_size[1],
+        ALPHA,
+        None, None,
+        2,
+        tensors["q_descale"], tensors["k_descale"], tensors["v_descale"],
+        tensors["sf_q"], tensors["sf_k"], tensors["sf_v"],
+        tensors["cu_q_blk"], tensors["cu_k_blk"], tensors["cu_v_blk"],
+        tensors["kv_cache_fp8"], page_offsets, page_ids, last_page_lens,
+    )
+    return out
+
+
+def make_paged_cache_from_contiguous_kv(k, v, batch_size, seqlen, page_size, page_ids):
+    total_pages = int(page_ids.numel())
+    heads = k.shape[1]
+    dim = k.shape[2]
+    kv_cache = torch.empty(
+        (total_pages, 2, page_size, heads, dim),
+        dtype=k.dtype,
+        device=k.device,
+    )
+    pages_per_batch = seqlen // page_size
+    for b in range(batch_size):
+        for p in range(pages_per_batch):
+            logical_page = b * pages_per_batch + p
+            page_id = int(page_ids[logical_page].item())
+            row0 = b * seqlen + p * page_size
+            row1 = row0 + page_size
+            kv_cache[page_id, 0] = k[row0:row1]
+            kv_cache[page_id, 1] = v[row0:row1]
+    return kv_cache
+
+
+def compute_paged_nonpaged_same_input_metrics(batch_size, heads, seqlen, mode):
+    D = 128
+    PAGE_SIZE = 64
+    assert seqlen % PAGE_SIZE == 0
+    seed = SEED + 9000 + batch_size * 100 + heads * 10 + seqlen + (1 if mode == "causal" else 0)
+    g = torch.Generator(device=DEVICE)
+    g.manual_seed(seed)
+
+    total_q = batch_size * seqlen
+    q = torch.randn((total_q, heads, D), generator=g, device=DEVICE, dtype=torch.bfloat16)
+    k = torch.randn((total_q, heads, D), generator=g, device=DEVICE, dtype=torch.bfloat16)
+    v = torch.randn((total_q, heads, D), generator=g, device=DEVICE, dtype=torch.bfloat16)
+    q = q.to(torch.float8_e4m3fn).to(torch.bfloat16)
+    k = k.to(torch.float8_e4m3fn).to(torch.bfloat16)
+    v = v.to(torch.float8_e4m3fn).to(torch.bfloat16)
+
+    cu = torch.arange(0, total_q + 1, seqlen, dtype=torch.int32, device=DEVICE)
+    pages_per_batch = seqlen // PAGE_SIZE
+    total_pages = batch_size * pages_per_batch
+    page_offsets = torch.arange(
+        0, total_pages + 1, pages_per_batch, dtype=torch.int32, device=DEVICE)
+    page_ids = torch.randperm(total_pages, generator=g, dtype=torch.int32, device=DEVICE)
+    last_page_lens = torch.full((batch_size,), PAGE_SIZE, dtype=torch.int32, device=DEVICE)
+    kv_cache = make_paged_cache_from_contiguous_kv(
+        k, v, batch_size, seqlen, PAGE_SIZE, page_ids)
+
+    window_size = (-1, 0) if mode == "causal" else (-1, -1)
+    num_targets = (
+        torch.zeros(batch_size, dtype=torch.int32, device=DEVICE)
+        if mode == "causal"
+        else None
+    )
+    nonpaged = quantize_nonpaged_inputs_for_block_scale(q, k, v, cu, PAGE_SIZE)
+    paged = quantize_paged_inputs_for_block_scale(q, k, v, kv_cache, cu, PAGE_SIZE)
+
+    out_nonpaged = run_nonpaged_attn_quantized(
+        nonpaged, cu, seqlen, num_targets, window_size)
+    out_paged = run_paged_attn_quantized(
+        paged, cu, cu, seqlen, seqlen, num_targets, window_size,
+        page_offsets, page_ids, last_page_lens)
+    torch.cuda.synchronize()
+
+    cos, max_err, mean_err = metric_report(out_paged.flatten(), out_nonpaged.flatten())
+    _, _, _, rel_l2 = norm_report(out_paged.flatten(), out_nonpaged.flatten())
+    return cos, max_err, mean_err, rel_l2
+
+
 def sum_report(a: torch.Tensor, b: torch.Tensor):
     sa = float(a.float().sum().item())
     sb = float(b.float().sum().item())
@@ -215,51 +410,40 @@ def compute_paged_kv_metrics(batch_size, heads, new_history_len, prev_history_le
     max_seqlen_q = new_history_len + target_len
     max_seqlen_k = new_history_len + prev_history_len + target_len
 
+    tensors = quantize_paged_inputs_for_block_scale(
+        q, k, v, kv_cache, cu_seqlens_q, PAGE_SIZE)
     ref = _hstu_paged_kv_attention(
         num_heads=heads,
         attention_dim=D,
         linear_dim=D,
         seqlen_q=max_seqlen_q,
         seqlen_k=max_seqlen_k,
-        q=q,
-        k=k,
-        v=v,
+        q=tensors["q_deq"],
+        k=tensors["k_deq"],
+        v=tensors["v_deq"],
         q_offsets=cu_seqlens_q,
         k_offsets=cu_seqlens_k,
         num_targets=num_targets,
         invalid_attn_mask=mask,
         alpha=ALPHA,
         upcast=True,
-        kv_cache=kv_cache,
+        kv_cache=tensors["kv_cache_deq"],
         page_offsets=page_offsets,
         page_ids=page_ids,
         last_page_lens=last_page_lens,
     )
 
-    out = hstu_attn_varlen_func(
-        q=q,
-        k=k,
-        v=v,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
-        seqused_q=None,
-        seqused_k=None,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        scaling_seqlen=-1,
-        num_contexts=None,
-        num_targets=num_targets,
-        target_group_size=1,
-        window_size=(-1, 0),
-        alpha=ALPHA,
-        rab=None,
-        has_drab=False,
-        kv_cache=kv_cache,
-        page_offsets=page_offsets,
-        page_ids=page_ids,
-        last_page_lens=last_page_lens,
-        func=None,
-        quant_mode=2,
+    out = run_paged_attn_quantized(
+        tensors,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        num_targets,
+        (-1, 0),
+        page_offsets,
+        page_ids,
+        last_page_lens,
     )
     torch.cuda.synchronize()
 
@@ -267,6 +451,103 @@ def compute_paged_kv_metrics(batch_size, heads, new_history_len, prev_history_le
     _, _, _, rel_l2 = norm_report(out.flatten(), ref.flatten())
     if cos < 0.995:
         raise AssertionError(f"paged KV fp8_gt_cos={cos:.6f} < 0.995")
+    return cos, max_err, mean_err, rel_l2, last_page_lens.detach().cpu().tolist()
+
+
+def make_full_paged_kv_input(batch_size, heads, seqlen, dtype=torch.float16):
+    D = 128
+    PAGE_SIZE = 64
+    pages_per_batch = (seqlen + PAGE_SIZE - 1) // PAGE_SIZE
+    total_pages = batch_size * pages_per_batch
+    total_q = batch_size * seqlen
+
+    q = torch.empty((total_q, heads, D), dtype=dtype, device=DEVICE).uniform_(-1, 1)
+    # Full paged-KV reads K/V from kv_cache only.  K/V tensors are schema
+    # placeholders used by the Python quantization wrapper for metadata.
+    k = torch.empty_like(q).uniform_(-1, 1)
+    v = torch.empty_like(q).uniform_(-1, 1)
+    kv_cache = torch.empty(
+        (total_pages, 2, PAGE_SIZE, heads, D),
+        dtype=dtype,
+        device=DEVICE,
+    ).uniform_(-1, 1)
+
+    cu = torch.arange(
+        0, total_q + 1, seqlen, dtype=torch.int32, device=DEVICE
+    )
+    page_offsets = torch.arange(
+        0, total_pages + 1, pages_per_batch, dtype=torch.int32, device=DEVICE
+    )
+    page_ids = torch.randperm(total_pages, dtype=torch.int32, device=DEVICE)
+    last_len = seqlen - (pages_per_batch - 1) * PAGE_SIZE
+    last_page_lens = torch.full(
+        (batch_size,), last_len, dtype=torch.int32, device=DEVICE
+    )
+    return q, k, v, kv_cache, cu, page_offsets, page_ids, last_page_lens
+
+
+def reconstruct_full_paged_kv(kv_cache, page_offsets, page_ids, last_page_lens, batch_idx):
+    k_chunks = []
+    v_chunks = []
+    start = int(page_offsets[batch_idx].item())
+    end = int(page_offsets[batch_idx + 1].item())
+    for page_pos in range(start, end):
+        page_id = int(page_ids[page_pos].item())
+        valid = kv_cache.shape[2]
+        if page_pos == end - 1:
+            valid = int(last_page_lens[batch_idx].item())
+        k_chunks.append(kv_cache[page_id, 0, :valid])
+        v_chunks.append(kv_cache[page_id, 1, :valid])
+    return torch.cat(k_chunks, dim=0), torch.cat(v_chunks, dim=0)
+
+
+def full_paged_ground_truth(q, kv_cache, cu, page_offsets, page_ids,
+                            last_page_lens, alpha, scaling_seqlen):
+    out = torch.empty_like(q)
+    batch_size = cu.numel() - 1
+    for b in range(batch_size):
+        q0 = int(cu[b].item())
+        q1 = int(cu[b + 1].item())
+        q_b = q[q0:q1].float()
+        k_b, v_b = reconstruct_full_paged_kv(
+            kv_cache, page_offsets, page_ids, last_page_lens, b)
+        s = torch.einsum("mhd,nhd->mhn", q_b, k_b.float())
+        s = torch.nn.functional.silu(s * float(alpha))
+        o = torch.einsum("mhn,nhd->mhd", s, v_b.float()) / float(scaling_seqlen)
+        out[q0:q1] = o.to(out.dtype)
+    return out
+
+
+def compute_full_paged_kv_metrics(batch_size, heads, seqlen, dtype=torch.float16):
+    torch.manual_seed(SEED + 7000 + batch_size * 100 + heads * 10 + seqlen)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED + 7000 + batch_size * 100 + heads * 10 + seqlen)
+
+    q, k, v, kv_cache, cu, page_offsets, page_ids, last_page_lens = (
+        make_full_paged_kv_input(batch_size, heads, seqlen, dtype=dtype)
+    )
+    tensors = quantize_paged_inputs_for_block_scale(q, k, v, kv_cache, cu, 64)
+    ref = full_paged_ground_truth(
+        tensors["q_deq"], tensors["kv_cache_deq"],
+        cu, page_offsets, page_ids, last_page_lens, ALPHA, seqlen)
+    out = run_paged_attn_quantized(
+        tensors,
+        cu,
+        cu,
+        seqlen,
+        seqlen,
+        None,
+        (-1, -1),
+        page_offsets,
+        page_ids,
+        last_page_lens,
+    )
+    torch.cuda.synchronize()
+
+    cos, max_err, mean_err = metric_report(out.flatten(), ref.flatten())
+    _, _, _, rel_l2 = norm_report(out.flatten(), ref.flatten())
+    if cos < 0.995:
+        raise AssertionError(f"full paged KV fp8_gt_cos={cos:.6f} < 0.995")
     return cos, max_err, mean_err, rel_l2, last_page_lens.detach().cpu().tolist()
 
 if GEMM1_ONLY:
@@ -285,11 +566,15 @@ else:
         f"{'||bf16||':>10} {'||fp8||':>10} {'rel_l2':>10} | "
         f"{'bf16_gt_cos':>11} {'bf16_gt_max':>12} {'bf16_gt_mean':>12} | "
         f"{'fp8_gt_cos':>10} {'fp8_gt_max':>11} {'fp8_gt_mean':>11} | "
-        f"{'paged_gt_cos':>12} {'paged_gt_max':>12} {'paged_gt_mean':>13}"
+        f"{'paged_c_cos':>12} {'paged_c_max':>12} {'paged_c_mean':>13} | "
+        f"{'paged_f_cos':>12} {'paged_f_max':>12} {'paged_f_mean':>13}"
     )
-    print("-" * 213)
+    print("-" * 256)
     if RUN_PAGED_KV_SWEEP:
-        print("[paged kv] appended columns use the current causal/target paged-KV path")
+        print(
+            "[paged kv] paged_f mirrors every non-paged full sweep row; "
+            "appended columns compare against dequantized FP8/e8m0 references"
+        )
 
 USE_ONES = os.getenv("HSTU_USE_ONES", "0") == "1"
 if USE_ONES:
@@ -402,16 +687,27 @@ for D in SWEEP_DIMS:
                 # FP8 kernel vs dequantized ground truth (correct comparison)
                 cos_f_gt, me_f_gt, mn_f_gt = metric_report(o_f, gt_deq_flat)
                 if RUN_PAGED_KV_SWEEP:
-                    paged_cos, paged_max, paged_mean, _, _ = compute_paged_kv_metrics(
+                    paged_c_cos, paged_c_max, paged_c_mean, _, _ = compute_paged_kv_metrics(
                         batch_size=BS,
                         heads=H,
                         new_history_len=SEQ,
                         prev_history_len=0,
                         target_len=0,
                     )
-                    paged_cols = f" | {paged_cos:>12.4f} {paged_max:>12.6f} {paged_mean:>13.6f}"
+                    paged_f_cos, paged_f_max, paged_f_mean, _, _ = compute_full_paged_kv_metrics(
+                        batch_size=BS,
+                        heads=H,
+                        seqlen=SEQ,
+                    )
+                    paged_cols = (
+                        f" | {paged_c_cos:>12.4f} {paged_c_max:>12.6f} {paged_c_mean:>13.6f}"
+                        f" | {paged_f_cos:>12.4f} {paged_f_max:>12.6f} {paged_f_mean:>13.6f}"
+                    )
                 else:
-                    paged_cols = f" | {'N/A':>12} {'N/A':>12} {'N/A':>13}"
+                    paged_cols = (
+                        f" | {'N/A':>12} {'N/A':>12} {'N/A':>13}"
+                        f" | {'N/A':>12} {'N/A':>12} {'N/A':>13}"
+                    )
                 print(
                     f"{D:>4} {H:>4} {SEQ:>6} | "
                     f"{cos:>12.4f} {me:>10.6f} {mn:>10.6f} | "
@@ -420,6 +716,36 @@ for D in SWEEP_DIMS:
                     f"{cos_f_gt:>10.4f} {me_f_gt:>11.6f} {mn_f_gt:>11.6f}{paged_cols}{flag}"
                 )
         sys.stdout.flush()
+
+
+def run_same_input_paged_vs_nonpaged():
+    print("\n[paged vs non-paged same input] same raw Q/K/V, same FP8 block scales")
+    print(
+        f"{'H':>4} {'SEQ':>6} {'MODE':>8} | "
+        f"{'cos':>10} {'max_err':>12} {'mean_err':>12} {'rel_l2':>10}"
+    )
+    print("-" * 72)
+    for H in SWEEP_HEADS:
+        for SEQ in SWEEP_SEQS:
+            for mode in ("full", "causal"):
+                cos, max_err, mean_err, rel_l2 = compute_paged_nonpaged_same_input_metrics(
+                    batch_size=BS,
+                    heads=H,
+                    seqlen=SEQ,
+                    mode=mode,
+                )
+                if cos < 0.999:
+                    raise AssertionError(
+                        f"same-input paged vs non-paged {mode} cos={cos:.6f} < 0.999"
+                    )
+                print(
+                    f"{H:>4} {SEQ:>6} {mode:>8} | "
+                    f"{cos:>10.6f} {max_err:>12.6f} {mean_err:>12.6f} {rel_l2:>10.6f}"
+                )
+
+
+if not GEMM1_ONLY and RUN_PAGED_KV_SWEEP:
+    run_same_input_paged_vs_nonpaged()
 
 
 def run_paged_kv_case(label, batch_size, heads, new_history_len, prev_history_len,
@@ -440,6 +766,21 @@ def run_paged_kv_case(label, batch_size, heads, new_history_len, prev_history_le
     )
 
 
+def run_full_paged_kv_case(label, batch_size, heads, seqlen, dtype=torch.float16):
+    cos, max_err, mean_err, rel_l2, last_page_lens = compute_full_paged_kv_metrics(
+        batch_size=batch_size,
+        heads=heads,
+        seqlen=seqlen,
+        dtype=dtype,
+    )
+    print(
+        f"{label:>22} | B={batch_size:<2} H={heads:<2} "
+        f"seq={seqlen:<3} full-paged | "
+        f"cos={cos:.6f} max={max_err:.6f} mean={mean_err:.6f} rel_l2={rel_l2:.6f} "
+        f"last_page={last_page_lens}"
+    )
+
+
 if (
     not GEMM1_ONLY
     and RUN_PAGED_KV_SWEEP
@@ -455,6 +796,7 @@ if (
                       new_history_len=64, prev_history_len=32, target_len=64)
     run_paged_kv_case("edge_target_zero", batch_size=1, heads=1,
                       new_history_len=128, prev_history_len=64, target_len=0)
+    run_full_paged_kv_case("edge_full_paged", batch_size=1, heads=2, seqlen=256)
 
 
 if os.getenv("HSTU_STAGE_PROBE", "0") == "1":

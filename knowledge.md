@@ -1,6 +1,24 @@
 # HSTU 架构实现对比：Blackwell (SM120) vs Hopper (SM90) vs Ampere (SM80)
 
-> 更新日期：2026-03-10
+> 更新日期：2026-05-06
+
+---
+
+## Phase 24 FP8 paged KV 性能结论
+
+- 初版 SM120 FP8 paged KV causal/target 走 per-tile grid `(num_m_block,h,b)`，在 `BS=4,SEQ=2048,H=16,D=128` 上 grid 为 `1024`、waves/SM `5.45`，NCU duration `467.1us`，local spilling requests `261632`。主要 regression 不是数学路径，而是没有进入 persistent scheduler，且 paged K/V 手动 LDG+STS gather 造成 scoreboard/spill。
+- 将 paged causal/target 接入 paired persistent scheduler 后，同 case grid 降为 `188`、waves/SM `1`，duration 降到 `350.4us`，local spilling requests 降到 `30928`。
+- 将 paged K/V tile copy 从同步 `LDG+STS` 改为 warp 内 `cp.async.cg.shared.global` 16B copy 后，同 case duration 降到 `200.2us`，local spilling requests 为 `0`；同轮 non-paged FP8 为 `169.6us`。
+- 全量 kernel benchmark `176` 相比旧 paged benchmark `175`：36 个 paged causal case 平均 latency 提升约 `62%`；`seq>=1024` 平均提升约 `110%`；paged 相对 non-paged FP8 的差距从约 `-58.8%` 收敛到约 `-14.2%`。剩余差距主要来自 paged K/V/SF 不能使用 non-paged TMA bulk load，仍需 load warp 按 page id gather。
+- `page_size == kBlockN == 64` 时，paged history K/V 可以用 TMA：把 physical `kv_cache` 描述成 `[page_size, d, h_k, total_pages]`，runtime 读取 `page_id` 后作为 TMA 高维坐标，单个 TMA box 直接搬 `[64,128]` 到 WS SW128 SMEM。它不是单条 TMA gather 多个 base address，而是把 physical page 维度纳入 affine TMA descriptor。
+- paged TMA threshold 版只在 `n_block_paged >= 16` 时对 history K/V/SFB/SFV 走 TMA；短 history 和 target tail 继续用 guarded `cp.async` copy。split-params/device-guard 版把 paged TMA descriptor 从 non-paged 参数结构中隔离，并让 non-paged device 实例不生成 paged copy lambda。
+- history SFB/SFV 复用现有 scale-factor TMA descriptor，scale tile id 为 `page_id * page_size / kBlockN`，并与 K/V 使用同一个 ready mbarrier。全量 benchmark `181` 相比 `176`：`seq>=1024` paged TFLOPS 平均 `+4.42%`，`seq>=4096` 平均 `+6.27%`；`seq>=4096` paged 相对 non-paged FP8 平均差距约 `-8.52%`。
+- full paged KV 不需要新 device load path：host 端允许 `num_targets=None` 且 `window_size=(-1,-1)`，device 端 `Is_target=false` 时 `actual_seqlen_h=actual_seqlen_k`，所有 K/V tile 都落在 paged history 分支并复用 page-cache TMA。全量 benchmark `182` 中，full paged 相对 non-paged FP8 全部 36 个 full case 平均 `-3.0%`，`seq>=1024` 平均 `-0.1%`，`seq>=4096` 平均 `+1.5%`；causal paged 仍平均约 `-8.2%`。
+- paged KV 的公平 correctness 口径必须和 non-paged 一样，比较 kernel 输出与 dequantized FP8/e8m0 reference。原先 paged reference 用 raw fp16 cache，会把量化误差算进 kernel 误差。改成公平口径后，`449/450` 日志显示 paged causal/full/edge cases 的 cosine 回到 `0.9996+`。
+- 如果要证明 paged 和 non-paged 逻辑等价，需要同一份 raw Q/K/V，同时让 V block-scale 粒度一致。`451_phase24_paged_same_input_sweep.log` 使用同一批随机 Q/K/V 构造 contiguous K/V 和 paged cache，并统一 `block_size=64`；full/causal、H=1/4、SEQ=128/256/512 均为 `max_err=0`，说明 aligned case 下两条路径输出 bitwise 一致。
+- `run_hstu8_examples.sh` 现在把原 14 个 HSTU8 non-paged example 逐个生成 paged mirror。当前可运行语义为 causal、context+causal、target+causal、arbitrary；RAB/DRAB/local 会触发 SM120 FP8 paged guard 并在脚本中标为 `PASS-UNSUPPORTED`，用于防止误以为这些语义已经支持。最新 examples 日志 `453` 为 `31/31 passed`；`sweep_accuracy.py` 的 `paged_f_*` 列覆盖每个 non-paged full sweep 行，日志 `455` 通过。
+- 当前 Python `quant_mode=2` wrapper 对 full paged 仍继承 V block-scale 的 N 对齐限制：例如 `seq=160` 会在量化阶段报 `quant_mode=2 requires N divisible by 128`，不会进入 SM120 kernel。causal/target paged 的 partial last page 仍已有 examples 覆盖。
+- paged causal TMA SASS 含 `UTMALDG.4D`，当前 SF TMA 版资源为 `REG:168 STACK:0 LOCAL:0`，无 `LDL/STL` 命中；`UTMALDG` 计数为 `10`。后续若要小 seq 也不回退，应拆 cp.async-paged 和 TMA-paged 为两个 dispatch specialization，避免短序列也携带 page TMA descriptor 固定开销。
 
 ---
 

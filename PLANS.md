@@ -34,14 +34,29 @@
 - `set_params_fprop_sm120` 已设置 `kv_cache` stride、page metadata 和 `is_paged_kv`。
 - SM120 FP8 traits 已支持 `Paged_KV` template bool；BF16 traits 仍固定 `Paged_KV=false`。
 - Python wrapper 已能在 SM120 `quant_mode=2` 下量化 paged `kv_cache`，并传入 combined cache+contiguous scale table。
-- 当前实现仅覆盖 no-RAB、causal/target、headDim128、`page_size=64`、forward。
+- 当前实现覆盖 no-RAB、full 和 causal/target、headDim128、`page_size=64`、forward。
 - 定向验证已通过：`B=1,H=1` paged KV cos `0.99875`；`B=2,H=4` paged KV cos `0.99876`；partial last page cos `0.99881`；target length 0 cos `0.99886`；非 paged `sweep_accuracy.py` 仍全部 `fp8_gt_cos >= 0.9996`。
+- profile 已支持 paged KV：`ncu_hstu_attn.py --target paged`，`run_profile.sh NNN desc paged` 或 `fp8,paged`。
+- paged causal/target 已接入 paired persistent scheduler；host grid 从 per-tile `(num_m_block,h,b)` 改为 `min(total_tile_pairs, SM_count)`。
+- paged K/V tile copy 已从同步 `LDG+STS` 改为 warp 内 `cp.async.cg.shared.global` 16B copy，再用 existing ready mbarrier 通知 math warp。
+- paged history K/V 已实现 page-cache TMA 版本：`kv_cache` 按 `[page_size, d, h_k, total_pages]` 建 TMA descriptor，load warp 使用 runtime `page_id` 作为 TMA 坐标直接搬 `[64,128]` tile。
+- 当前保留 `n_block_paged >= 16` 的 TMA 启发式；较小 history 和 paged target tail 继续用 guarded `cp.async` copy。history SFB/SFV 也使用现有 scale-factor TMA descriptor，scale tile id 为 `page_id * page_size / kBlockN`。
+- profile 结论：`BS=4,SEQ=2048,H=16,D=128 causal` 中 paged duration 从 `467.1us` 降到 persistent-only `350.4us`，再降到 persistent+cp.async `200.2us`；同轮 non-paged FP8 为 `169.6us`。
+- profile 指标：paged grid `1024 -> 188`，waves/SM `5.45 -> 1`，local spilling requests `261632 -> 30928 -> 0`，No Eligible `77.6% -> 73.6% -> 61.1%`。
+- 全量 kernel benchmark `176`：36 个 paged causal case 平均 latency 相比旧 benchmark `175` 提升约 `62%`；`seq>=1024` 平均提升约 `110%`；paged 相对 non-paged FP8 的差距从约 `-58.8%` 收敛到约 `-14.2%`。
+- 全量 kernel benchmark `181`：paged TMA + SF TMA 版相对 `176` cp.async paged，`seq>=1024` 平均 paged TFLOPS `+4.42%`，`seq>=4096` 平均 `+6.27%`；`seq>=4096` paged 相对 non-paged FP8 平均差距约 `-8.52%`。
+- full paged KV 已接入：`hstu_varlen_fwd_120` 允许 `num_targets=None` 且 `window_size=(-1,-1)` 的 paged KV full path，device 端复用同一 paged TMA history K/V/SFB/SFV load 逻辑。correctness 日志：build `1test_results/446_phase24_paged_full_guard_build.log`；sweep `1test_results/447_phase24_paged_full_guard_sweep.log`；examples `1test_results/448_phase24_paged_full_guard_examples.log`，其中 examples 为 `31/31 passed`。
+- paged KV 公平误差对比已改为 dequantized FP8/e8m0 reference：先手动量化 Q/K/V/kv_cache，再用同一批 FP8 tensor 和 e8m0 scale 重建 Python reference。`1test_results/449_phase24_paged_fair_ref_sweep.log` 中 paged causal/full `cos=0.9996~0.9997`；`1test_results/450_phase24_paged_fair_ref_edges.log` 中 partial page/target/full edge `cos>=0.99962`。
+- paged vs non-paged same-input 对照已加入 `sweep_accuracy.py`：同一份 raw Q/K/V 生成 contiguous K/V 和 paged cache，两边都用 `block_size=64` 量化以保证 V scale 粒度一致。`1test_results/451_phase24_paged_same_input_sweep.log` 显示 full/causal、H=1/4、SEQ=128/256/512 全部 `max_err=0`，说明 aligned case 下 paged 与 non-paged 输出 bitwise 一致。
+- examples 已按原 14 个 non-paged HSTU8 example 逐个生成 paged mirror：causal、context+causal、target+causal、arbitrary 真实运行并通过；RAB/DRAB/local 仍属于当前 SM120 FP8 paged guard 的不支持范围，脚本标记为 `PASS-UNSUPPORTED` 并验证会触发明确错误。最新日志 `1test_results/456_phase24_paged_mirror_examples_final.log` 为 `31/31 passed`。`sweep_accuracy.py` 的 `paged_f_*` 列覆盖每个 non-paged full sweep 行，最新日志 `1test_results/455_phase24_paged_mirror_sweep.log` 通过，same-input full/causal 继续 `max_err=0`。
+- benchmark `182`：full paged 相对 non-paged FP8，全部 36 个 full case 平均 `-3.0%`，`seq>=1024` 平均 `-0.1%`，`seq>=4096` 平均 `+1.5%`；causal paged 平均约 `-8.2%`，`seq>=4096` 平均约 `-8.3%`。
+- SASS：paged causal TMA 实例含 `UTMALDG.4D`，当前 SF TMA 版资源 `REG:168 STACK:0 LOCAL:0`，无 `LDL/STL` 命中；`UTMALDG` 计数为 `10`。
 
 第一阶段范围：
 
 - forward only。
 - SM120 FP8 `quant_mode=2`。
-- no-RAB、causal/target paged KV 优先。
+- no-RAB、full 和 causal/target paged KV 优先。
 - headDim128 优先。
 - 初始只支持 `page_size == kBlockN`，优先匹配当前 BN64 路径；不先支持跨 page 的单个 N tile。
 - 先不做 backward、RAB、arbitrary mask、local window 的完整支持。
@@ -62,7 +77,10 @@
 
 3. Paged K/V load
    - 参考 Ampere `Paged_KV` 逻辑：`n_block < n_block_paged` 走 paged cache，后续 target/new tokens 走普通 contiguous K/V。
-   - 第一版没有为 paged cache 建 TMA descriptor；paged K/V 由 K-load/V-load warp 手动 gather 到原 WS SW128 SMEM layout。
+   - 当前已为 physical paged cache 建 TMA descriptor：形状 `[page_size, d, h_k, total_pages]`，`page_id` 是 TMA 坐标而不是手工 gather base list。
+   - history page block 数达到 `16` 时，paged K/V 直接 TMA 到原 WS SW128 SMEM layout。
+   - history SFB/SFV 也用现有 scale-factor TMA descriptor 搬运，scale tile id 为 `page_id * page_size / kBlockN`，并与 K/V 使用同一个 ready mbarrier。
+   - history 较短时保留 `cp.async.cg.shared.global` 16B copy，避免小 seq 被 page TMA descriptor/控制流固定开销拖慢。
    - K load 用 `page_ids[page_offsets[bidb] + n_block]` 映射到物理 page；V load 使用同一个 page id，K/V tensor 维度分别取 0/1。
    - contiguous target K/V 也在 paged path 中由 load warp 手动 copy，避免 target 起点不按 `kBlockN` 对齐时 TMA tile index 不清。
    - 保持 Q/O 路径不变。
@@ -77,12 +95,12 @@
 5. Mask 和 block info
    - 在 SM120 `HstuBlockInfo` 中启用 `page_offsets/page_ids/last_page_lens`。
    - 对齐 Ampere 的 `n_block_history`、`n_block_target`、`last_page_offset` 语义。
-   - 重点保证 target rows 对 paged history 的 causal mask 正确。
+   - 重点保证 full no-target、target rows 对 paged history 的 causal mask 正确。
    - 初始不支持 RAB/arbitrary/local，降低 mask 组合复杂度。
 
 6. Correctness 验证
    - 基于 `HSTUPagedKVTest` 增加 SM120 FP8 paged KV 定向测试。
-   - 先覆盖：`page_size=64`、headDim128、causal、target length 为 0 和非 0。
+   - 先覆盖：`page_size=64`、headDim128、full、causal、target length 为 0 和非 0。
    - 对比 BF16 reference 或 FP8 Python reference，要求 cosine >= 0.995，理想 >= 0.999。
    - 小 shape 先跑 compute-sanitizer，重点查 page 边界和 last page。
    - 当前已完成 aligned directed、last page 非满、target length 为 0；还需要补 varlen batch 的正式测试。
@@ -93,14 +111,19 @@
    - 与“手动 gather 成 contiguous K/V 后的 SM120 FP8”做同 shape 对照。
    - dump SASS 检查 `LDL/STL`，目标仍保持无 register spill。
    - NCU 重点看 TMA pipe、page-id gather 开销、mbarrier wait、No Eligible 和 L2 hit。
+   - 当前日志：profile `176/177/178_phase24_*paged*_profile.*`，benchmark `2benchmark_results/176_bbb84710_gpu2407MHz_phase24_paged_persistent_cpasync_kernel.log`，correctness `1test_results/412_phase24_paged_persistent_cpasync_sweep.log`、`413_phase24_paged_persistent_cpasync_examples.log`。
+   - paged TMA + SF TMA 日志：build `1test_results/437_phase24_paged_tma_sf_tma_build.log`；correctness `1test_results/438_phase24_paged_tma_sf_tma_sweep.log`、`439_phase24_paged_tma_sf_tma_examples.log`；benchmark `2benchmark_results/181_bbb84710_gpu2407MHz_phase24_paged_tma_sf_tma_kernel.log`；SASS `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_paged_causal_tma_sf_tma.sass`。
+   - full paged 日志：build `1test_results/446_phase24_paged_full_guard_build.log`；correctness `1test_results/447_phase24_paged_full_guard_sweep.log`、`448_phase24_paged_full_guard_examples.log`；fair-reference correctness `1test_results/449_phase24_paged_fair_ref_sweep.log`、`450_phase24_paged_fair_ref_edges.log`；same-input output parity `1test_results/451_phase24_paged_same_input_sweep.log`；paged mirror examples/sweep `1test_results/456_phase24_paged_mirror_examples_final.log`、`455_phase24_paged_mirror_sweep.log`；benchmark `2benchmark_results/182_fcb69d8a_gpu2407MHz_phase24_paged_full_kernel.log`。
 
 风险点：
 
-- TMA 不支持一个 tile 内跨多个非连续 physical page gather；因此必须先限制 `page_size == kBlockN`。
+- TMA 不支持一个 tile 内跨多个非连续 physical page gather；因此必须先限制 `page_size == kBlockN`。在该限制下，paged history K/V 可以把 physical `page_id` 当作 TMA 坐标直接搬运。
 - FP8 block-scale 的 K/V cache scale-factor 索引比 BF16 paged KV 更复杂，是本阶段最大 correctness 风险。
 - paged target mask 中 `last_page_lens` 和 `last_page_offset` 容易出现 off-by-one。
-- 新 specialization 可能增加 register pressure；每个保留版本必须检查 SASS spill。
+- full paged 的 Python `quant_mode=2` wrapper 仍要求 N 按 128 对齐；`seq=160` 会在量化阶段失败，尚未覆盖 full partial-last-page。
+- 新 specialization 可能增加 register pressure；persistent+cp.async profile 当前显示 local spilling requests 为 0，但每个保留版本仍必须检查 SASS/profile。
 - persistent scheduler 当前按 logical tile decode；paged KV 需要保证 load/math 两边 page-id decode 完全一致。
+- 当前 full paged 大 seq 已与 non-paged FP8 基本持平；causal paged 大 seq 仍约落后 non-paged FP8 `8%`。主要剩余差距来自 page-id/descriptor 控制流、target tail 手工 copy，以及 page TMA descriptor 固定开销。若要小 seq 和大 seq 都最优，下一步应考虑拆成独立 cp.async-paged 与 TMA-paged dispatch specialization，避免小 seq 也携带 TMA descriptor。
 
 ## Phase 22：BF16 默认路径优化
 

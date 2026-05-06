@@ -420,9 +420,14 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_120(
     TORCH_CHECK(quant_mode == 2, "SM120 paged KV initial path requires quant_mode=2");
     TORCH_CHECK(!has_rab, "SM120 FP8 paged KV initial path does not support RAB");
     TORCH_CHECK(head_size == 128, "SM120 FP8 paged KV initial path requires head_size=128");
-    TORCH_CHECK(num_targets.has_value(), "SM120 paged KV initial path requires target mask");
-    TORCH_CHECK(window_size_right == 0,
-        "SM120 paged KV initial path requires causal window_size_right=0");
+    const bool is_full_paged_kv =
+        !num_targets.has_value() && window_size_left < 0 && window_size_right < 0;
+    const bool is_causal_or_target_paged_kv =
+        num_targets.has_value() && window_size_left < 0 && window_size_right == 0;
+    TORCH_CHECK(
+        is_full_paged_kv || is_causal_or_target_paged_kv,
+        "SM120 FP8 paged KV supports full window (-1,-1) without num_targets, "
+        "or causal/target mode with num_targets and window_size_right=0");
     const at::Tensor& kv = kv_cache.value();
     CHECK_DEVICE(kv);
     CHECK_CONTIGUOUS(kv);
