@@ -154,9 +154,9 @@ def quantize_for_block_scale_v_along_n(x, seq_offsets, block_size=128, fp8_type=
     with torch.no_grad():
         for i in range(B):
             actual_len = seq_offsets[i + 1] - seq_offsets[i]
-            if int(actual_len.item()) % 128 != 0:
+            if int(actual_len.item()) % block_size != 0:
                 raise ValueError(
-                    f"AssertError: quant_mode=2 requires N divisible by 128, got N={int(actual_len.item())} in batch {i}"
+                    f"AssertError: quant_mode=2 requires N divisible by block_size={block_size}, got N={int(actual_len.item())} in batch {i}"
                 )
             cur_bs_tensor = x[seq_offsets[i]:(seq_offsets[i] + actual_len)]
             actual_len_padding_block_num = (actual_len + block_size - 1) // block_size
@@ -191,6 +191,46 @@ def pack_descale_to_e8m0x4_int32(descale: torch.Tensor) -> torch.Tensor:
     return (word | (word << 8) | (word << 16) | (word << 24)).contiguous()
 
 
+def quantize_paged_kv_cache_for_block_scale(
+    kv_cache: torch.Tensor,
+    block_size: int,
+    fp8_type=torch.float8_e4m3fn,
+):
+    if kv_cache.dim() != 5:
+        raise ValueError("kv_cache must have shape [pages, 2, page_size, heads, dim]")
+    if kv_cache.size(1) != 2:
+        raise ValueError("kv_cache second dimension must be 2")
+    if kv_cache.size(2) != block_size:
+        raise ValueError(f"kv_cache page_size must equal block_size={block_size}")
+    pages, _, page_size, heads, dim = kv_cache.shape
+    if dim % 128 != 0:
+        raise ValueError(f"D must be divisible by 128 for paged K cache, got D={dim}")
+    fp8_max = 448.0 if fp8_type == torch.float8_e4m3fn else 57344.0
+
+    with torch.no_grad():
+        k_cache = kv_cache[:, 0].contiguous()
+        v_cache = kv_cache[:, 1].contiguous()
+
+        k_view = k_cache.view(pages * page_size, heads, dim // 128, 128)
+        k_scale = torch.amax(k_view.abs(), dim=3).to(torch.float32) / fp8_max
+        k_scale = _round_descale_to_e8m0(k_scale)
+        k_fp8 = (k_view / k_scale.unsqueeze(-1)).to(fp8_type).view(pages, page_size, heads, dim)
+        k_scale_flat = k_scale.permute(0, 2, 1).reshape(pages * page_size * (dim // 128), heads)
+        sf_k_cache = pack_descale_to_e8m0x4_int32(k_scale_flat.transpose(1, 0).contiguous())
+
+        v_scale = torch.amax(v_cache.abs(), dim=(1, 3)).to(torch.float32) / fp8_max
+        v_scale = _round_descale_to_e8m0(v_scale)  # [pages, heads]
+        v_fp8 = (v_cache / v_scale[:, None, :, None]).to(fp8_type)
+        sf_v_cache = pack_descale_to_e8m0x4_int32(
+            v_scale.transpose(1, 0).contiguous()
+        ).repeat_interleave(block_size, dim=1)
+
+        kv_cache_fp8 = torch.empty_like(kv_cache, dtype=fp8_type)
+        kv_cache_fp8[:, 0] = k_fp8
+        kv_cache_fp8[:, 1] = v_fp8
+    return kv_cache_fp8.contiguous(), sf_k_cache, sf_v_cache
+
+
 # Backward compatibility for older call sites.
 def quantize_for_block_scale(x, seq_offsets, block_size=128, fp8_type=torch.float8_e4m3fn):
     return quantize_for_block_scale_v_along_n(x, seq_offsets, block_size=block_size, fp8_type=fp8_type)
@@ -212,7 +252,7 @@ def get_bm_and_bn_block_size_fwd(rab, dim):
         if dim == 64:
             return 128, 128
         elif dim == 128:
-            return 128, 128
+            return 128, 64
         else:
             return 128, 64
 
@@ -329,19 +369,38 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
                 # Blockwise FP8 quantization
                 dim = q.shape[-1]
                 bm, bn = get_bm_and_bn_block_size_fwd(rab, dim)
+                is_paged_kv = (
+                    kv_cache is not None
+                    and page_offsets is not None
+                    and page_ids is not None
+                    and last_page_lens is not None
+                )
+                if is_paged_kv:
+                    if rab is not None:
+                        raise ValueError("SM120 FP8 paged KV initial path does not support RAB")
+                    if dim != 128 or bn != 64:
+                        raise ValueError("SM120 FP8 paged KV initial path requires headDim=128 and kBlockN=64")
+                    if kv_cache.shape[2] != bn:
+                        raise ValueError(f"SM120 FP8 paged KV requires page_size={bn}")
                 q_raw, k_raw, v_raw = q, k, v
+                kv_quant_offsets = cu_seqlens_q if is_paged_kv else cu_seqlens_k
                 q, q_descale, cu_seqlens_q_block_descale = quantize_for_block_scale_qk_along_d(
                     q, cu_seqlens_q, fp8_type=torch.float8_e4m3fn)
                 k, k_descale, cu_seqlens_kv_block_descale = quantize_for_block_scale_qk_along_d(
-                    k, cu_seqlens_k, fp8_type=torch.float8_e4m3fn)
+                    k, kv_quant_offsets, fp8_type=torch.float8_e4m3fn)
                 v, v_descale, cu_seqlens_v_block_descale = quantize_for_block_scale_v_along_n(
-                    v, cu_seqlens_k, block_size=bn, fp8_type=torch.float8_e4m3fn)
+                    v, kv_quant_offsets, block_size=bn, fp8_type=torch.float8_e4m3fn)
                 sf_q_packed = pack_descale_to_e8m0x4_int32(q_descale)
                 sf_k_packed = pack_descale_to_e8m0x4_int32(k_descale)
                 # v_descale has shape [H, total_blocks]; expand to [H, total_tokens] so
                 # sf_v_packed has the same layout as sf_k_packed and TMA SFV can use
                 # identical kBlockN-element tiles indexed by nb_abs (same as SFB).
                 sf_v_packed = pack_descale_to_e8m0x4_int32(v_descale).repeat_interleave(bn, dim=1)
+                if is_paged_kv:
+                    kv_cache, sf_k_cache_packed, sf_v_cache_packed = quantize_paged_kv_cache_for_block_scale(
+                        kv_cache, block_size=bn, fp8_type=torch.float8_e4m3fn)
+                    sf_k_packed = torch.cat([sf_k_cache_packed, sf_k_packed], dim=1).contiguous()
+                    sf_v_packed = torch.cat([sf_v_cache_packed, sf_v_packed], dim=1).contiguous()
                 if _hstu_debug_enabled():
                     print(
                         f"[HSTU_DEBUG] quant_mode=2 bm={bm} bn={bn} "
@@ -393,6 +452,10 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
                 cu_seqlens_q_block_descale,
                 cu_seqlens_kv_block_descale,
                 cu_seqlens_v_block_descale,
+                kv_cache,
+                page_offsets,
+                page_ids,
+                last_page_lens,
             )
         elif major_version == 8:
             out, rab_padded = torch.ops.fbgemm.hstu_varlen_fwd_80(
@@ -909,6 +972,7 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
                 None, None, None,  # descale_q/k/v
                 None, None, None,  # sf_q/k/v_packed
                 None, None, None,  # cu_seqlens_q/kv/v_block_descale
+                None, None, None, None,  # kv_cache/page_offsets/page_ids/last_page_lens
             )
         elif major_version == 8:
             out, rab_padded = torch.ops.fbgemm.hstu_varlen_fwd_80(

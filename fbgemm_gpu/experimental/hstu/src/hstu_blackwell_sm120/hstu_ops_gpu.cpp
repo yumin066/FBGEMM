@@ -55,14 +55,19 @@ void set_params_fprop_sm120(
     const at::Tensor k,
     const at::Tensor v,
     const at::Tensor rab,
+    const std::optional<at::Tensor>& kv_cache,
     at::Tensor out,
     void* num_contexts_d,
     void* cu_seqlens_q_d,
     void* cu_seqlens_k_d,
     void* seqused_q_d,
     void* seqused_k_d,
+    void* page_offsets,
+    void* page_ids,
+    void* last_page_lens,
     void* num_targets_d,
     bool has_rab,
+    bool is_paged_kv,
     int quant_mode,
     const std::optional<at::Tensor>& func,
     int window_size_left,
@@ -174,8 +179,24 @@ void set_params_fprop_sm120(
     TORCH_CHECK(params->n_func == HSTU_ARBITRARY_NFUNC, "n_func mismatch");
   }
 
-  // No paged KV support in first Blackwell impl
-  params->is_paged_kv = false;
+  params->is_paged_kv = is_paged_kv;
+  if (is_paged_kv) {
+    const at::Tensor& kv = kv_cache.value();
+    params->kv_cache_ptr = kv.data_ptr();
+    params->kv_cache_row_stride = kv.stride(-2);
+    params->kv_cache_head_stride = kv.stride(-3);
+    params->kv_cache_page_stride = kv.stride(-4);
+    params->kv_cache_kvtensor_stride = kv.stride(-5);
+    params->page_size = kv.size(-3);
+    params->total_pages = kv.size(-5);
+  } else {
+    params->kv_cache_ptr = nullptr;
+    params->page_size = 0;
+    params->total_pages = 0;
+  }
+  params->page_offsets = static_cast<int*>(page_offsets);
+  params->page_ids = static_cast<int*>(page_ids);
+  params->last_page_lens = static_cast<int*>(last_page_lens);
 
   // Runtime EXP-A switch (no recompile needed):
   // export HSTU_EXP_A_SYNC_K=1 to disable K prefetch and reload K synchronously.
@@ -325,7 +346,11 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_120(
     // Block-wise descale cumulative seqlens (quant_mode=2 only)
     const std::optional<at::Tensor>& cu_seqlens_q_block_descale,
     const std::optional<at::Tensor>& cu_seqlens_kv_block_descale,
-    const std::optional<at::Tensor>& cu_seqlens_v_block_descale) {
+    const std::optional<at::Tensor>& cu_seqlens_v_block_descale,
+    const std::optional<at::Tensor>& kv_cache,
+    const std::optional<at::Tensor>& page_offsets,
+    const std::optional<at::Tensor>& page_ids,
+    const std::optional<at::Tensor>& last_page_lens) {
   auto dprops = at::cuda::getCurrentDeviceProperties();
   const int arch = dprops->major * 10 + dprops->minor;
   TORCH_CHECK(arch >= 120, "hstu_varlen_fwd_120 requires SM120+ (Blackwell) GPU, got SM", arch);
@@ -372,6 +397,9 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_120(
   const int head_size = q.size(2);
   const int total_k = k.size(0);
   const int num_heads_k = k.size(1);
+  const bool is_paged_kv = kv_cache.has_value() && page_offsets.has_value() &&
+      page_ids.has_value() && last_page_lens.has_value();
+  bool has_rab = rab.has_value();
 
   CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
   CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
@@ -387,6 +415,45 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_120(
   // V must be row-major (d-stride=1). WS TMA path uses row-major V with LDSM_T transpose.
   TORCH_CHECK(v.stride(-1) == 1,
       "v must have contiguous last dimension (row-major)");
+
+  if (is_paged_kv) {
+    TORCH_CHECK(quant_mode == 2, "SM120 paged KV initial path requires quant_mode=2");
+    TORCH_CHECK(!has_rab, "SM120 FP8 paged KV initial path does not support RAB");
+    TORCH_CHECK(head_size == 128, "SM120 FP8 paged KV initial path requires head_size=128");
+    TORCH_CHECK(num_targets.has_value(), "SM120 paged KV initial path requires target mask");
+    TORCH_CHECK(window_size_right == 0,
+        "SM120 paged KV initial path requires causal window_size_right=0");
+    const at::Tensor& kv = kv_cache.value();
+    CHECK_DEVICE(kv);
+    CHECK_CONTIGUOUS(kv);
+    TORCH_CHECK(kv.dtype() == at::kFloat8_e4m3fn,
+        "SM120 FP8 paged KV requires kv_cache dtype float8_e4m3fn");
+    TORCH_CHECK(kv.dim() == 5,
+        "kv_cache must have shape [total_pages, 2, page_size, num_heads_k, head_size]");
+    TORCH_CHECK(kv.size(1) == 2, "kv_cache second dimension must be 2 (K,V)");
+    TORCH_CHECK(kv.size(2) == 64,
+        "SM120 FP8 paged KV initial path requires page_size=64");
+    TORCH_CHECK(kv.size(3) == num_heads_k, "kv_cache num_heads_k mismatch");
+    TORCH_CHECK(kv.size(4) == head_size, "kv_cache head_size mismatch");
+    TORCH_CHECK(kv.stride(-1) == 1, "kv_cache must have contiguous last dimension");
+    CHECK_DEVICE(page_offsets.value());
+    CHECK_DEVICE(page_ids.value());
+    CHECK_DEVICE(last_page_lens.value());
+    CHECK_CONTIGUOUS(page_offsets.value());
+    CHECK_CONTIGUOUS(page_ids.value());
+    CHECK_CONTIGUOUS(last_page_lens.value());
+    TORCH_CHECK(page_offsets.value().dtype() == at::kInt, "page_offsets must be int32");
+    TORCH_CHECK(page_ids.value().dtype() == at::kInt, "page_ids must be int32");
+    TORCH_CHECK(last_page_lens.value().dtype() == at::kInt, "last_page_lens must be int32");
+    CHECK_SHAPE(page_offsets.value(), batch_size + 1);
+    CHECK_SHAPE(last_page_lens.value(), batch_size);
+    TORCH_CHECK(sf_k_packed.has_value() && sf_v_packed.has_value(),
+        "SM120 FP8 paged KV requires combined sf_k_packed and sf_v_packed");
+  } else {
+    TORCH_CHECK(!kv_cache.has_value() && !page_offsets.has_value() &&
+            !page_ids.has_value() && !last_page_lens.has_value(),
+        "kv_cache/page_offsets/page_ids/last_page_lens must either all be provided or all be None");
+  }
 
   // FP8 mode: output is float16 (matches q_raw dtype from which q was quantized).
   // float16 has 10 mantissa bits (step=0.0625 at 64) vs BF16's 7 (step=0.5 at 64),
@@ -404,7 +471,6 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_120(
   const int seqlen_q_rounded = round_multiple(max_seqlen_q, 16);
   const int seqlen_k_rounded = round_multiple(max_seqlen_k, 16);
 
-  bool has_rab = rab.has_value();
   int num_heads_rab = num_heads;
   if (has_rab) {
     num_heads_rab = rab.value().size(1);
@@ -440,14 +506,19 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_120(
       head_size, static_cast<float>(alpha),
       q, k, v,
       has_rab ? rab.value() : at::Tensor(),
+      kv_cache,
       out,
       num_contexts.has_value() ? num_contexts.value().data_ptr() : nullptr,
       cu_seqlens_q.data_ptr(),
       cu_seqlens_k.data_ptr(),
       seqused_q.has_value() ? seqused_q.value().data_ptr() : nullptr,
       seqused_k.has_value() ? seqused_k.value().data_ptr() : nullptr,
+      page_offsets.has_value() ? page_offsets.value().data_ptr() : nullptr,
+      page_ids.has_value() ? page_ids.value().data_ptr() : nullptr,
+      last_page_lens.has_value() ? last_page_lens.value().data_ptr() : nullptr,
       num_targets.has_value() ? num_targets.value().data_ptr() : nullptr,
       has_rab,
+      is_paged_kv,
       static_cast<int>(quant_mode),
       func,
       static_cast<int>(window_size_left),
@@ -529,7 +600,9 @@ TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
       "Tensor? descale_q, Tensor? descale_k, Tensor? descale_v, "
       "Tensor? sf_q_packed, Tensor? sf_k_packed, Tensor? sf_v_packed, "
       "Tensor? cu_seqlens_q_block_descale, Tensor? cu_seqlens_kv_block_descale, "
-      "Tensor? cu_seqlens_v_block_descale"
+      "Tensor? cu_seqlens_v_block_descale, "
+      "Tensor? kv_cache=None, Tensor? page_offsets=None, Tensor? page_ids=None, "
+      "Tensor? last_page_lens=None"
       ") -> (Tensor, Tensor)");
 }
 

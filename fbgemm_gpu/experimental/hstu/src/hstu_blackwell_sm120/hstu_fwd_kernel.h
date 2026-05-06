@@ -1335,6 +1335,16 @@ struct Hstu_fwd_params_fp8_ws_tma : public Hstu_fwd_params {
     TMA_O_t   tma_o;   // TMA descriptor for O store:  [total_q, d, h] (same dim ordering as tma_q)
 };
 
+template <typename TMA_Q_t, typename TMA_K_t, typename TMA_Vt_t,
+          typename TMA_SFA_t, typename TMA_SFB_t, typename TMA_SFV_t, typename TMA_O_t,
+          typename TMA_KPage_t, typename TMA_VtPage_t>
+struct Hstu_fwd_params_fp8_ws_tma_paged
+    : public Hstu_fwd_params_fp8_ws_tma<
+          TMA_Q_t, TMA_K_t, TMA_Vt_t, TMA_SFA_t, TMA_SFB_t, TMA_SFV_t, TMA_O_t> {
+    TMA_KPage_t  tma_k_page;   // TMA descriptor for paged K: [page_size, d, h_k, total_pages]
+    TMA_VtPage_t tma_vt_page;  // TMA descriptor for paged V: [page_size, d, h_k, total_pages]
+};
+
 namespace flash {  // reopen flash namespace for kernel
 
 #include "hstu_fwd_kernel_fp8_ws.h"  // Phase 6 WS kernel
@@ -1357,13 +1367,14 @@ template <
     bool Is_arbitrary,
     int kNFunc,
     bool Has_rab,
+    bool Paged_KV = false,
     bool Is_Q_in_regs = false,
     bool Share_Q_K_smem = false>
 void run_hstu_fwd_sm120_fp8_ws_tma_impl(Hstu_fwd_params& params, cudaStream_t stream) {
   using Kernel_traits = Hstu_fwd_kernel_traits_sm120_fp8_ws<
       kHeadDim, kBlockM, kBlockN, kNWarps,
       Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc, Has_rab,
-      Is_Q_in_regs, Share_Q_K_smem, cutlass::half_t>;
+      Paged_KV, Is_Q_in_regs, Share_Q_K_smem, cutlass::half_t>;
 
   using FP8Elem = typename Kernel_traits::Element;
   using SmemLayoutQ_TMA  = typename Kernel_traits::SmemLayoutQ_TMA;
@@ -1499,16 +1510,6 @@ void run_hstu_fwd_sm120_fp8_ws_tma_impl(Hstu_fwd_params& params, cudaStream_t st
   using TMA_SFV_t = decltype(tma_sfv);
   using TMA_O_t   = decltype(tma_o);
 
-  Hstu_fwd_params_fp8_ws_tma<TMA_Q_t, TMA_K_t, TMA_Vt_t, TMA_SFA_t, TMA_SFB_t, TMA_SFV_t, TMA_O_t> tma_params;
-  static_cast<Hstu_fwd_params&>(tma_params) = params;
-  tma_params.tma_q   = tma_q;
-  tma_params.tma_k   = tma_k;
-  tma_params.tma_vt  = tma_vt;
-  tma_params.tma_sfa = tma_sfa;
-  tma_params.tma_sfb = tma_sfb;
-  tma_params.tma_sfv = tma_sfv;
-  tma_params.tma_o   = tma_o;
-
   size_t smem_size = Kernel_traits::kSmemSize;
   const int num_m_block = (params.seqlen_q + kBlockM - 1) / kBlockM;
   const int total_tiles = num_m_block * params.h * params.b;
@@ -1516,7 +1517,8 @@ void run_hstu_fwd_sm120_fp8_ws_tma_impl(Hstu_fwd_params& params, cudaStream_t st
   static constexpr bool Use_full_persistent =
       !Is_causal && !Is_target && !Is_context && !Is_local && !Is_arbitrary;
   static constexpr bool Use_paired_persistent =
-      Is_causal && !Is_target && !Is_context && !Is_local && !Is_arbitrary;
+      Is_causal && !Is_context && !Is_local && !Is_arbitrary &&
+      (!Is_target || Paged_KV);
   static constexpr bool Use_persistent = Use_full_persistent || Use_paired_persistent;
   const int persistent_work_units = Use_paired_persistent ? total_tile_pairs : total_tiles;
   int sm_count = 0;
@@ -1528,16 +1530,79 @@ void run_hstu_fwd_sm120_fp8_ws_tma_impl(Hstu_fwd_params& params, cudaStream_t st
   dim3 grid = Use_persistent
       ? dim3(std::min(persistent_work_units, sm_count))
       : dim3(num_m_block, params.h, params.b);
-  auto kernel = &flash::hstu_fwd_kernel_sm120_fp8_ws_tma<
-      Kernel_traits, TMA_Q_t, TMA_K_t, TMA_Vt_t, TMA_SFA_t, TMA_SFB_t, TMA_SFV_t, TMA_O_t>;
 
-  if (smem_size >= 48 * 1024) {
-    C10_CUDA_CHECK(cudaFuncSetAttribute(
-        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+  auto launch_tma_kernel = [&](auto& tma_params) {
+    using TmaParamsT = std::decay_t<decltype(tma_params)>;
+    auto kernel = &flash::hstu_fwd_kernel_sm120_fp8_ws_tma<Kernel_traits, TmaParamsT>;
+    if (smem_size >= 48 * 1024) {
+      C10_CUDA_CHECK(cudaFuncSetAttribute(
+          kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    }
+    kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(tma_params);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  };
+
+  if constexpr (Paged_KV) {
+    // Paged K/V TMA descriptors.  The physical page id is a regular TMA coordinate:
+    // kv_cache layout is [total_pages, 2, page_size, h_k, d], but the descriptor
+    // is exposed as [page_size, d, h_k, total_pages] so each paged history N tile
+    // is one TMA box at (page_row_tile=0, d_tile=0, head, page_id).
+    auto tensor_K_page = cute::make_tensor(
+        cute::make_gmem_ptr(static_cast<FP8Elem*>(params.kv_cache_ptr)),
+        cute::make_layout(
+            cute::make_shape(params.page_size, params.d, params.h_k, params.total_pages),
+            cute::make_stride(
+                params.kv_cache_head_stride, cute::_1{},
+                params.kv_cache_row_stride, params.kv_cache_kvtensor_stride)));
+    auto tma_k_page = cute::make_tma_copy(
+        cute::SM90_TMA_LOAD{},
+        tensor_K_page,
+        SmemLayoutK_TMA{},
+        cute::make_shape(cute::Int<kBlockN>{}, cute::Int<kHeadDim>{}),
+        cute::_1{});
+    auto tensor_Vt_page = cute::make_tensor(
+        cute::make_gmem_ptr(static_cast<FP8Elem*>(params.kv_cache_ptr) + params.kv_cache_page_stride),
+        cute::make_layout(
+            cute::make_shape(params.page_size, params.d, params.h_k, params.total_pages),
+            cute::make_stride(
+                params.kv_cache_head_stride, cute::_1{},
+                params.kv_cache_row_stride, params.kv_cache_kvtensor_stride)));
+    auto tma_vt_page = cute::make_tma_copy(
+        cute::SM90_TMA_LOAD{},
+        tensor_Vt_page,
+        SmemLayoutVt_TMA{},
+        cute::make_shape(cute::Int<kBlockN>{}, cute::Int<kHeadDim>{}),
+        cute::_1{});
+
+    using TMA_KPage_t  = decltype(tma_k_page);
+    using TMA_VtPage_t = decltype(tma_vt_page);
+    Hstu_fwd_params_fp8_ws_tma_paged<
+        TMA_Q_t, TMA_K_t, TMA_Vt_t, TMA_SFA_t, TMA_SFB_t, TMA_SFV_t, TMA_O_t,
+        TMA_KPage_t, TMA_VtPage_t> tma_params;
+    static_cast<Hstu_fwd_params&>(tma_params) = params;
+    tma_params.tma_q   = tma_q;
+    tma_params.tma_k   = tma_k;
+    tma_params.tma_vt  = tma_vt;
+    tma_params.tma_sfa = tma_sfa;
+    tma_params.tma_sfb = tma_sfb;
+    tma_params.tma_sfv = tma_sfv;
+    tma_params.tma_o   = tma_o;
+    tma_params.tma_k_page = tma_k_page;
+    tma_params.tma_vt_page = tma_vt_page;
+    launch_tma_kernel(tma_params);
+  } else {
+    Hstu_fwd_params_fp8_ws_tma<
+        TMA_Q_t, TMA_K_t, TMA_Vt_t, TMA_SFA_t, TMA_SFB_t, TMA_SFV_t, TMA_O_t> tma_params;
+    static_cast<Hstu_fwd_params&>(tma_params) = params;
+    tma_params.tma_q   = tma_q;
+    tma_params.tma_k   = tma_k;
+    tma_params.tma_vt  = tma_vt;
+    tma_params.tma_sfa = tma_sfa;
+    tma_params.tma_sfb = tma_sfb;
+    tma_params.tma_sfv = tma_sfv;
+    tma_params.tma_o   = tma_o;
+    launch_tma_kernel(tma_params);
   }
-
-  kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(tma_params);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1577,37 +1642,45 @@ void run_hstu_fwd_sm120(Hstu_fwd_params& params, cudaStream_t stream) {
   };
 
   if constexpr (Is_fp8_type) {
-    if constexpr (!Has_rab) {
-      if constexpr ((kHeadDim == 128 && kBlockN == 64) || (kBlockN % 128) == 0) {
-        // WS TMA kernel: load warp issues TMA for Q/K/V^T/SFB/SFV; math warps do QMMA.
-        // Has_rab=true is not supported in WS kernel; handled by cp.async fallback below.
-        run_hstu_fwd_sm120_fp8_ws_tma_impl<
-            elem_type, kHeadDim, kBlockM, kBlockN, kNWarps,
-            Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc, Has_rab,
-            Is_Q_in_regs, Share_Q_K_smem>(params, stream);
-      } else {
-        TORCH_CHECK(
-            false,
-            "SM120 FP8 WS blockscaled path currently requires headDim128+kBlockN64 or kBlockN divisible by 128, got kBlockN=",
-            kBlockN);
+    BOOL_SWITCH(params.is_paged_kv, Paged_KV, [&] {
+      if constexpr (Paged_KV) {
+        TORCH_CHECK(!Has_rab, "SM120 FP8 paged KV initial path does not support RAB");
+        TORCH_CHECK(kHeadDim == 128 && kBlockN == 64,
+            "SM120 FP8 paged KV initial path requires headDim=128 and kBlockN=64");
       }
-    } else {
-      if constexpr ((kBlockN % 128) == 0) {
-        // cp.async fallback for Has_rab=true (WS kernel does not support RAB).
-        using Kernel_traits = Hstu_fwd_kernel_traits_sm120_fp8<
-            kHeadDim, kBlockM, kBlockN, kNWarps,
-            Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc, Has_rab,
-            Is_Q_in_regs, Share_Q_K_smem, cutlass::half_t>;
-        auto kernel = &flash::hstu_fwd_kernel_sm120<Kernel_traits, Hstu_fwd_params>;
-        launch_kernel(kernel, Kernel_traits::kNThreads, Kernel_traits::kSmemSize);
+      if constexpr (!Has_rab) {
+        if constexpr ((kHeadDim == 128 && kBlockN == 64) || (kBlockN % 128) == 0) {
+          // WS TMA kernel: non-paged K/V use contiguous TMA; paged history K/V
+          // uses page-cache TMA indexed by runtime page_id. Paged target tail
+          // remains a guarded load-warp copy.
+          run_hstu_fwd_sm120_fp8_ws_tma_impl<
+              elem_type, kHeadDim, kBlockM, kBlockN, kNWarps,
+              Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc, Has_rab,
+              Paged_KV, Is_Q_in_regs, Share_Q_K_smem>(params, stream);
+        } else {
+          TORCH_CHECK(
+              false,
+              "SM120 FP8 WS blockscaled path currently requires headDim128+kBlockN64 or kBlockN divisible by 128, got kBlockN=",
+              kBlockN);
+        }
       } else {
-        // Compile-time gate: do not instantiate FP8 blockscaled fallback for unsupported N tiles.
-        TORCH_CHECK(
-            false,
-            "SM120 FP8 blockscaled fallback currently requires kBlockN divisible by 128, got kBlockN=",
-            kBlockN);
+        if constexpr ((kBlockN % 128) == 0) {
+          // cp.async fallback for Has_rab=true (WS kernel does not support RAB).
+          using Kernel_traits = Hstu_fwd_kernel_traits_sm120_fp8<
+              kHeadDim, kBlockM, kBlockN, kNWarps,
+              Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc, Has_rab,
+              Paged_KV, Is_Q_in_regs, Share_Q_K_smem, cutlass::half_t>;
+          auto kernel = &flash::hstu_fwd_kernel_sm120<Kernel_traits, Hstu_fwd_params>;
+          launch_kernel(kernel, Kernel_traits::kNThreads, Kernel_traits::kSmemSize);
+        } else {
+          // Compile-time gate: do not instantiate FP8 blockscaled fallback for unsupported N tiles.
+          TORCH_CHECK(
+              false,
+              "SM120 FP8 blockscaled fallback currently requires kBlockN divisible by 128, got kBlockN=",
+              kBlockN);
+        }
       }
-    }
+    });
   } else {
     using Kernel_traits = Hstu_fwd_kernel_traits_sm120<
         kHeadDim, kBlockM, kBlockN, kNWarps,

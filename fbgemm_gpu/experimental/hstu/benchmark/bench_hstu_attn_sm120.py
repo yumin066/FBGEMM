@@ -29,6 +29,7 @@ try:
     from hstu.cuda_hstu_attention import (
         quantize_for_block_scale_qk_along_d,
         quantize_for_block_scale_v_along_n,
+        quantize_paged_kv_cache_for_block_scale,
         pack_descale_to_e8m0x4_int32,
     )
     import hstu  # noqa: F401
@@ -72,14 +73,26 @@ def make_bf16_inputs(batch_size, seqlen, nheads, headdim):
     return q, k, v, cu_seqlens
 
 
+def fp8_block_n(headdim: int) -> int:
+    """No-RAB SM120 FP8 kBlockN used by the current forward dispatcher."""
+    if headdim == 64:
+        return 128
+    return 64
+
+
+def fp8_round_bf16(x: torch.Tensor) -> torch.Tensor:
+    return x.to(torch.float8_e4m3fn).to(torch.bfloat16)
+
+
 def quantize_fp8_bs(q_bf16, k_bf16, v_bf16, batch_size, seqlen, nheads, headdim):
     """Quantize BF16 Q/K/V to FP8 block-scale (quant_mode=2) format."""
     cu_seqlens = make_cu_seqlens(batch_size, seqlen)
+    block_n = fp8_block_n(headdim)
 
     # Round to FP8 range first (same as sweep_accuracy.py)
-    q_in = q_bf16.to(torch.float8_e4m3fn).to(torch.bfloat16)
-    k_in = k_bf16.to(torch.float8_e4m3fn).to(torch.bfloat16)
-    v_in = v_bf16.to(torch.float8_e4m3fn).to(torch.bfloat16)
+    q_in = fp8_round_bf16(q_bf16)
+    k_in = fp8_round_bf16(k_bf16)
+    v_in = fp8_round_bf16(v_bf16)
 
     # Q/K: block-scale along D (headdim axis)
     q_fp8, q_descale, cu_q_blk = quantize_for_block_scale_qk_along_d(
@@ -91,20 +104,124 @@ def quantize_fp8_bs(q_bf16, k_bf16, v_bf16, batch_size, seqlen, nheads, headdim)
 
     # V: block-scale along N (sequence axis)
     v_fp8, v_descale, cu_v_blk = quantize_for_block_scale_v_along_n(
-        v_in, cu_seqlens, block_size=128, fp8_type=torch.float8_e4m3fn
+        v_in, cu_seqlens, block_size=block_n, fp8_type=torch.float8_e4m3fn
     )
     # Pack descale factors to e8m0×4 int32 format for kernel.
     # sf_v is expanded from [H, total_blocks] → [H, total_tokens] via repeat_interleave
     # so TMA SFV can load kBlockN-element tiles indexed by nb_abs (same as SFB).
     sf_q = pack_descale_to_e8m0x4_int32(q_descale)
     sf_k = pack_descale_to_e8m0x4_int32(k_descale)
-    sf_v = pack_descale_to_e8m0x4_int32(v_descale).repeat_interleave(128, dim=1)
+    sf_v = pack_descale_to_e8m0x4_int32(v_descale).repeat_interleave(block_n, dim=1)
 
     return (q_fp8, k_fp8, v_fp8,
             sf_q, sf_k, sf_v,
             q_descale, k_descale, v_descale,
             cu_q_blk, cu_kv_blk, cu_v_blk,
             cu_seqlens)
+
+
+def make_paged_kv_raw_inputs(batch_size, seqlen, nheads, headdim, window_size):
+    """
+    Build an equivalent paged-KV causal case for the same benchmark shape.
+
+    Current SM120 FP8 paged KV support is decode/target-style and requires a
+    causal right window.  To keep the shape identical to the existing causal
+    benchmark, use target_len=0 and place the whole K/V sequence in the cache.
+    """
+    if window_size != (-1, 0):
+        raise ValueError("paged KV is supported only for causal benchmark cases")
+    if headdim != 128:
+        raise ValueError("SM120 FP8 paged KV benchmark requires headDim=128")
+
+    page_size = fp8_block_n(headdim)
+    if page_size != 64:
+        raise ValueError(f"SM120 FP8 paged KV benchmark requires page_size=64, got {page_size}")
+    if seqlen % page_size != 0:
+        raise ValueError(f"paged KV benchmark requires seq divisible by {page_size}, got {seqlen}")
+
+    total_q = batch_size * seqlen
+    pages_per_batch = seqlen // page_size
+    total_pages = batch_size * pages_per_batch
+
+    q_raw = torch.randn(total_q, nheads, headdim, dtype=torch.bfloat16, device="cuda")
+    # K/V tensors are required by the op schema.  With num_targets=0, the paged
+    # kernel reads K/V from kv_cache only; these tensors are still quantized so
+    # descriptor metadata matches the production wrapper path.
+    k_raw = torch.randn(total_q, nheads, headdim, dtype=torch.bfloat16, device="cuda")
+    v_raw = torch.randn(total_q, nheads, headdim, dtype=torch.bfloat16, device="cuda")
+    kv_cache_raw = torch.randn(
+        total_pages, 2, page_size, nheads, headdim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+
+    cu_q = make_cu_seqlens(batch_size, seqlen)
+    cu_k = make_cu_seqlens(batch_size, seqlen)
+    num_targets = torch.zeros(batch_size, dtype=torch.int32, device="cuda")
+
+    page_offsets = torch.zeros(batch_size + 1, dtype=torch.int32, device="cuda")
+    page_offsets[1:] = torch.arange(
+        1, batch_size + 1, dtype=torch.int32, device="cuda"
+    ) * pages_per_batch
+    page_ids = torch.randperm(total_pages, dtype=torch.int32, device="cuda")
+    last_page_lens = torch.full(
+        (batch_size,), page_size, dtype=torch.int32, device="cuda"
+    )
+
+    return (
+        q_raw, k_raw, v_raw, kv_cache_raw,
+        cu_q, cu_k, num_targets, page_offsets, page_ids, last_page_lens,
+    )
+
+
+def quantize_paged_kv_inputs(raw_inputs, headdim):
+    (
+        q_raw, k_raw, v_raw, kv_cache_raw,
+        cu_q, cu_k, num_targets, page_offsets, page_ids, last_page_lens,
+    ) = raw_inputs
+    page_size = fp8_block_n(headdim)
+    q_raw = fp8_round_bf16(q_raw)
+    k_raw = fp8_round_bf16(k_raw)
+    v_raw = fp8_round_bf16(v_raw)
+    kv_cache_raw = fp8_round_bf16(kv_cache_raw)
+
+    # Q/K: block-scale along D.
+    q_fp8, q_descale, cu_q_blk = quantize_for_block_scale_qk_along_d(
+        q_raw, cu_q, fp8_type=torch.float8_e4m3fn
+    )
+    k_fp8, k_descale, cu_k_blk = quantize_for_block_scale_qk_along_d(
+        k_raw, cu_q, fp8_type=torch.float8_e4m3fn
+    )
+    # V target tensor: block-scale along N.  It is unused when target_len=0,
+    # but the kernel path expects valid scale metadata.
+    v_fp8, v_descale, cu_v_blk = quantize_for_block_scale_v_along_n(
+        v_raw, cu_q, block_size=page_size, fp8_type=torch.float8_e4m3fn
+    )
+
+    sf_q = pack_descale_to_e8m0x4_int32(q_descale)
+    sf_k = pack_descale_to_e8m0x4_int32(k_descale)
+    sf_v = pack_descale_to_e8m0x4_int32(v_descale).repeat_interleave(page_size, dim=1)
+
+    kv_cache_fp8, sf_k_cache, sf_v_cache = quantize_paged_kv_cache_for_block_scale(
+        kv_cache_raw, block_size=page_size, fp8_type=torch.float8_e4m3fn
+    )
+    sf_k = torch.cat([sf_k_cache, sf_k], dim=1).contiguous()
+    sf_v = torch.cat([sf_v_cache, sf_v], dim=1).contiguous()
+
+    return (
+        q_fp8, k_fp8, v_fp8, kv_cache_fp8,
+        sf_q, sf_k, sf_v,
+        q_descale, k_descale, v_descale,
+        cu_q, cu_k, cu_q_blk, cu_k_blk, cu_v_blk,
+        num_targets, page_offsets, page_ids, last_page_lens,
+    )
+
+
+def make_fp8_paged_kv_inputs(batch_size, seqlen, nheads, headdim, window_size):
+    return quantize_paged_kv_inputs(
+        make_paged_kv_raw_inputs(batch_size, seqlen, nheads, headdim, window_size),
+        headdim,
+    )
 
 
 def run_kernel_bf16(q, k, v, cu_seqlens, seqlen, batch_size, window_size=(-1, -1)):
@@ -149,6 +266,34 @@ def run_kernel_fp8bs(q_fp8, k_fp8, v_fp8, sf_q, sf_k, sf_v,
         q_descale, k_descale, v_descale,  # raw descales (for reference, unused by mode=2)
         sf_q, sf_k, sf_v,           # block-scale SF tensors (packed e8m0×4 int32)
         cu_q_blk, cu_kv_blk, cu_v_blk,
+    )
+    return out
+
+
+def run_kernel_fp8bs_paged(paged_inputs, seqlen, window_size=(-1, 0)):
+    """Run SM120 FP8 paged-KV kernel directly via torch.ops."""
+    (
+        q_fp8, k_fp8, v_fp8, kv_cache_fp8,
+        sf_q, sf_k, sf_v,
+        q_descale, k_descale, v_descale,
+        cu_q, cu_k, cu_q_blk, cu_kv_blk, cu_v_blk,
+        num_targets, page_offsets, page_ids, last_page_lens,
+    ) = paged_inputs
+    out, _ = torch.ops.fbgemm.hstu_varlen_fwd_120(
+        q_fp8, k_fp8, v_fp8,
+        cu_q, cu_k,
+        None, None,
+        seqlen, seqlen,
+        seqlen,
+        None, num_targets, 1,
+        window_size[0], window_size[1],
+        1.0,
+        None, None,
+        2,
+        q_descale, k_descale, v_descale,
+        sf_q, sf_k, sf_v,
+        cu_q_blk, cu_kv_blk, cu_v_blk,
+        kv_cache_fp8, page_offsets, page_ids, last_page_lens,
     )
     return out
 
@@ -251,17 +396,37 @@ def bench_kernel_only(
     except Exception as e:
         result["fp8_error"] = str(e)
 
+    try:
+        # Prepare paged-KV FP8 inputs once; kernel-only timing excludes
+        # page/cache construction and FP8 quantization.
+        paged_inputs = make_fp8_paged_kv_inputs(
+            batch_size, seqlen, nheads, headdim, window_size
+        )
+        paged_avg, _, _ = time_kernel(
+            lambda: run_kernel_fp8bs_paged(paged_inputs, seqlen, window_size)
+        )
+        result["paged_ms"] = paged_avg
+
+    except Exception as e:
+        result["paged_error"] = str(e)
+
     # Compute TFLOPS
     total_flops = attention_flops(batch_size, seqlen, nheads, headdim, window_size)
     if "bf16_ms" in result:
         result["bf16_tflops"] = total_flops / (result["bf16_ms"] * 1e-3) / 1e12
     if "fp8_ms" in result:
         result["fp8_tflops"] = total_flops / (result["fp8_ms"] * 1e-3) / 1e12
+    if "paged_ms" in result:
+        result["paged_tflops"] = total_flops / (result["paged_ms"] * 1e-3) / 1e12
 
     # Speedup
     if "bf16_tflops" in result and "fp8_tflops" in result:
         result["speedup_pct"] = (
             result["fp8_tflops"] / result["bf16_tflops"] - 1.0
+        ) * 100.0
+    if "fp8_ms" in result and "paged_ms" in result:
+        result["paged_vs_fp8_pct"] = (
+            result["fp8_ms"] / result["paged_ms"] - 1.0
         ) * 100.0
 
     return result
@@ -293,6 +458,12 @@ def run_e2e_fp8bs(q_bf16, k_bf16, v_bf16, seqlen, batch_size, nheads, headdim,
         cu_seqlens, cu_q_blk, cu_kv_blk, cu_v_blk,
         seqlen, window_size
     )
+
+
+def run_e2e_fp8bs_paged(raw_paged_inputs, headdim, seqlen, window_size):
+    """Paged-KV e2e path: quantize Q/target tensors/cache, then run kernel."""
+    paged_inputs = quantize_paged_kv_inputs(raw_paged_inputs, headdim)
+    return run_kernel_fp8bs_paged(paged_inputs, seqlen, window_size)
 
 
 def bench_e2e(
@@ -341,10 +512,33 @@ def bench_e2e(
     except Exception as e:
         result["fp8_error"] = str(e)
 
+    try:
+        raw_paged_inputs = make_paged_kv_raw_inputs(
+            batch_size, seqlen, nheads, headdim, window_size
+        )
+        paged_avg, _, _ = time_kernel(
+            lambda: run_e2e_fp8bs_paged(
+                raw_paged_inputs, headdim, seqlen, window_size
+            )
+        )
+        result["paged_ms"] = paged_avg
+
+        total_flops_e2e = attention_flops(
+            batch_size, seqlen, nheads, headdim, window_size
+        )
+        result["paged_tflops"] = total_flops_e2e / (paged_avg * 1e-3) / 1e12
+
+    except Exception as e:
+        result["paged_error"] = str(e)
+
     if "bf16_ms" in result and "fp8_ms" in result:
         result["speedup_pct"] = (
             result["fp8_ms"] / result["bf16_ms"] - 1.0
         ) * -100.0  # positive = FP8 faster
+    if "fp8_ms" in result and "paged_ms" in result:
+        result["paged_vs_fp8_pct"] = (
+            result["fp8_ms"] / result["paged_ms"] - 1.0
+        ) * 100.0
 
     return result
 
@@ -369,7 +563,9 @@ def print_kernel_table(
     print("KERNEL-ONLY BENCHMARK  (FP8 quantization not included)")
     print("=" * 100)
     hdr = (f"{'Config':<56} {'BF16(ms)':>9} {'BF16 TFLOPS':>12}"
-           f" {'FP8(ms)':>9} {'FP8 TFLOPS':>12} {'Speedup':>9}")
+           f" {'FP8(ms)':>9} {'FP8 TFLOPS':>12}"
+           f" {'Paged(ms)':>10} {'Paged TFLOPS':>13} {'Paged/F8':>9}"
+           f" {'Speedup':>9}")
     print(hdr)
     print("-" * len(hdr))
 
@@ -394,16 +590,30 @@ def print_kernel_table(
                         fp8_tf = (f"{res['fp8_tflops']:12.1f}"
                                   if "fp8_tflops" in res
                                   else f"{'ERR':>12}")
+                        paged_str = (f"{res['paged_ms']:10.3f}"
+                                     if "paged_ms" in res
+                                     else f"{'N/A':>10}")
+                        paged_tf = (f"{res['paged_tflops']:13.1f}"
+                                    if "paged_tflops" in res
+                                    else f"{'N/A':>13}")
+                        paged_vs = (f"{res['paged_vs_fp8_pct']:+8.1f}%"
+                                    if "paged_vs_fp8_pct" in res
+                                    else f"{'N/A':>9}")
                         speedup = (f"{res['speedup_pct']:+8.1f}%"
                                    if "speedup_pct" in res
                                    else f"{'N/A':>9}")
 
-                        print(f"  {cfg:<54} {bf16_str} {bf16_tf} {fp8_str} {fp8_tf} {speedup}")
+                        print(
+                            f"  {cfg:<54} {bf16_str} {bf16_tf} {fp8_str} {fp8_tf}"
+                            f" {paged_str} {paged_tf} {paged_vs} {speedup}"
+                        )
 
                         if "bf16_error" in res:
                             print(f"    BF16 ERROR: {res['bf16_error']}")
                         if "fp8_error" in res:
                             print(f"    FP8  ERROR: {res['fp8_error']}")
+                        if "paged_error" in res and ws == (-1, 0):
+                            print(f"    PAGED ERROR: {res['paged_error']}")
     print()
 
 

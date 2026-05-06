@@ -65,6 +65,66 @@ __device__ inline void wait_mbar_parity(uint64_t* mbar, uint32_t parity) {
   wait_mbar_parity(mbar_smem_addr(mbar), parity);
 }
 
+__device__ __forceinline__ void cp_async_cg_16B(
+    void* __restrict__ dst_smem,
+    const void* __restrict__ src_gmem) {
+  const uint32_t smem_addr =
+      static_cast<uint32_t>(__cvta_generic_to_shared(dst_smem));
+  const uint64_t gmem_addr = reinterpret_cast<uint64_t>(src_gmem);
+  asm volatile(
+      "cp.async.cg.shared.global [%0], [%1], 16;\n"
+      : : "r"(smem_addr), "l"(gmem_addr) : "memory");
+}
+
+template <typename FP8Elem>
+__device__ __forceinline__ void copy_fp8_tile_rowmajor_to_sw128(
+    FP8Elem* __restrict__ dst_smem,
+    const FP8Elem* __restrict__ src_gmem,
+    int64_t src_row_stride,
+    int rows_valid,
+    int lane) {
+  constexpr int kHeadDim = 128;
+  constexpr int kVecElems = 16;
+  constexpr int kVecsPerRow = kHeadDim / kVecElems;
+  static_assert(sizeof(FP8Elem) == 1, "FP8 paged copy expects 1-byte elements");
+  using Vec = uint4;
+  const Vec zero = make_uint4(0, 0, 0, 0);
+
+  for (int vec = lane; vec < rows_valid * kVecsPerRow; vec += 32) {
+    const int row = vec / kVecsPerRow;
+    const int d = (vec - row * kVecsPerRow) * kVecElems;
+    const int swizzled_d = d ^ ((row & 7) << 4);
+    cp_async_cg_16B(
+        dst_smem + row * kHeadDim + swizzled_d,
+        src_gmem + row * src_row_stride + d);
+  }
+  asm volatile("cp.async.commit_group;\n" : : : "memory");
+  asm volatile("cp.async.wait_group 0;\n" : : : "memory");
+  asm volatile("fence.proxy.async.shared::cta;\n" : : : "memory");
+
+  for (int vec = lane + rows_valid * kVecsPerRow; vec < 64 * kVecsPerRow; vec += 32) {
+    const int row = vec / kVecsPerRow;
+    const int d = (vec - row * kVecsPerRow) * kVecElems;
+    const int swizzled_d = d ^ ((row & 7) << 4);
+    *reinterpret_cast<Vec*>(dst_smem + row * kHeadDim + swizzled_d) = zero;
+  }
+}
+
+__device__ __forceinline__ void copy_packed_sf_tile(
+    int32_t* __restrict__ dst_smem,
+    const int32_t* __restrict__ src_gmem,
+    int64_t src_head_stride,
+    int head,
+    int token_base,
+    int rows_valid,
+    int lane) {
+  for (int row = lane; row < 64; row += 32) {
+    dst_smem[row] = row < rows_valid
+        ? src_gmem[(int64_t)head * src_head_stride + token_base + row]
+        : 0x7f7f7f7f;
+  }
+}
+
 struct HstuWsTileCoord {
   int bidb;
   int bidh;
@@ -206,6 +266,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     constexpr bool Is_arbitrary = Kernel_traits::Is_arbitrary;
     constexpr int  kNFunc       = Kernel_traits::kNFunc;
     constexpr bool Is_local     = Kernel_traits::Is_local;
+    constexpr bool Paged_KV     = Kernel_traits::Paged_KV;
     constexpr int  kBlockM      = Kernel_traits::kBlockM;
     constexpr int  kBlockN      = Kernel_traits::kBlockN;
     constexpr int  kHeadDim     = Kernel_traits::kHeadDim;
@@ -298,20 +359,28 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       const int actual_seqlen_c        = Is_context ? binfo.actual_seqlen_c : 0;
       const int actual_seqlen_h        = Is_target  ? actual_seqlen_k - actual_seqlen_t : actual_seqlen_k;
       const int actual_seqlen_offset   = actual_seqlen_k - actual_seqlen_q;
+      const int last_page_seqlen       = Paged_KV ? binfo.last_page_seqlen : kBlockN;
+      const int page_offset            = Paged_KV ? binfo.sum_s_page : 0;
 
       const bool is_jump             = Is_target && m_block * kBlockM + actual_seqlen_offset > actual_seqlen_h;
+      const bool is_in_target        = Is_target && (m_block + 1) * kBlockM + actual_seqlen_offset > actual_seqlen_h;
       const bool is_in_context       = Is_context && (m_block + 1) * kBlockM <= actual_seqlen_c;
       const bool is_in_mixed_context = Is_context &&
           (m_block + 1) * kBlockM > actual_seqlen_c && m_block * kBlockM < actual_seqlen_c;
+      const bool is_in_paged_target  = is_in_target && Paged_KV;
+      const int last_page_offset     = is_in_paged_target ? kBlockN - last_page_seqlen : 0;
 
       const int n_block_history = cute::ceil_div(actual_seqlen_h, kBlockN);
       const int target_index    = (m_block * kBlockM - actual_seqlen_h) / params.target_group_size;
+      const int n_block_paged   = Paged_KV ? n_block_history : 0;
+      const int n_block_target  = cute::ceil_div(actual_seqlen_t, kBlockN);
 
       int n_block_min = !Is_local ? 0
           : std::max(0, (m_block * kBlockM + actual_seqlen_offset - params.window_size_left) / kBlockN);
-      int n_block_max = cute::ceil_div(actual_seqlen_k, kBlockN);
+      int n_block_max = Paged_KV ? n_block_history + n_block_target : cute::ceil_div(actual_seqlen_k, kBlockN);
       if constexpr (Is_causal || Is_local) {
         int offset = (m_block + 1) * kBlockM + actual_seqlen_offset + params.window_size_right;
+        if (is_in_paged_target) offset += last_page_offset;
         n_block_max = std::min(n_block_max, cute::ceil_div(offset, kBlockN));
       }
       if constexpr (Is_context) {
@@ -321,11 +390,13 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       }
 
       int n_masking_block_max = cute::ceil_div(
-          std::min(actual_seqlen_k, (m_block + 1) * kBlockM + actual_seqlen_offset), kBlockN);
+          std::min(actual_seqlen_k + last_page_offset,
+                   (m_block + 1) * kBlockM + actual_seqlen_offset + last_page_offset),
+          kBlockN);
       int n_masking_block_min = (m_block * kBlockM + actual_seqlen_offset) / kBlockN;
       if constexpr (Is_target) {
         n_masking_block_min = is_jump
-            ? (actual_seqlen_h + actual_seqlen_offset + target_index * params.target_group_size) / kBlockN
+            ? (actual_seqlen_h + actual_seqlen_offset + target_index * params.target_group_size + last_page_offset) / kBlockN
             : n_masking_block_min;
       }
       if constexpr (Is_context) {
@@ -488,62 +559,249 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       }
 
       if (is_k_load_warp) {
-        for (int n_valid = n_block_max - 1, masking_step_load = 0; n_valid >= n_block_min;
-             ++masking_step_load, --n_valid) {
-          const int nb = Is_arbitrary ? int(sValidBlockIds[n_valid]) : n_valid;
-
-          uint64_t* k_empty_mbar_ptr = kv_load_stage ? k_empty_mbar_ptr1 : k_empty_mbar_ptr0;
-          int& k_empty_wait_parity = kv_load_stage ? k_empty_wait_parity1 : k_empty_wait_parity0;
-          wait_mbar_parity(k_empty_mbar_ptr, (uint32_t)k_empty_wait_parity);
-          k_empty_wait_parity ^= 1;
-
-          const int nb_abs = binfo.sum_s_k / kBlockN + nb;
-          if (tidx == kNMathThreads + 32) {
-            if (kv_load_stage == 0) {
-              arrive_expect_tx_mbar(k_ready_mbar_ptr0, kSmemKSFBBytes);
-              cute::copy(params.tma_k.with(*k_ready_mbar_ptr0),   tKgK_tma(_, _, _, nb_abs),    tKsK_d_0);
-              cute::copy(params.tma_sfb.with(*k_ready_mbar_ptr0), tSFBgSFB_tma(_, _, _, nb_abs), tSFBsSFB_d_0);
+        if constexpr (Paged_KV) {
+          auto copy_paged_or_target_k = [&](int nb, int stage) {
+            FP8Elem* dst = stage ? sK_base[1] : sK_base[0];
+            int32_t* sf_dst = stage ? smem_sfb_ptr[1] : smem_sfb_ptr[0];
+            const int lane = tidx & 31;
+            if (nb < n_block_paged) {
+              const int page_id = params.page_ids[page_offset + nb];
+              const FP8Elem* src = reinterpret_cast<const FP8Elem*>(params.kv_cache_ptr)
+                  + (int64_t)page_id * params.kv_cache_kvtensor_stride
+                  + (int64_t)bidh_kv * params.kv_cache_row_stride;
+              copy_fp8_tile_rowmajor_to_sw128(
+                  dst, src, params.kv_cache_head_stride, kBlockN, lane);
+              copy_packed_sf_tile(
+                  sf_dst, params.sf_k_packed_ptr, params.kv_block_descale_head_stride,
+                  bidh_kv, page_id * params.page_size, kBlockN, lane);
             } else {
-              arrive_expect_tx_mbar(k_ready_mbar_ptr1, kSmemKSFBBytes);
-              cute::copy(params.tma_k.with(*k_ready_mbar_ptr1),   tKgK_tma(_, _, _, nb_abs),    tKsK_d_1);
-              cute::copy(params.tma_sfb.with(*k_ready_mbar_ptr1), tSFBgSFB_tma(_, _, _, nb_abs), tSFBsSFB_d_1);
+              const int target_block = nb - n_block_paged;
+              const int target_start = binfo.sum_s_q + actual_seqlen_q - actual_seqlen_t
+                  + target_block * kBlockN;
+              const int rows_valid = std::max(0, std::min(kBlockN, actual_seqlen_t - target_block * kBlockN));
+              const FP8Elem* src = reinterpret_cast<const FP8Elem*>(params.k_ptr)
+                  + (int64_t)target_start * params.k_row_stride
+                  + (int64_t)bidh_kv * params.k_head_stride;
+              copy_fp8_tile_rowmajor_to_sw128(
+                  dst, src, params.k_row_stride, rows_valid, lane);
+              copy_packed_sf_tile(
+                  sf_dst, params.sf_k_packed_ptr, params.kv_block_descale_head_stride,
+                  bidh_kv, params.total_pages * params.page_size + target_start,
+                  rows_valid, lane);
             }
+            __syncwarp();
+          };
+
+          auto mK_page_tma = params.tma_k_page.get_tma_tensor(
+              make_shape(params.page_size, params.d, params.h_k, params.total_pages));
+          auto gK_page_head = mK_page_tma(_, _, bidh_kv, _);
+          auto gK_page_tiles = local_tile(
+              gK_page_head, Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(_, _));
+          auto tma_slice_K_page = params.tma_k_page.get_slice(0);
+          auto tKPgK_tma = tma_slice_K_page.partition_S(
+              gK_page_tiles(_, _, _, Int<0>{}, _));
+          auto tKPsK_d_0 = tma_slice_K_page.partition_D(
+              make_tensor(make_smem_ptr(sK_base[0]), SmemLayoutK_SW128{}));
+          auto tKPsK_d_1 = tma_slice_K_page.partition_D(
+              make_tensor(make_smem_ptr(sK_base[1]), SmemLayoutK_SW128{}));
+
+          auto load_paged_tma_or_target_k =
+              [&](int nb, int stage, uint64_t* k_ready_mbar_ptr) {
+            const bool use_paged_history_tma = n_block_paged >= 16;
+            if (nb < n_block_paged && use_paged_history_tma) {
+              const int page_id = params.page_ids[page_offset + nb];
+              const int sf_page_block = (page_id * params.page_size) / kBlockN;
+              if (tidx == kNMathThreads + 32) {
+                arrive_expect_tx_mbar(k_ready_mbar_ptr, kSmemKSFBBytes);
+                if (stage == 0) {
+                  cute::copy(params.tma_k_page.with(*k_ready_mbar_ptr),
+                             tKPgK_tma(_, _, _, Int<0>{}, page_id), tKPsK_d_0);
+                  cute::copy(params.tma_sfb.with(*k_ready_mbar_ptr),
+                             tSFBgSFB_tma(_, _, _, sf_page_block), tSFBsSFB_d_0);
+                } else {
+                  cute::copy(params.tma_k_page.with(*k_ready_mbar_ptr),
+                             tKPgK_tma(_, _, _, Int<0>{}, page_id), tKPsK_d_1);
+                  cute::copy(params.tma_sfb.with(*k_ready_mbar_ptr),
+                             tSFBgSFB_tma(_, _, _, sf_page_block), tSFBsSFB_d_1);
+                }
+              }
+            } else {
+              copy_paged_or_target_k(nb, stage);
+              if (tidx == kNMathThreads + 32) {
+                arrive_mbar(k_ready_mbar_ptr);
+              }
+            }
+          };
+
+          for (int n_valid = n_block_max - 1, masking_step_load = 0; n_valid >= n_block_min;
+               ++masking_step_load, --n_valid) {
+            const int nb = Is_arbitrary ? int(sValidBlockIds[n_valid]) : n_valid;
+
+            uint64_t* k_empty_mbar_ptr = kv_load_stage ? k_empty_mbar_ptr1 : k_empty_mbar_ptr0;
+            int& k_empty_wait_parity = kv_load_stage ? k_empty_wait_parity1 : k_empty_wait_parity0;
+            wait_mbar_parity(k_empty_mbar_ptr, (uint32_t)k_empty_wait_parity);
+            k_empty_wait_parity ^= 1;
+
+            load_paged_tma_or_target_k(
+                nb, kv_load_stage, kv_load_stage ? k_ready_mbar_ptr1 : k_ready_mbar_ptr0);
+
+            if (is_jump && masking_step_load == n_masking_steps - 1)
+              n_valid = std::min(n_valid, n_block_history);
+
+            kv_load_stage ^= 1;
           }
+        } else {
+          for (int n_valid = n_block_max - 1, masking_step_load = 0; n_valid >= n_block_min;
+               ++masking_step_load, --n_valid) {
+            const int nb = Is_arbitrary ? int(sValidBlockIds[n_valid]) : n_valid;
 
-          if (is_jump && masking_step_load == n_masking_steps - 1)
-            n_valid = std::min(n_valid, n_block_history);
+            uint64_t* k_empty_mbar_ptr = kv_load_stage ? k_empty_mbar_ptr1 : k_empty_mbar_ptr0;
+            int& k_empty_wait_parity = kv_load_stage ? k_empty_wait_parity1 : k_empty_wait_parity0;
+            wait_mbar_parity(k_empty_mbar_ptr, (uint32_t)k_empty_wait_parity);
+            k_empty_wait_parity ^= 1;
 
-          kv_load_stage ^= 1;
+            if (tidx == kNMathThreads + 32) {
+              const int nb_abs = binfo.sum_s_k / kBlockN + nb;
+              if (kv_load_stage == 0) {
+                arrive_expect_tx_mbar(k_ready_mbar_ptr0, kSmemKSFBBytes);
+                cute::copy(params.tma_k.with(*k_ready_mbar_ptr0),   tKgK_tma(_, _, _, nb_abs),    tKsK_d_0);
+                cute::copy(params.tma_sfb.with(*k_ready_mbar_ptr0), tSFBgSFB_tma(_, _, _, nb_abs), tSFBsSFB_d_0);
+              } else {
+                arrive_expect_tx_mbar(k_ready_mbar_ptr1, kSmemKSFBBytes);
+                cute::copy(params.tma_k.with(*k_ready_mbar_ptr1),   tKgK_tma(_, _, _, nb_abs),    tKsK_d_1);
+                cute::copy(params.tma_sfb.with(*k_ready_mbar_ptr1), tSFBgSFB_tma(_, _, _, nb_abs), tSFBsSFB_d_1);
+              }
+            }
+
+            if (is_jump && masking_step_load == n_masking_steps - 1)
+              n_valid = std::min(n_valid, n_block_history);
+
+            kv_load_stage ^= 1;
+          }
         }
       }
 
       if (is_v_load_warp) {
-        for (int n_valid = n_block_max - 1, masking_step_load = 0; n_valid >= n_block_min;
-             ++masking_step_load, --n_valid) {
-          const int nb = Is_arbitrary ? int(sValidBlockIds[n_valid]) : n_valid;
-
-          uint64_t* v_empty_mbar_ptr = kv_load_stage ? v_empty_mbar_ptr1 : v_empty_mbar_ptr0;
-          int& v_empty_wait_parity = kv_load_stage ? v_empty_wait_parity1 : v_empty_wait_parity0;
-          wait_mbar_parity(v_empty_mbar_ptr, (uint32_t)v_empty_wait_parity);
-          v_empty_wait_parity ^= 1;
-
-          const int nb_abs = binfo.sum_s_k / kBlockN + nb;
-          if (tidx == kNMathThreads + 64) {
-            if (kv_load_stage == 0) {
-              arrive_expect_tx_mbar(v_ready_mbar_ptr0, kSmemVtSFVBytes);
-              cute::copy(params.tma_vt.with(*v_ready_mbar_ptr0),  tVtgVt_tma(_, _, _, nb_abs),  tVtsVt_d_0);
-              cute::copy(params.tma_sfv.with(*v_ready_mbar_ptr0), tSFVgSFV_tma(_, _, _, nb_abs), tSFVsSFV_d_0);
+        if constexpr (Paged_KV) {
+          auto copy_paged_or_target_v = [&](int nb, int stage) {
+            FP8Elem* dst = stage ? sVt_base[1] : sVt_base[0];
+            int32_t* sf_dst = stage ? smem_sfv_ptr[1] : smem_sfv_ptr[0];
+            const int lane = tidx & 31;
+            if (nb < n_block_paged) {
+              const int page_id = params.page_ids[page_offset + nb];
+              const FP8Elem* src = reinterpret_cast<const FP8Elem*>(params.kv_cache_ptr)
+                  + (int64_t)page_id * params.kv_cache_kvtensor_stride
+                  + params.kv_cache_page_stride
+                  + (int64_t)bidh_kv * params.kv_cache_row_stride;
+              copy_fp8_tile_rowmajor_to_sw128(
+                  dst, src, params.kv_cache_head_stride, kBlockN, lane);
+              copy_packed_sf_tile(
+                  sf_dst, params.sf_v_packed_ptr, params.v_block_descale_head_stride,
+                  bidh_kv, page_id * params.page_size, kBlockN, lane);
             } else {
-              arrive_expect_tx_mbar(v_ready_mbar_ptr1, kSmemVtSFVBytes);
-              cute::copy(params.tma_vt.with(*v_ready_mbar_ptr1),  tVtgVt_tma(_, _, _, nb_abs),  tVtsVt_d_1);
-              cute::copy(params.tma_sfv.with(*v_ready_mbar_ptr1), tSFVgSFV_tma(_, _, _, nb_abs), tSFVsSFV_d_1);
+              const int target_block = nb - n_block_paged;
+              const int target_start = binfo.sum_s_q + actual_seqlen_q - actual_seqlen_t
+                  + target_block * kBlockN;
+              const int rows_valid = std::max(0, std::min(kBlockN, actual_seqlen_t - target_block * kBlockN));
+              const FP8Elem* src = reinterpret_cast<const FP8Elem*>(params.v_ptr)
+                  + (int64_t)target_start * params.v_row_stride
+                  + (int64_t)bidh_kv * params.v_head_stride;
+              copy_fp8_tile_rowmajor_to_sw128(
+                  dst, src, params.v_row_stride, rows_valid, lane);
+              copy_packed_sf_tile(
+                  sf_dst, params.sf_v_packed_ptr, params.v_block_descale_head_stride,
+                  bidh_kv, params.total_pages * params.page_size + target_start,
+                  rows_valid, lane);
             }
+            __syncwarp();
+          };
+
+          auto mVt_page_tma = params.tma_vt_page.get_tma_tensor(
+              make_shape(params.page_size, params.d, params.h_k, params.total_pages));
+          auto gVt_page_head = mVt_page_tma(_, _, bidh_kv, _);
+          auto gVt_page_tiles = local_tile(
+              gVt_page_head, Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(_, _));
+          auto tma_slice_Vt_page = params.tma_vt_page.get_slice(0);
+          auto tVPgVt_tma = tma_slice_Vt_page.partition_S(
+              gVt_page_tiles(_, _, _, Int<0>{}, _));
+          auto tVPsVt_d_0 = tma_slice_Vt_page.partition_D(
+              make_tensor(make_smem_ptr(sVt_base[0]), SmemLayoutVt_SW128{}));
+          auto tVPsVt_d_1 = tma_slice_Vt_page.partition_D(
+              make_tensor(make_smem_ptr(sVt_base[1]), SmemLayoutVt_SW128{}));
+
+          auto load_paged_tma_or_target_v =
+              [&](int nb, int stage, uint64_t* v_ready_mbar_ptr) {
+            const bool use_paged_history_tma = n_block_paged >= 16;
+            if (nb < n_block_paged && use_paged_history_tma) {
+              const int page_id = params.page_ids[page_offset + nb];
+              const int sf_page_block = (page_id * params.page_size) / kBlockN;
+              if (tidx == kNMathThreads + 64) {
+                arrive_expect_tx_mbar(v_ready_mbar_ptr, kSmemVtSFVBytes);
+                if (stage == 0) {
+                  cute::copy(params.tma_vt_page.with(*v_ready_mbar_ptr),
+                             tVPgVt_tma(_, _, _, Int<0>{}, page_id), tVPsVt_d_0);
+                  cute::copy(params.tma_sfv.with(*v_ready_mbar_ptr),
+                             tSFVgSFV_tma(_, _, _, sf_page_block), tSFVsSFV_d_0);
+                } else {
+                  cute::copy(params.tma_vt_page.with(*v_ready_mbar_ptr),
+                             tVPgVt_tma(_, _, _, Int<0>{}, page_id), tVPsVt_d_1);
+                  cute::copy(params.tma_sfv.with(*v_ready_mbar_ptr),
+                             tSFVgSFV_tma(_, _, _, sf_page_block), tSFVsSFV_d_1);
+                }
+              }
+            } else {
+              copy_paged_or_target_v(nb, stage);
+              if (tidx == kNMathThreads + 64) {
+                arrive_mbar(v_ready_mbar_ptr);
+              }
+            }
+          };
+
+          for (int n_valid = n_block_max - 1, masking_step_load = 0; n_valid >= n_block_min;
+               ++masking_step_load, --n_valid) {
+            const int nb = Is_arbitrary ? int(sValidBlockIds[n_valid]) : n_valid;
+
+            uint64_t* v_empty_mbar_ptr = kv_load_stage ? v_empty_mbar_ptr1 : v_empty_mbar_ptr0;
+            int& v_empty_wait_parity = kv_load_stage ? v_empty_wait_parity1 : v_empty_wait_parity0;
+            wait_mbar_parity(v_empty_mbar_ptr, (uint32_t)v_empty_wait_parity);
+            v_empty_wait_parity ^= 1;
+
+            load_paged_tma_or_target_v(
+                nb, kv_load_stage, kv_load_stage ? v_ready_mbar_ptr1 : v_ready_mbar_ptr0);
+
+            if (is_jump && masking_step_load == n_masking_steps - 1)
+              n_valid = std::min(n_valid, n_block_history);
+
+            kv_load_stage ^= 1;
           }
+        } else {
+          for (int n_valid = n_block_max - 1, masking_step_load = 0; n_valid >= n_block_min;
+               ++masking_step_load, --n_valid) {
+            const int nb = Is_arbitrary ? int(sValidBlockIds[n_valid]) : n_valid;
 
-          if (is_jump && masking_step_load == n_masking_steps - 1)
-            n_valid = std::min(n_valid, n_block_history);
+            uint64_t* v_empty_mbar_ptr = kv_load_stage ? v_empty_mbar_ptr1 : v_empty_mbar_ptr0;
+            int& v_empty_wait_parity = kv_load_stage ? v_empty_wait_parity1 : v_empty_wait_parity0;
+            wait_mbar_parity(v_empty_mbar_ptr, (uint32_t)v_empty_wait_parity);
+            v_empty_wait_parity ^= 1;
 
-          kv_load_stage ^= 1;
+            if (tidx == kNMathThreads + 64) {
+              const int nb_abs = binfo.sum_s_k / kBlockN + nb;
+              if (kv_load_stage == 0) {
+                arrive_expect_tx_mbar(v_ready_mbar_ptr0, kSmemVtSFVBytes);
+                cute::copy(params.tma_vt.with(*v_ready_mbar_ptr0),  tVtgVt_tma(_, _, _, nb_abs),  tVtsVt_d_0);
+                cute::copy(params.tma_sfv.with(*v_ready_mbar_ptr0), tSFVgSFV_tma(_, _, _, nb_abs), tSFVsSFV_d_0);
+              } else {
+                arrive_expect_tx_mbar(v_ready_mbar_ptr1, kSmemVtSFVBytes);
+                cute::copy(params.tma_vt.with(*v_ready_mbar_ptr1),  tVtgVt_tma(_, _, _, nb_abs),  tVtsVt_d_1);
+                cute::copy(params.tma_sfv.with(*v_ready_mbar_ptr1), tSFVgSFV_tma(_, _, _, nb_abs), tSFVsSFV_d_1);
+              }
+            }
+
+            if (is_jump && masking_step_load == n_masking_steps - 1)
+              n_valid = std::min(n_valid, n_block_history);
+
+            kv_load_stage ^= 1;
+          }
         }
       }
 
@@ -622,6 +880,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     constexpr bool Is_arbitrary = Kernel_traits::Is_arbitrary;
     constexpr int  kNFunc       = Kernel_traits::kNFunc;
     constexpr bool Is_local     = Kernel_traits::Is_local;
+    constexpr bool Paged_KV     = Kernel_traits::Paged_KV;
     constexpr int  kBlockM      = Kernel_traits::kBlockM;
     constexpr int  kBlockN      = Kernel_traits::kBlockN;
     constexpr int  kHeadDim     = Kernel_traits::kHeadDim;
@@ -655,20 +914,27 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       const int actual_seqlen_c        = Is_context ? binfo.actual_seqlen_c : 0;
       const int actual_seqlen_h        = Is_target  ? actual_seqlen_k - actual_seqlen_t : actual_seqlen_k;
       const int actual_seqlen_offset   = actual_seqlen_k - actual_seqlen_q;
+      const int last_page_seqlen       = Paged_KV ? binfo.last_page_seqlen : kBlockN;
 
       const bool is_jump             = Is_target && m_block * kBlockM + actual_seqlen_offset > actual_seqlen_h;
+      const bool is_in_target        = Is_target && (m_block + 1) * kBlockM + actual_seqlen_offset > actual_seqlen_h;
       const bool is_in_context       = Is_context && (m_block + 1) * kBlockM <= actual_seqlen_c;
       const bool is_in_mixed_context = Is_context &&
           (m_block + 1) * kBlockM > actual_seqlen_c && m_block * kBlockM < actual_seqlen_c;
+      const bool is_in_paged_target  = is_in_target && Paged_KV;
+      const int last_page_offset     = is_in_paged_target ? kBlockN - last_page_seqlen : 0;
 
       const int n_block_history = cute::ceil_div(actual_seqlen_h, kBlockN);
       const int target_index    = (m_block * kBlockM - actual_seqlen_h) / params.target_group_size;
+      const int n_block_paged   = Paged_KV ? n_block_history : 0;
+      const int n_block_target  = cute::ceil_div(actual_seqlen_t, kBlockN);
 
       int n_block_min = !Is_local ? 0
           : std::max(0, (m_block * kBlockM + actual_seqlen_offset - params.window_size_left) / kBlockN);
-      int n_block_max = cute::ceil_div(actual_seqlen_k, kBlockN);
+      int n_block_max = Paged_KV ? n_block_history + n_block_target : cute::ceil_div(actual_seqlen_k, kBlockN);
       if constexpr (Is_causal || Is_local) {
         int offset = (m_block + 1) * kBlockM + actual_seqlen_offset + params.window_size_right;
+        if (is_in_paged_target) offset += last_page_offset;
         n_block_max = std::min(n_block_max, cute::ceil_div(offset, kBlockN));
       }
       if constexpr (Is_context) {
@@ -678,11 +944,13 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       }
 
       int n_masking_block_max = cute::ceil_div(
-          std::min(actual_seqlen_k, (m_block + 1) * kBlockM + actual_seqlen_offset), kBlockN);
+          std::min(actual_seqlen_k + last_page_offset,
+                   (m_block + 1) * kBlockM + actual_seqlen_offset + last_page_offset),
+          kBlockN);
       int n_masking_block_min = (m_block * kBlockM + actual_seqlen_offset) / kBlockN;
       if constexpr (Is_target) {
         n_masking_block_min = is_jump
-            ? (actual_seqlen_h + actual_seqlen_offset + target_index * params.target_group_size) / kBlockN
+            ? (actual_seqlen_h + actual_seqlen_offset + target_index * params.target_group_size + last_page_offset) / kBlockN
             : n_masking_block_min;
       }
       if constexpr (Is_context) {
@@ -992,7 +1260,10 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
             }
           }
           const int block_col = int(get<Col>(coord));
-          const int col       = block_col + base_col;
+          int col             = block_col + base_col;
+          if (Paged_KV && row >= actual_seqlen_h) {
+            col -= last_page_offset;
+          }
           if constexpr (!Is_causal && !Is_local && !Is_arbitrary) {
             if (col >= actual_seqlen_k) { tSrS(flat) = -INFINITY; continue; }
           } else {
@@ -1004,7 +1275,9 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
               if (col < col_limit_left(row)) { tSrS(flat) = -INFINITY; continue; }
             }
             if constexpr (Is_target) {
-              if (row >= actual_seqlen_h && col >= actual_seqlen_h && col < tgt_col_lft)
+              if (row >= actual_seqlen_h &&
+                  (col + (Paged_KV ? last_page_offset : 0)) >= actual_seqlen_h &&
+                  col < tgt_col_lft)
                 tSrS(flat) = -INFINITY;
             }
             if constexpr (Is_arbitrary) {
@@ -1584,12 +1857,10 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
 
 // Phase 6 WS TMA kernel entry: launched with kNThreads=384.
 // Q, K, V^T, Q-SF, K-SF, and V-SF all via TMA.
-template <typename Kernel_traits, typename TMA_Q_t, typename TMA_K_t, typename TMA_Vt_t,
-          typename TMA_SFA_t, typename TMA_SFB_t, typename TMA_SFV_t, typename TMA_O_t>
+template <typename Kernel_traits, typename Params>
 __global__ void __launch_bounds__(Kernel_traits::kNThreads, 1)
 hstu_fwd_kernel_sm120_fp8_ws_tma(
-    __grid_constant__ Hstu_fwd_params_fp8_ws_tma<TMA_Q_t, TMA_K_t, TMA_Vt_t,
-                                                  TMA_SFA_t, TMA_SFB_t, TMA_SFV_t, TMA_O_t> const params) {
+    __grid_constant__ Params const params) {
   constexpr int kBlockM = Kernel_traits::kBlockM;
   const int num_m_block = (params.seqlen_q + kBlockM - 1) / kBlockM;
   const int total_tiles = num_m_block * params.h * params.b;
@@ -1602,10 +1873,10 @@ hstu_fwd_kernel_sm120_fp8_ws_tma(
       !Kernel_traits::Is_arbitrary;
   constexpr bool Use_paired_persistent =
       Kernel_traits::Is_causal &&
-      !Kernel_traits::Is_target &&
       !Kernel_traits::Is_context &&
       !Kernel_traits::Is_local &&
-      !Kernel_traits::Is_arbitrary;
+      !Kernel_traits::Is_arbitrary &&
+      (!Kernel_traits::Is_target || Kernel_traits::Paged_KV);
   constexpr bool Use_persistent = Use_full_persistent || Use_paired_persistent;
 
   if constexpr (!Use_persistent) {

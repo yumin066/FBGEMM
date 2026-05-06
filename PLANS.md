@@ -5,6 +5,7 @@
 ## 当前状态
 
 项目当前位于 SM120 FP8 WS kernel 优化后续阶段。Phase 21 已完成并验证，最新基线为 benchmark 056。Phase 22 已完成第一轮 BF16 迁移评估：当前提交只保留默认 BF16 路径的 `kBlockN=128` 性能改动；WS/TMA 实验因性能回退不进入待提交 diff。Phase 23 当前实现为 FP8 WS pure full 和 pure causal split persistent kernel；其他 mask 仍保持原始 3D grid。
+下一阶段目标定为 Phase 24：支持 SM120 FP8 paged KV cache。
 
 最新有效基线：
 
@@ -21,6 +22,85 @@
 - SASS：当前 K/V stage persistent four-load-warp full/causal 目标 kernel 均为 `REG:168 STACK:0 LOCAL:0`，无 `LDL/STL`。
 - 准确性：`sweep_accuracy.py` 全部 `fp8_gt_cos >= 0.9996`。
 - examples：`run_hstu8_examples.sh` 为 14/14 PASS。
+
+## Phase 24：SM120 FP8 paged KV cache
+
+目标：让 SM120 FP8 forward 支持 paged KV cache，并先在 `quant_mode=2` block-scale FP8 路径上打通 correctness，再评估性能。
+
+当前结论：
+
+- 已实现第一版 SM120 FP8 paged KV forward correctness 路径。
+- `hstu_varlen_fwd_120` schema 已接入 `kv_cache/page_offsets/page_ids/last_page_lens` optional 参数。
+- `set_params_fprop_sm120` 已设置 `kv_cache` stride、page metadata 和 `is_paged_kv`。
+- SM120 FP8 traits 已支持 `Paged_KV` template bool；BF16 traits 仍固定 `Paged_KV=false`。
+- Python wrapper 已能在 SM120 `quant_mode=2` 下量化 paged `kv_cache`，并传入 combined cache+contiguous scale table。
+- 当前实现仅覆盖 no-RAB、causal/target、headDim128、`page_size=64`、forward。
+- 定向验证已通过：`B=1,H=1` paged KV cos `0.99875`；`B=2,H=4` paged KV cos `0.99876`；partial last page cos `0.99881`；target length 0 cos `0.99886`；非 paged `sweep_accuracy.py` 仍全部 `fp8_gt_cos >= 0.9996`。
+
+第一阶段范围：
+
+- forward only。
+- SM120 FP8 `quant_mode=2`。
+- no-RAB、causal/target paged KV 优先。
+- headDim128 优先。
+- 初始只支持 `page_size == kBlockN`，优先匹配当前 BN64 路径；不先支持跨 page 的单个 N tile。
+- 先不做 backward、RAB、arbitrary mask、local window 的完整支持。
+
+实施计划：
+
+1. API 和参数接线
+   - 给 `hstu_varlen_fwd_120` 增加 `kv_cache/page_offsets/page_ids/last_page_lens` optional 参数。
+   - Python SM120 分支传递 paged KV 参数。
+   - 在 `set_params_fprop_sm120` 中设置 `kv_cache_ptr`、stride、`page_size`、`total_pages`、page metadata 和 `is_paged_kv`。
+   - 加 runtime guard：只有当前支持的 FP8 paged KV shape 进入新路径，不支持的组合直接 `TORCH_CHECK` 报错。
+
+2. Kernel traits 和 dispatch
+   - 给 SM120 FP8 traits 加 `Paged_KV` template bool，不再固定为 false。
+   - dispatch 增加 paged KV specialization。
+   - 初始限制 `Page_Size == kBlockN`，避免 TMA tile 跨物理 page gather。
+   - 保持非 paged 路径生成代码不变，避免影响当前性能基线。
+
+3. Paged K/V load
+   - 参考 Ampere `Paged_KV` 逻辑：`n_block < n_block_paged` 走 paged cache，后续 target/new tokens 走普通 contiguous K/V。
+   - 第一版没有为 paged cache 建 TMA descriptor；paged K/V 由 K-load/V-load warp 手动 gather 到原 WS SW128 SMEM layout。
+   - K load 用 `page_ids[page_offsets[bidb] + n_block]` 映射到物理 page；V load 使用同一个 page id，K/V tensor 维度分别取 0/1。
+   - contiguous target K/V 也在 paged path 中由 load warp 手动 copy，避免 target 起点不按 `kBlockN` 对齐时 TMA tile index 不清。
+   - 保持 Q/O 路径不变。
+
+4. FP8 scale-factor 支持
+   - 明确 paged K/V cache 的 scale-factor layout。
+   - K cache scale 需要按 physical page id 可寻址；target/new K 仍按 contiguous token 可寻址。
+   - V cache scale 需要与 physical page/block 对齐；target/new V 仍沿 N block 对齐。
+   - 第一版使用 combined scale table：`[physical cache pages, contiguous q/k/v tokens]`，paged tile 用 `page_id * page_size` 索引，target tile 用 `total_pages * page_size + target_token_start` 索引。
+   - Python quantization 已支持 paged `kv_cache` 的 FP8 block-scale 打包。
+
+5. Mask 和 block info
+   - 在 SM120 `HstuBlockInfo` 中启用 `page_offsets/page_ids/last_page_lens`。
+   - 对齐 Ampere 的 `n_block_history`、`n_block_target`、`last_page_offset` 语义。
+   - 重点保证 target rows 对 paged history 的 causal mask 正确。
+   - 初始不支持 RAB/arbitrary/local，降低 mask 组合复杂度。
+
+6. Correctness 验证
+   - 基于 `HSTUPagedKVTest` 增加 SM120 FP8 paged KV 定向测试。
+   - 先覆盖：`page_size=64`、headDim128、causal、target length 为 0 和非 0。
+   - 对比 BF16 reference 或 FP8 Python reference，要求 cosine >= 0.995，理想 >= 0.999。
+   - 小 shape 先跑 compute-sanitizer，重点查 page 边界和 last page。
+   - 当前已完成 aligned directed、last page 非满、target length 为 0；还需要补 varlen batch 的正式测试。
+   - 当前日志：`1test_results/401_phase24_sm120_fp8_paged_kv_directed.log`、`402_phase24_sm120_fp8_paged_kv_b2h4.log`、`403_phase24_sm120_fp8_paged_kv_partial_last_page.log`、`404_phase24_sm120_fp8_paged_kv_target0.log`、`405_phase24_sm120_fp8_paged_kv_sweep.log`。
+
+7. 性能验证
+   - 增加 paged KV benchmark case，记录 kernel-only latency 和 corrected TFLOPS。
+   - 与“手动 gather 成 contiguous K/V 后的 SM120 FP8”做同 shape 对照。
+   - dump SASS 检查 `LDL/STL`，目标仍保持无 register spill。
+   - NCU 重点看 TMA pipe、page-id gather 开销、mbarrier wait、No Eligible 和 L2 hit。
+
+风险点：
+
+- TMA 不支持一个 tile 内跨多个非连续 physical page gather；因此必须先限制 `page_size == kBlockN`。
+- FP8 block-scale 的 K/V cache scale-factor 索引比 BF16 paged KV 更复杂，是本阶段最大 correctness 风险。
+- paged target mask 中 `last_page_lens` 和 `last_page_offset` 容易出现 off-by-one。
+- 新 specialization 可能增加 register pressure；每个保留版本必须检查 SASS spill。
+- persistent scheduler 当前按 logical tile decode；paged KV 需要保证 load/math 两边 page-id decode 完全一致。
 
 ## Phase 22：BF16 默认路径优化
 
@@ -210,11 +290,11 @@ Phase 20 的 `kBlockM=256` 路线暂时搁置。
 
 优先级建议：
 
-1. 对 Phase 21 基线做新的 NCU profile，确认 No Eligible、Long Scoreboard、SMEM、register、occupancy 的最新分布。
-2. 评估 `kBlockN=256` 的 SMEM 可行性和寄存器压力，重点检查是否超过 85KB 预算以及是否恶化 1 CTA/SM 限制。
-3. 评估能否把 SMEM 降到约 50KB，以解除 1 CTA/SM 限制；这是高难度方向，但可能直接改善 No Eligible。
-4. 对 Phase 23 mbar producer/consumer four-load-warp 版本做 NCU；重点确认 spill 消除后 persistent tail-wave 收益、Q/K/V/O mbarrier wait、Q/SFA/K/V TMA 与 O TMA store overlap、TMA pipe 竞争的实际占比。若性能优先，继续和旧 static launch pair 无 spill 版本做同频对照。
-5. Phase 22 下一步：停止通过降低 BF16 causal tile 或单纯提高 launch bound 追求 occupancy；已测方案没有超过默认 `{128,128,8}`。后续若继续 BF16，应优先寻找减少指令/同步/冗余工作且不缩小主 tile 的方案，或做 runtime 多 kernel dispatch 但必须证明目标 shape 有稳定收益。
+1. Phase 24：支持 SM120 FP8 paged KV cache。先打通 API/参数/schema，再实现 paged K/V TMA load、paged scale-factor layout、causal/target mask，最后做 correctness 和 benchmark。
+2. 对 Phase 23 当前 FP8 WS 版本做 NCU，确认 No Eligible、Long Scoreboard、SMEM、register、occupancy、mbarrier wait、TMA pipe 竞争和 tail-wave 分布。
+3. 若继续性能优化，评估 `kBlockN=256` 的 SMEM 可行性和寄存器压力，重点检查是否超过 85KB 预算以及是否恶化 1 CTA/SM 限制。
+4. 评估能否把 SMEM 降到约 50KB，以解除 1 CTA/SM 限制；这是高难度方向，但可能直接改善 No Eligible。
+5. Phase 22 BF16：停止通过降低 BF16 causal tile 或单纯提高 launch bound 追求 occupancy；已测方案没有超过默认 `{128,128,8}`。后续若继续 BF16，应优先寻找减少指令/同步/冗余工作且不缩小主 tile 的方案，或做 runtime 多 kernel dispatch 但必须证明目标 shape 有稳定收益。
 
 不建议立即继续：
 
@@ -229,6 +309,7 @@ Phase 20 的 `kBlockM=256` 路线暂时搁置。
 - `HSTU_SWEEP_FP8_QUANT_MODE=2 python sweep_accuracy.py`，要求 `fp8_gt_cos >= 0.995`，理想值 `>= 0.9996`。
 - BF16 相关改动运行 `hstu_test.py` 的 `HSTU16Test` 定向用例，至少覆盖 aligned WS 场景和不对齐 fallback 场景。
 - FP8 相关改动运行 `bash run_hstu8_examples.sh`，要求 14/14 PASS。
+- paged KV 相关改动运行 SM120 FP8 paged KV 定向测试，至少覆盖 `page_size == kBlockN`、last page 非满、target length 为 0 和非 0。
 
 性能相关改动还需要：
 

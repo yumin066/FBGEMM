@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run 14 explicit @example cases for HSTU8Test (quant_mode=2, SM120 FP8 block-scale).
+# Run 14 explicit @example cases for HSTU8Test plus paged KV mirrors.
 # Covers causal / +rab / +drab / local / context / target / arbitrary at seq=128 and seq=256.
 #
 # Usage:
@@ -26,7 +26,13 @@ REPO = '/home/scratch.minyu_gpu/project/shopee/fbgemm-hstu'
 sys.path.insert(0, f'{REPO}/fbgemm_gpu/experimental/hstu')
 sys.path.insert(0, f'{REPO}/fbgemm_gpu/experimental/hstu/test')
 import hstu  # noqa
-from hstu_test import HSTU8Test
+from hstu.cuda_hstu_attention import hstu_attn_varlen_func
+from hstu_test import HSTU8Test, generate_paged_kv_input, _hstu_paged_kv_attention
+
+SEED = 42
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
 
 t = HSTU8Test()
 inner = t.test_hstu_attn_fp8.hypothesis.inner_test
@@ -101,6 +107,124 @@ labels = [
     'seq=256 arbitrary',
 ]
 
+def metric_report(a, b):
+    diff = (a.float() - b.float()).abs()
+    cos = float(torch.nn.functional.cosine_similarity(
+        a.float().flatten().unsqueeze(0), b.float().flatten().unsqueeze(0)
+    ).item())
+    return cos, float(diff.max().item()), float(diff.mean().item())
+
+
+def run_paged_kv_case(batch_size, heads, new_history_len, prev_history_len, target_len):
+    D = 128
+    page_size = 64
+    alpha = 1.0
+    torch.manual_seed(SEED + batch_size * 100 + heads * 10 + new_history_len + prev_history_len + target_len)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED + batch_size * 100 + heads * 10 + new_history_len + prev_history_len + target_len)
+
+    (
+        _,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        num_targets,
+        page_offsets,
+        page_ids,
+        last_page_lens,
+        q,
+        k,
+        v,
+        kv_cache,
+        mask,
+    ) = generate_paged_kv_input(
+        batch_size=batch_size,
+        heads=heads,
+        max_seq_len_q=new_history_len,
+        max_seq_len_k=prev_history_len,
+        max_target_len=target_len,
+        attn_dim=D,
+        hidden_dim=D,
+        page_size=page_size,
+        dtype=torch.float16,
+        full_batch=True,
+    )
+
+    max_seqlen_q = new_history_len + target_len
+    max_seqlen_k = new_history_len + prev_history_len + target_len
+    ref = _hstu_paged_kv_attention(
+        num_heads=heads,
+        attention_dim=D,
+        linear_dim=D,
+        seqlen_q=max_seqlen_q,
+        seqlen_k=max_seqlen_k,
+        q=q,
+        k=k,
+        v=v,
+        q_offsets=cu_seqlens_q,
+        k_offsets=cu_seqlens_k,
+        num_targets=num_targets,
+        invalid_attn_mask=mask,
+        alpha=alpha,
+        upcast=True,
+        kv_cache=kv_cache,
+        page_offsets=page_offsets,
+        page_ids=page_ids,
+        last_page_lens=last_page_lens,
+    )
+    out = hstu_attn_varlen_func(
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_q=None,
+        seqused_k=None,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        scaling_seqlen=-1,
+        num_contexts=None,
+        num_targets=num_targets,
+        target_group_size=1,
+        window_size=(-1, 0),
+        alpha=alpha,
+        rab=None,
+        has_drab=False,
+        kv_cache=kv_cache,
+        page_offsets=page_offsets,
+        page_ids=page_ids,
+        last_page_lens=last_page_lens,
+        func=None,
+        quant_mode=2,
+    )
+    torch.cuda.synchronize()
+    cos, max_err, mean_err = metric_report(out, ref)
+    if cos < 0.995:
+        raise AssertionError(f'paged KV fp8_gt_cos={cos:.6f} < 0.995')
+    return cos, max_err, mean_err, last_page_lens.detach().cpu().tolist()
+
+
+def paged_case_from_example(kw):
+    seq_len = kw['seq_len_params'][1]
+    target_len = kw['target_params'][0]
+    return dict(
+        batch_size=kw['batch_size'],
+        heads=kw['heads'],
+        new_history_len=seq_len,
+        prev_history_len=kw['max_context_len'],
+        target_len=target_len,
+    )
+
+
+# SM120 FP8 paged KV currently supports no-RAB causal/target semantics only.
+# These mirrors cover every example's batch/head/seq/context/target dimensions;
+# unsupported RAB/local/arbitrary features are not enabled on the paged path.
+PAGED_CASES = [
+    (f'paged kv mirror {label}', paged_case_from_example(kw))
+    for kw, label in zip(cases, labels)
+] + [
+    ('paged kv edge partial-last-page', dict(batch_size=1, heads=2, new_history_len=64, prev_history_len=32, target_len=64)),
+]
+
 passed = 0
 for i, (kw, label) in enumerate(zip(cases, labels)):
     try:
@@ -111,8 +235,23 @@ for i, (kw, label) in enumerate(zip(cases, labels)):
         print(f'case {i+1:2d} FAIL  [{label}] -- {e}')
     sys.stdout.flush()
 
-print(f'\nResult: {passed}/{len(cases)} passed')
-sys.exit(0 if passed == len(cases) else 1)
+case_id = len(cases)
+for label, kw in PAGED_CASES:
+    case_id += 1
+    try:
+        cos, max_err, mean_err, last_page = run_paged_kv_case(**kw)
+        print(
+            f'case {case_id:2d} PASS  [{label}] '
+            f'cos={cos:.6f} max={max_err:.6f} mean={mean_err:.6f} last_page={last_page}'
+        )
+        passed += 1
+    except Exception as e:
+        print(f'case {case_id:2d} FAIL  [{label}] -- {e}')
+    sys.stdout.flush()
+
+total = len(cases) + len(PAGED_CASES)
+print(f'\nResult: {passed}/{total} passed')
+sys.exit(0 if passed == total else 1)
 PYEOF
 
 EXIT=$?

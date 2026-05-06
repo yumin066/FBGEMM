@@ -216,6 +216,7 @@ template <
     bool Is_arbitrary_,
     int kNFunc_,
     bool Has_rab_,
+    bool Paged_KV_ = false,
     bool Is_Q_in_regs_ = false,
     bool Share_Q_K_smem_ = false,
     typename out_type = cutlass::bfloat16_t>
@@ -235,7 +236,7 @@ struct Hstu_fwd_kernel_traits_sm120_fp8 {
   static constexpr bool Is_arbitrary = Is_arbitrary_;
   static constexpr int kNFunc = Is_arbitrary_ ? kNFunc_ : 0;
   static constexpr bool Has_rab = Has_rab_;
-  static constexpr bool Paged_KV = false;
+  static constexpr bool Paged_KV = Paged_KV_;
   static constexpr bool Is_fp8 = true;
 
   // Note: MMA_Atom_Arch / TiledMma / SmemCopyAtom are intentionally absent from this FP8
@@ -434,6 +435,7 @@ template <
     bool Is_arbitrary_,
     int kNFunc_,
     bool Has_rab_,
+    bool Paged_KV_ = false,
     bool Is_Q_in_regs_ = false,
     bool Share_Q_K_smem_ = false,
     typename out_type = cutlass::bfloat16_t>
@@ -441,11 +443,11 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
     : public Hstu_fwd_kernel_traits_sm120_fp8<
           kHeadDim_, kBlockM_, kBlockN_, kNWarps_,
           Is_causal_, Is_target_, Is_context_, Is_local_, Is_arbitrary_, kNFunc_, Has_rab_,
-          Is_Q_in_regs_, Share_Q_K_smem_, out_type> {
+          Paged_KV_, Is_Q_in_regs_, Share_Q_K_smem_, out_type> {
   using Base = Hstu_fwd_kernel_traits_sm120_fp8<
       kHeadDim_, kBlockM_, kBlockN_, kNWarps_,
       Is_causal_, Is_target_, Is_context_, Is_local_, Is_arbitrary_, kNFunc_, Has_rab_,
-      Is_Q_in_regs_, Share_Q_K_smem_, out_type>;
+      Paged_KV_, Is_Q_in_regs_, Share_Q_K_smem_, out_type>;
 
   // Warp roles:
   //   warps 0..kNWarps_-1  = math warps  (WG0: warps 0-3, WG1: warps 4-7)

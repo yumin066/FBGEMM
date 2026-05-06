@@ -66,7 +66,8 @@ struct Hstu_fwd_params : public Hstu_params {
   index_t rab_seqlen_q_stride;
   index_t rab_seqlen_k_stride;
 
-  // Paged KV cache (not supported in first Blackwell impl, kept for ABI compat)
+  // Paged KV cache. Initial SM120 support is FP8 forward-only, no-RAB,
+  // headDim128, page_size == kBlockN.
   void* __restrict__ kv_cache_ptr = nullptr;
   index_t kv_cache_row_stride = 0;
   index_t kv_cache_head_stride = 0;

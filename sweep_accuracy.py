@@ -7,12 +7,15 @@ import os
 import random
 import torch, sys
 sys.path.insert(0, "/home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/fbgemm_gpu/experimental/hstu")
+sys.path.insert(0, "/home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/fbgemm_gpu/experimental/hstu/test")
 import hstu  # noqa
 from hstu.cuda_hstu_attention import (
+    hstu_attn_varlen_func,
     quantize_for_block_scale_qk_along_d,
     quantize_for_block_scale_v_along_n,
     pack_descale_to_e8m0x4_int32,
 )
+from hstu_test import generate_paged_kv_input, _hstu_paged_kv_attention
 
 SEED = 42
 random.seed(SEED)
@@ -27,6 +30,9 @@ if torch.cuda.is_available():
 DEVICE = "cuda"
 BS = 1
 ALPHA = 1.0
+SWEEP_DIMS = [128]  # D=64 disabled in this build (HSTU_DISABLE_HDIM64=TRUE)
+SWEEP_HEADS = [1, 4]
+SWEEP_SEQS = [128, 256, 512]
 
 # Baseline defaults to avoid branch interference in debugging runs.
 # Users can still override from shell when explicitly needed.
@@ -37,6 +43,7 @@ os.environ.setdefault("HSTU_DEBUG_GEMM1_ONLY", "0")
 EXP_A = os.getenv("HSTU_EXP_A_SYNC_K", "0")
 EXP_B = os.getenv("HSTU_EXP_B_PBUF_IN_SK", "0")
 GEMM1_ONLY = os.getenv("HSTU_DEBUG_GEMM1_ONLY", "0") == "1"
+RUN_PAGED_KV_SWEEP = os.getenv("HSTU_SKIP_PAGED_KV_SWEEP", "0") != "1"
 print(f"[sweep config] HSTU_EXP_A_SYNC_K={EXP_A} HSTU_EXP_B_PBUF_IN_SK={EXP_B} HSTU_DEBUG_GEMM1_ONLY={int(GEMM1_ONLY)}")
 
 def run_attn(q, k, v, cu_seqlens, max_seqlen, num_targets, scaling_seqlen, quant_mode,
@@ -170,6 +177,98 @@ def stage_error_probe(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     _, _, _, o_rel_l2 = norm_report(o_b.flatten(), o_f.flatten())
     return (s_cos, s_max, s_mean, s_rel_l2), (o_cos, o_max, o_mean, o_rel_l2)
 
+
+def compute_paged_kv_metrics(batch_size, heads, new_history_len, prev_history_len,
+                             target_len, dtype=torch.float16):
+    D = 128
+    PAGE_SIZE = 64
+    torch.manual_seed(SEED + batch_size * 100 + heads * 10 + new_history_len + prev_history_len + target_len)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED + batch_size * 100 + heads * 10 + new_history_len + prev_history_len + target_len)
+
+    (
+        _,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        num_targets,
+        page_offsets,
+        page_ids,
+        last_page_lens,
+        q,
+        k,
+        v,
+        kv_cache,
+        mask,
+    ) = generate_paged_kv_input(
+        batch_size=batch_size,
+        heads=heads,
+        max_seq_len_q=new_history_len,
+        max_seq_len_k=prev_history_len,
+        max_target_len=target_len,
+        attn_dim=D,
+        hidden_dim=D,
+        page_size=PAGE_SIZE,
+        dtype=dtype,
+        full_batch=True,
+    )
+
+    max_seqlen_q = new_history_len + target_len
+    max_seqlen_k = new_history_len + prev_history_len + target_len
+
+    ref = _hstu_paged_kv_attention(
+        num_heads=heads,
+        attention_dim=D,
+        linear_dim=D,
+        seqlen_q=max_seqlen_q,
+        seqlen_k=max_seqlen_k,
+        q=q,
+        k=k,
+        v=v,
+        q_offsets=cu_seqlens_q,
+        k_offsets=cu_seqlens_k,
+        num_targets=num_targets,
+        invalid_attn_mask=mask,
+        alpha=ALPHA,
+        upcast=True,
+        kv_cache=kv_cache,
+        page_offsets=page_offsets,
+        page_ids=page_ids,
+        last_page_lens=last_page_lens,
+    )
+
+    out = hstu_attn_varlen_func(
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_q=None,
+        seqused_k=None,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        scaling_seqlen=-1,
+        num_contexts=None,
+        num_targets=num_targets,
+        target_group_size=1,
+        window_size=(-1, 0),
+        alpha=ALPHA,
+        rab=None,
+        has_drab=False,
+        kv_cache=kv_cache,
+        page_offsets=page_offsets,
+        page_ids=page_ids,
+        last_page_lens=last_page_lens,
+        func=None,
+        quant_mode=2,
+    )
+    torch.cuda.synchronize()
+
+    cos, max_err, mean_err = metric_report(out.flatten(), ref.flatten())
+    _, _, _, rel_l2 = norm_report(out.flatten(), ref.flatten())
+    if cos < 0.995:
+        raise AssertionError(f"paged KV fp8_gt_cos={cos:.6f} < 0.995")
+    return cos, max_err, mean_err, rel_l2, last_page_lens.detach().cpu().tolist()
+
 if GEMM1_ONLY:
     print("[mode] GEMM1 bypass: output = sum(Q×K^T tiles) / scaling_seqlen, GEMM2 skipped")
     print(
@@ -185,17 +284,20 @@ else:
         f"{'bf16_fp8_cos':>12} {'max_err':>10} {'mean_err':>10} | "
         f"{'||bf16||':>10} {'||fp8||':>10} {'rel_l2':>10} | "
         f"{'bf16_gt_cos':>11} {'bf16_gt_max':>12} {'bf16_gt_mean':>12} | "
-        f"{'fp8_gt_cos':>10} {'fp8_gt_max':>11} {'fp8_gt_mean':>11}"
+        f"{'fp8_gt_cos':>10} {'fp8_gt_max':>11} {'fp8_gt_mean':>11} | "
+        f"{'paged_gt_cos':>12} {'paged_gt_max':>12} {'paged_gt_mean':>13}"
     )
-    print("-" * 168)
+    print("-" * 213)
+    if RUN_PAGED_KV_SWEEP:
+        print("[paged kv] appended columns use the current causal/target paged-KV path")
 
 USE_ONES = os.getenv("HSTU_USE_ONES", "0") == "1"
 if USE_ONES:
     print("[input mode] Q=K=V=ones (all 1.0)")
 
-for D in [128]:  # D=64 disabled in this build (HSTU_DISABLE_HDIM64=TRUE)
-    for H in [1, 4]:
-        for SEQ in [128, 256, 512]:
+for D in SWEEP_DIMS:
+    for H in SWEEP_HEADS:
+        for SEQ in SWEEP_SEQS:
             g = torch.Generator(device=DEVICE)
             g.manual_seed(SEED)
             if USE_ONES:
@@ -299,14 +401,60 @@ for D in [128]:  # D=64 disabled in this build (HSTU_DISABLE_HDIM64=TRUE)
                 cos_b_gt, me_b_gt, mn_b_gt = metric_report(o_b, gt)
                 # FP8 kernel vs dequantized ground truth (correct comparison)
                 cos_f_gt, me_f_gt, mn_f_gt = metric_report(o_f, gt_deq_flat)
+                if RUN_PAGED_KV_SWEEP:
+                    paged_cos, paged_max, paged_mean, _, _ = compute_paged_kv_metrics(
+                        batch_size=BS,
+                        heads=H,
+                        new_history_len=SEQ,
+                        prev_history_len=0,
+                        target_len=0,
+                    )
+                    paged_cols = f" | {paged_cos:>12.4f} {paged_max:>12.6f} {paged_mean:>13.6f}"
+                else:
+                    paged_cols = f" | {'N/A':>12} {'N/A':>12} {'N/A':>13}"
                 print(
                     f"{D:>4} {H:>4} {SEQ:>6} | "
                     f"{cos:>12.4f} {me:>10.6f} {mn:>10.6f} | "
                     f"{n_b:>10.4f} {n_f:>10.4f} {rel_l2:>10.6f} | "
                     f"{cos_b_gt:>11.4f} {me_b_gt:>12.6f} {mn_b_gt:>12.6f} | "
-                    f"{cos_f_gt:>10.4f} {me_f_gt:>11.6f} {mn_f_gt:>11.6f}{flag}"
+                    f"{cos_f_gt:>10.4f} {me_f_gt:>11.6f} {mn_f_gt:>11.6f}{paged_cols}{flag}"
                 )
         sys.stdout.flush()
+
+
+def run_paged_kv_case(label, batch_size, heads, new_history_len, prev_history_len,
+                      target_len, dtype=torch.float16):
+    cos, max_err, mean_err, rel_l2, last_page_lens = compute_paged_kv_metrics(
+        batch_size=batch_size,
+        heads=heads,
+        new_history_len=new_history_len,
+        prev_history_len=prev_history_len,
+        target_len=target_len,
+        dtype=dtype,
+    )
+    print(
+        f"{label:>22} | B={batch_size:<2} H={heads:<2} "
+        f"new={new_history_len:<3} prev={prev_history_len:<3} tgt={target_len:<3} | "
+        f"cos={cos:.6f} max={max_err:.6f} mean={mean_err:.6f} rel_l2={rel_l2:.6f} "
+        f"last_page={last_page_lens}"
+    )
+
+
+if (
+    not GEMM1_ONLY
+    and RUN_PAGED_KV_SWEEP
+    and os.getenv("HSTU_PAGED_KV_EDGE_CASES", "0") == "1"
+):
+    print("\n[paged kv edge cases] SM120 FP8 quant_mode=2")
+    print(
+        f"{'case':>22} | {'shape':>24} | "
+        f"{'metrics':>55}"
+    )
+    print("-" * 112)
+    run_paged_kv_case("edge_partial_page", batch_size=1, heads=2,
+                      new_history_len=64, prev_history_len=32, target_len=64)
+    run_paged_kv_case("edge_target_zero", batch_size=1, heads=1,
+                      new_history_len=128, prev_history_len=64, target_len=0)
 
 
 if os.getenv("HSTU_STAGE_PROBE", "0") == "1":
