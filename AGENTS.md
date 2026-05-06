@@ -26,11 +26,16 @@
 
 当前 FP8 WS Phase 23 状态：
 
-- FP8 WS pure causal no-RAB 路径使用静态首尾配对 launch queue：`blockIdx.x` 映射为 `0, total_tiles-1, 1, total_tiles-2, ...`，用于拉平 causal heavy/light tile 的 wave/tail。
-- FP8 WS full、local、context、target、arbitrary 等其他实例保持原始三维 grid：`dim3(num_m_block, h, b)`。
+- FP8 WS pure full no-RAB 路径当前使用 branch-local grid-stride persistent kernel：host 端 `grid.x = min(total_tiles, SM_count)`，device 端 load/math 分支各自以 `gridDim.x` 为 stride 遍历 tile。
+- FP8 WS pure causal no-RAB 路径当前使用 branch-local paired persistent kernel：host 端 `grid.x = min(total_tile_pairs, SM_count)`，device 端 load/math 分支各自以 `gridDim.x` 为 stride 遍历 tile-pair。
+- 每个 tile-pair 处理 `tile_pair` 和 `total_tiles - 1 - tile_pair`，用于拉平 causal heavy/light tile 的 wave/tail。
+- tile id 使用静态本地 decode：load/math 两边运行同一确定性 scheduler，不使用 dynamic work queue、atomic counter 或 shared tile-id state。
+- FP8 WS local、context、target、arbitrary 等其他实例保持原始三维 grid：`dim3(num_m_block, h, b)`。
+- epilogue/O-store 已归到 active load warp：math warps 负责写 O 到 SMEM，active load warp 负责 `tma_o` store 并等待完成。
+- persistent full/causal 路径已把 K/V 双缓冲的 producer/consumer mbarrier 初始化和 CTA S1 提到 static scheduler loop 外，并跨 tile 维护 mbarrier parity 和 K/V stage；`S_arb` 仍只属于 arbitrary/non-persistent 路径。
+- 当前实验版进一步把 4 个 load warp 分工为 Q/SFA load、K/SFB load、V/SFV load、O store；Q/K/V/O 使用 ready/empty mbarrier 做细粒度 producer/consumer 同步，已移除 tile-end load-only `bar.sync 4,128`。O 不新增 double buffer，而是复用当前 tile 最后被 math 消费的 K/V stage。math epilogue 直接用 `math_stage ^ 1` 选 O stage；O-store warp 使用同一 tile 参数和当前起始 stage 推导 O stage。
 - 不保留 dynamic persistent work queue：correctness 可过，但 tile 间需要 CTA sync/atomic，性能收益小且波动。
-- 不保留 paired persistent wrapper loop：causal 有单次高分，但会让 inline WS body 出现 `STACK`/`LDL`/`STL` spill，full 明显回退。
-- 若后续继续做真正 persistent kernel，应先把 `hstu_compute_attn_1rowblock_sm120_fp8_ws` 拆成 producer/consumer/store 三段，而不是在 wrapper 中循环调用整个 inline body。
+- 当前 K/V stage persistent 版本已通过 correctness，full/causal SASS 均为 `REG:168 STACK:0 LOCAL:0` 且无 `LDL/STL`；当前 O-stage N-tile parity 公式版 benchmark `156` 为 full/causal `643.7/1194.6 TFLOPS`。前一版逐 tile 翻转 O-store stage 的 benchmark `155` 为 `642.2/1204.1 TFLOPS`。full 仍低于 benchmark `148` 的 `646.5 TFLOPS` 和 pre-hoist `140` 的 `649.5 TFLOPS`。`q_consumed_mbar + bar.sync 4,96` 实验 correctness 可过，但 benchmark `146` 回退到 `621.6/1155.0 TFLOPS`，不保留。
 
 ## 核心路径
 
@@ -148,8 +153,36 @@ SASS 中重点搜索 `LDL`/`STL` 以定位 register spill。
 
 Phase 23 FP8 WS SASS 参考：
 
-- `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full_static_launch_pair.sass`：full 实例 `REG:168 STACK:0 LOCAL:0`，`LDL/STL=0`。
-- `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_causal_static_launch_pair.sass`：causal 实例 `REG:168 STACK:0 LOCAL:0`，`LDL/STL=0`。
+- 当前 K/V stage persistent 版本：
+  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full_kv_stage_persist.sass`：full 实例 `REG:168 STACK:0 LOCAL:0`，无 `LDL/STL`。
+  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_causal_kv_stage_persist.sass`：causal 实例 `REG:168 STACK:0 LOCAL:0`，无 `LDL/STL`。
+  - benchmark `156` 为 full/causal `643.7/1194.6 TFLOPS`；benchmark `155` 的逐 tile 翻转版本为 `642.2/1204.1 TFLOPS`。
+- mbar producer/consumer four-load-warp 参考版本：
+  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full_mbar_cnt_sync_oempty_real.sass`：full 实例 `REG:168 STACK:0 LOCAL:0`，无 `LDL/STL`。
+  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_causal_mbar_cnt_sync_oempty_real.sass`：causal 实例 `REG:168 STACK:0 LOCAL:0`，无 `LDL/STL`。
+  - benchmark `148` 为 full/causal `646.5/1177.6 TFLOPS`。
+- 当前 S1-hoist split persistent 版本：
+  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full_persistent_hoist_s1.sass`：full 实例无 `LDL/STL`。
+  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_causal_persistent_hoist_s1.sass`：causal 实例无 `LDL/STL`。
+  - benchmark `142` 为 full/causal `643.6/1160.4 TFLOPS`。
+- Four-load-warp 实验版：
+  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full_four_load_warp.sass`：full 实例无 `LDL/STL`。
+  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_causal_four_load_warp.sass`：causal 实例无 `LDL/STL`。
+  - benchmark `143` 为 full/causal `625.2/1166.0 TFLOPS`。
+- Pre-hoist split persistent 参考：
+  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full_split_static_decode.sass`：full 实例 `REG:168 STACK:0 LOCAL:0`，`LDL/STL=0`。
+  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_causal_split_static_decode.sass`：causal 实例 `REG:168 STACK:0 LOCAL:0`，`LDL/STL=0`。
+  - benchmark `140` 为 full/causal `649.5/1162.5 TFLOPS`。
+- 旧 full+causal wrapper persistent 版本：
+  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full_full_causal_persistent_unroll1.sass`：full 实例 `REG:168 STACK:48 LOCAL:0`，`LDL=22`、`STL=16`。
+  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_causal_full_causal_persistent_unroll1.sass`：causal 实例 `REG:168 STACK:56 LOCAL:0`，`LDL=45`、`STL=27`。
+  - 外层 persistent wrapper loop 的 `#pragma unroll 1` 没有减少 spill；benchmark `139` 为 full/causal `627.5/1097.6 TFLOPS`。
+- 旧 pure causal persistent 参考：
+  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full_paired_persistent.sass`：full 实例未走 persistent，`REG:168 STACK:0 LOCAL:0`，`LDL/STL=0`。
+  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_causal_paired_persistent.sass`：causal 实例 `REG:168 STACK:56 LOCAL:0`，`LDL=45`、`STL=27`。
+- 旧 static launch pair 参考：
+  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full_static_launch_pair.sass`：full 实例 `REG:168 STACK:0 LOCAL:0`，`LDL/STL=0`。
+  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_causal_static_launch_pair.sass`：causal 实例 `REG:168 STACK:0 LOCAL:0`，`LDL/STL=0`。
 
 ## 性能分析重点
 
@@ -162,7 +195,8 @@ Phase 23 FP8 WS SASS 参考：
 - SM 利用率
 - SMEM bank conflict
 - Block Limit SMEM；当前 FP8 WS 路径受约 85KB SMEM/CTA 限制，通常为 1 CTA/SM。
-- FP8 WS static launch pair 下一步应跑 NCU，重点确认 tail wave 是否改善，以及 No Eligible/Long Scoreboard 是否变化。
+- FP8 WS pure full 和 pure causal 当前都是 K/V stage persistent 的 mbar producer/consumer four-load-warp persistent kernel；下一步应跑 NCU，重点确认 No Eligible、Long Scoreboard、mbarrier wait、O-store 与下一 tile Q/SFA/K/V TMA overlap、TMA pipe 竞争，以及 tail-wave 的占比。
+- 旧 static launch pair 仍可作为同频对照：当前 split persistent causal 已超过旧 static pair 记录，full 略低于旧 static pair 最好记录。
 
 跑性能数据前可锁频：
 

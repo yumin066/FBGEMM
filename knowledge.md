@@ -81,24 +81,78 @@
 
 ---
 
-## 23. FP8 WS causal 静态首尾配对 queue
+## 23. FP8 WS split persistent kernel
 
-**结论**：对 pure causal no-RAB FP8 WS，首尾配对的静态 launch order 比 persistent wrapper 更稳。
+**当前结论**：pure full 和 pure causal no-RAB FP8 WS 已改为 split persistent kernel。把 persistent loop 放进 load/math 各自分支后，之前 monolithic wrapper loop 引入的 full/causal register spill 已消除。
 
-**有效做法**：
-- pure causal launch 使用一维 `grid.x = total_tiles`；
-- `blockIdx.x` 映射为 `0, total_tiles-1, 1, total_tiles-2, ...`；
-- full/local/context/target/arbitrary 保持原始三维 grid，避免无收益路径被 causal queue 影响。
+**当前 persistent 做法**：
+- pure full launch 使用一维 `grid.x = min(total_tiles, SM_count)`，load/math 分支各自以 `gridDim.x` 为 stride 遍历 tile；
+- pure causal launch 使用一维 `grid.x = min(total_tile_pairs, SM_count)`；
+- `total_tile_pairs = (total_tiles + 1) / 2`；
+- 每个 CTA 以 `gridDim.x` 为 stride 遍历 tile-pair；
+- 每个 tile-pair 处理 `tile_pair` 和 `total_tiles - 1 - tile_pair`，把 heavy/light tile 配到同一个 CTA；
+- local/context/target/arbitrary 保持原始三维 grid，避免无收益路径被 persistent queue 影响。
 
-**原因**：
-- causal 的 M tile 工作量从重到轻变化，原始顺序容易在 wave/tail 上产生不均；
-- heavy/light 交错可以静态拉平 launch order；
-- 不把 `hstu_compute_attn_1rowblock_sm120_fp8_ws` 包进 persistent loop，就不会因为 inline body 跨 tile 循环而引入 `STACK`/`LDL`/`STL`。
+**tile id 获取与广播**：
+- 不使用 dynamic work queue、atomic counter 或 shared tile-id state；
+- load/math 两边运行同一确定性 static scheduler；
+- `hstu_ws_decode_tile(tile, num_m_block, params.h)` 负责把 linear tile 映射到 `{bidb, bidh, m_block}`；
+- 这等价于静态本地广播：两个分支从同一 CTA/loop counter 解出同一 tile id，不需要额外 CTA sync。
 
-**已拒绝做法**：
+**同步与 store 所属路径**：
+- math warps 只负责 compute/softmax、GEMM2 和把 O 写入 SMEM；
+- active load warp 负责 `tma_o` store，并在 store wait 完成后才进入下一 tile；
+- math/load 通过 O ready/empty mbarrier handoff；active O-store warp 等 O ready 后做 `tma_o` store，store wait 完成后释放 O empty。
+- 这个 handoff 避免 load path 在下一 tile 开始前重置仍被 O-store 使用的 `smem_q` 或 mbarrier。
+- persistent full/causal 路径可以把 Q/K/V/O producer/consumer mbarrier 初始化和 CTA S1 提到 static scheduler loop 外；正确做法是跨 tile 维护 load 侧 empty wait parity 和 math/O-store 侧 ready wait parity，不能在每个 tile 内重置 parity。
+- `S_arb` 只属于 arbitrary mask 路径；当前 persistent full/causal 编译条件排除了 arbitrary/local/context/target，因此不能把 `S_arb` 作为 persistent hot path 的优化对象。
+- four-load-warp 实验把 load WG2 拆成 Q/SFA、K/SFB、V/SFV、O-store 四个角色。K 和 V 使用独立 TMA completion mbarrier，math warp 同一 stage 必须同时 wait K 和 V 两个 mbarrier 后再进入 GEMM1/GEMM2。
+- 该实验不新增 Q/O double buffer：Q 仍使用 Q-persist 单 buffer，O 复用当前 tile 最后被 math 消费的 K/V stage。math epilogue 可以直接用 `math_stage ^ 1` 得到该 stage，因为 N-loop 每消费一个 tile 后都会 flip `math_stage`；O-store warp没有执行 math loop，因此需要从同一 tile 的 N-loop 参数推导相同 stage。
+- 为了保证 O store 期间 K/V 不覆盖 O 复用的 stage，K/V load warp 只在对应 K/V stage 有 pending O-store 时等待 `o_empty[stage]`；Q warp 独立等待 `q_empty`，不再需要 tile-end load-only `bar.sync 4,128`。
+- `o_empty` 不能在初始化时 pre-arrive。K/V 第一次写某个 stage 时没有 pending O，因此会跳过 `o_empty` wait；如果初始化 pre-arrive，则第一次真正 pending wait 会吃到 stale initial phase，导致 K/V 在 O TMA store 完成前覆盖 O SMEM。正确做法是只初始化 `o_empty`，不 arrive；由真实 O-store 完成后第一次 arrive。
+- 删除 K/V 循环外 prefetch 后，K/V double-buffer stage 不应在每个 M tile 重置为 0。否则 causal 中前一 tile 的 O-store 如果占用 stage0，下一 tile 即使 stage1 空闲也会先等 stage0，浪费跨 tile overlap。正确做法是让 load 侧 `kv_load_stage`、math 侧 `math_stage`、O-store 侧 O-stage 推导都跨 persistent scheduler loop 维护同一个 stage 序列。
+
+**实测状态**：
+- correctness：`1test_results/334_phase23_fp8_ws_split_static_decode_accuracy.log` 通过，`fp8_gt_cos >= 0.9996`；`1test_results/335_phase23_fp8_ws_split_static_decode_examples.log` 为 14/14 PASS。
+- benchmark：`2benchmark_results/140_27011a7f_gpu_unlocked_phase23_fp8_ws_split_static_decode_kernel200.log` 中 full/causal 为 `649.5/1162.5 TFLOPS`。
+- SASS：full 和 causal 实例均为 `REG:168 STACK:0 LOCAL:0`，`LDL/STL=0`。
+- S1-hoist correctness：`1test_results/336_phase23_fp8_ws_persistent_hoist_s1_accuracy.log` 通过，`fp8_gt_cos >= 0.9996`；`1test_results/337_phase23_fp8_ws_persistent_hoist_s1_examples.log` / `338_hstu8_examples_qm2.log` 为 14/14 PASS。
+- S1-hoist benchmark：`2benchmark_results/142_27011a7f_gpu_unlocked_phase23_fp8_ws_persistent_hoist_s1_kernel200_target.log` 中 full/causal 为 `643.6/1160.4 TFLOPS`，相对 pre-hoist benchmark `140` 没有提升。
+- S1-hoist SASS：`4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full_persistent_hoist_s1.sass` 和 `..._causal_persistent_hoist_s1.sass` 均无 `LDL/STL`。
+- 结论：hoist S1 是正确的同步简化，但不是已证明的性能优化；可能原因是原 per-tile S1 成本小，或去掉 S1 后下一 tile Q/SFA TMA 与前一 tile O TMA store 竞争 TMA pipe。
+- four-load-warp correctness：`1test_results/339_phase23_fp8_ws_four_load_warp_accuracy.log` 通过，`fp8_gt_cos >= 0.9996`；`1test_results/340_phase23_fp8_ws_four_load_warp_examples.log` / `341_hstu8_examples_qm2.log` 为 14/14 PASS。
+- four-load-warp benchmark：`2benchmark_results/143_27011a7f_gpu_unlocked_phase23_fp8_ws_four_load_warp_kernel200_target.log` 中 full/causal 为 `625.2/1166.0 TFLOPS`。causal 略高，但 full 明显低于 pre-hoist benchmark `140` 的 `649.5 TFLOPS`。
+- four-load-warp SASS：`4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full_four_load_warp.sass` 和 `..._causal_four_load_warp.sass` 均无 `LDL/STL`。
+- dynamic O-stage correctness：`1test_results/346_phase23_fp8_ws_dynamic_o_stage_mathstage_accuracy.log` 通过，`fp8_gt_cos >= 0.9996`；`1test_results/347_phase23_fp8_ws_dynamic_o_stage_mathstage_examples.log` / `348_hstu8_examples_qm2.log` 为 14/14 PASS。
+- dynamic O-stage benchmark：`2benchmark_results/145_27011a7f_gpu_unlocked_phase23_fp8_ws_dynamic_o_stage_mathstage_kernel200_target.log` 中 full/causal 为 `630.1/1169.1 TFLOPS`。相对固定 stage0 four-load-warp 版本略升，但 full 仍低于 pre-hoist benchmark `140`。
+- dynamic O-stage SASS：`4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full_dynamic_o_stage_mathstage.sass` 和 `..._causal_dynamic_o_stage_mathstage.sass` 均无 `LDL/STL`。
+- final dynamic O-stage correctness：`1test_results/352_phase23_fp8_ws_dynamic_o_stage_final_accuracy.log` 通过，`fp8_gt_cos >= 0.9996`；`1test_results/353_phase23_fp8_ws_dynamic_o_stage_final_examples.log` / `354_hstu8_examples_qm2.log` 为 14/14 PASS。
+- final dynamic O-stage benchmark：`2benchmark_results/147_27011a7f_gpu_unlocked_phase23_fp8_ws_dynamic_o_stage_final_kernel200_target.log` 中 full/causal 为 `630.3/1170.3 TFLOPS`。
+- final dynamic O-stage SASS：`4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full_dynamic_o_stage_final.sass` 和 `..._causal_dynamic_o_stage_final.sass` 均无 `LDL/STL`。
+- `q_consumed_mbar + bar.sync 4,96` 实验：语义上可以让 Q warp 不等 O-store/KV-stage reuse，但实测不保留。correctness 通过（`1test_results/349_phase23_fp8_ws_q_consumed_bar4_96_accuracy.log`、`350_phase23_fp8_ws_q_consumed_bar4_96_examples.log`），benchmark `146` full/causal 只有 `621.6/1155.0 TFLOPS`，低于 dynamic O-stage 保留版本。当前推断是新增 mbarrier wait 的控制流/等待成本超过 Q 提前进入下一 tile 的收益，且 K/V/O 仍受 `bar.sync 4,128` 类同步约束限制主要 overlap。
+- `o_empty` pre-arrive 版本：sweep 可过（`1test_results/362_phase23_fp8_ws_mbar_cnt_sync_oready8_helper_accuracy.log`），但 examples `363/364` 只有 12/14 PASS，pure causal `seq=128/256` 出现 NaN；该版本已拒绝。
+- mbar producer/consumer 版本：移除 `o_empty` pre-arrive 后 correctness 通过（`1test_results/365_phase23_fp8_ws_mbar_cnt_sync_oempty_real_accuracy.log`，`1test_results/366_phase23_fp8_ws_mbar_cnt_sync_oempty_real_examples.log` 14/14 PASS），benchmark `148` full/causal 为 `646.5/1177.6 TFLOPS`。
+- mbar producer/consumer SASS：`4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full_mbar_cnt_sync_oempty_real.sass` 和 `..._causal_mbar_cnt_sync_oempty_real.sass` 均为 `REG:168 STACK:0 LOCAL:0` 且无 `LDL/STL`。
+- K/V stage persistent 版本：correctness 通过（`1test_results/377_phase23_fp8_ws_kv_stage_persist_accuracy.log`，`1test_results/378_phase23_fp8_ws_kv_stage_persist_examples.log` / `379_hstu8_examples_qm2.log` 14/14 PASS），benchmark `155` full/causal 为 `642.2/1204.1 TFLOPS`。
+- O-stage N-tile parity 公式版：correctness 通过（`1test_results/380_phase23_fp8_ws_o_stage_ntiles_formula_accuracy.log`，`1test_results/381_phase23_fp8_ws_o_stage_ntiles_formula_examples.log` / `382_hstu8_examples_qm2.log` 14/14 PASS），benchmark `156` full/causal 为 `643.7/1194.6 TFLOPS`。
+- 2407MHz locked full benchmark：当前 persistent `157` 中 bs=8 seq=4096 h=16 full/causal 为 `627.8/1168.8 TFLOPS`；同环境临时关闭 full/causal persistent scheduler 的 current-code non-persistent `158` 为 `4.8/9.0 TFLOPS`。该 non-persistent 对照不是历史 phase21 源码，而是当前 four-load-warp/mbar 代码按每 tile CTA 运行；它证明当前实现的 mbar/O-store/QKV stage 设计强依赖 persistent scheduler，不能作为回退路径。历史 phase21 non-persistent 参考 `056` 为 `640.0/1131.8 TFLOPS`。
+- K/V stage persistent SASS：`4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full_kv_stage_persist.sass` 和 `..._causal_kv_stage_persist.sass` 均为 `REG:168 STACK:0 LOCAL:0` 且无 `LDL/STL`。
+- 当前结论：四 load warp 分工、动态 O stage、Q/K/V/O ready-empty mbarrier 和跨 tile K/V stage 在 SMEM/correctness 上可行；causal 已形成当前最好记录，full 仍略低于 benchmark `140/148`。后续要拿 full 收益，需要用 NCU 判断 mbarrier 控制流成本、TMA pipe 竞争和跨 tile overlap。
+
+**旧 wrapper persistent 的教训**：
+- monolithic 外层 wrapper loop 也能通过 correctness，但会扩大 inline WS body 的 live range；
+- full/causal wrapper persistent + `#pragma unroll 1` 后 spill 仍不变，说明问题不是 loop unroll，而是跨 tile loop 包住整块 compute body；
+- 旧记录：full `STACK:48`、`LDL=22`、`STL=16`；causal `STACK:56`、`LDL=45`、`STL=27`；benchmark full/causal 为 `627.5/1097.6 TFLOPS`。
+
+**已拒绝/需避免做法**：
 - dynamic persistent queue：correctness 可过，但需要 tile 间 CTA sync/atomic，收益小且波动；
-- paired persistent loop：causal 有单次高分，但 full 回退，SASS 出现 stack/local spill；
+- 外层 wrapper loop `#pragma unroll 1`：不减少 `STACK`/`LDL`/`STL`，性能也没有改善；
+- noinline callee 隔离 wrapper loop 和 WS body：causal FP8 WS 实例 `ptxas` 超过 7 分钟未完成，编译成本不可接受；
 - wrapper 中 static shared state：会移动 dynamic SMEM 起点，破坏 SW128/TMA 绝对对齐。
+
+**后续方向**：
+- 对当前 mbar producer/consumer four-load-warp 版本跑 NCU，确认 spill 消除后 No Eligible、Long Scoreboard、Q/K/V/O mbarrier wait、O-store 与下一 tile Q/SFA/K/V TMA overlap、TMA pipe 竞争和 tail-wave 的实际占比；
+- 若继续优化，应优先降低 tile handoff、K/V TMA wait 或 TMA pipe 竞争，而不是再改外层 wrapper loop。
 
 ---
 
