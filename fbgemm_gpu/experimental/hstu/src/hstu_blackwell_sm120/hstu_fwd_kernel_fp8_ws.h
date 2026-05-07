@@ -224,7 +224,9 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     const int total_tile_pairs_persistent = 0) {
 
   static_assert(Kernel_traits::Is_fp8, "Phase 6 WS: FP8 path only");
-  static_assert(!Kernel_traits::Has_rab, "Phase 6 WS: Has_rab not yet supported");
+  static_assert(
+      !Kernel_traits::Has_rab || Kernel_traits::Paged_KV,
+      "FP8 WS RAB/DRAB is currently only enabled for paged KV");
   static_assert(
       !(Use_full_persistent && Use_paired_persistent),
       "Only one FP8 WS persistent scheduler can be enabled");
@@ -961,10 +963,12 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     constexpr bool Is_arbitrary = Kernel_traits::Is_arbitrary;
     constexpr int  kNFunc       = Kernel_traits::kNFunc;
     constexpr bool Is_local     = Kernel_traits::Is_local;
+    constexpr bool Has_rab      = Kernel_traits::Has_rab;
     constexpr bool Paged_KV     = Kernel_traits::Paged_KV;
     constexpr int  kBlockM      = Kernel_traits::kBlockM;
     constexpr int  kBlockN      = Kernel_traits::kBlockN;
     constexpr int  kHeadDim     = Kernel_traits::kHeadDim;
+    using RabElement = cutlass::bfloat16_t;
 
     const int tidx_math = tidx;  // math warps: tidx_math == tidx (0-255)
     int tma_parity0 = 0;  // Persistent K/V mbarrier parity for stage 0.
@@ -1442,6 +1446,42 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         }
       };
 
+      auto add_rab_bs = [&](auto& tSrS, int nb) {
+        if constexpr (Has_rab) {
+          static constexpr int Row = 0, Col = 1;
+          Tensor cS   = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
+          Tensor tScS = thr_mma_g1.partition_C(cS);
+          const int bidh_rab = (params.h_rab > 1) ? bidh : 0;
+          const size_t rab_offset = bidb * params.rab_seqlen_qk_stride
+              + bidh_rab * params.rab_seqlen_q_stride
+              + params.seqlen_k_rounded * actual_seqlen_offset;
+          const RabElement* rab_ptr =
+              reinterpret_cast<const RabElement*>(params.rab_ptr) + rab_offset;
+          const int base_row = m_block * kBlockM + actual_seqlen_offset;
+          const int base_col = nb * kBlockN;
+
+          CUTE_UNROLL
+          for (int flat = 0; flat < size(tSrS); ++flat) {
+            const auto coord = tScS(flat);
+            const int block_row = int(get<Row>(coord));
+            const int q_idx = m_block * kBlockM + block_row;
+            if (q_idx >= actual_seqlen_q) {
+              continue;
+            }
+            const int row = block_row + base_row;
+            const int block_col = int(get<Col>(coord));
+            int col = block_col + base_col;
+            if (Paged_KV && row >= actual_seqlen_h) {
+              col -= last_page_offset;
+            }
+            if (0 <= col && col < actual_seqlen_k) {
+              tSrS(flat) += static_cast<float>(
+                  rab_ptr[q_idx * params.rab_seqlen_k_stride + col]);
+            }
+          }
+        }
+      };
+
       // SFP (unit scale for P) — separate buffer so real SFA SMEM stays valid for per-tile GEMM1 s2r.
       for (int i = tidx_math; i < kBlockM; i += kNMathThreads)
         smem_sfp_ptr[i] = 0x7f7f7f7f;
@@ -1756,6 +1796,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
             arrive_mbar(k_empty_addr);
           }
         }
+        add_rab_bs(acc_s, nb);
         if (params.debug_gemm1_only) {
           for (int i = 0; i < size(acc_s); ++i) acc_o(i) += acc_s(i);
           {
@@ -2183,7 +2224,7 @@ hstu_fwd_kernel_sm120_fp8_ws_tma(
       !Kernel_traits::Is_local &&
       !Kernel_traits::Is_arbitrary &&
       (!Kernel_traits::Is_target || Kernel_traits::Paged_KV) &&
-      (Kernel_traits::kHeadDim <= 128 || Kernel_traits::Paged_KV);
+      (Kernel_traits::kHeadDim <= 128 || (Kernel_traits::Paged_KV && !Kernel_traits::Has_rab));
   constexpr bool Use_persistent = Use_full_persistent || Use_paired_persistent;
 
   if constexpr (!Use_persistent) {

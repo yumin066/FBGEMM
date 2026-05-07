@@ -172,9 +172,6 @@ def make_paged_cache_from_varlen_kv(k, v, cu_seqlens_k, num_targets, page_size):
 
 def expected_paged_unsupported_reason(kw):
     max_target_len, window_size, _, is_arbitrary = kw['target_params']
-    has_rab, has_drab, _ = kw['rab_params']
-    if has_rab or has_drab:
-        return 'RAB/DRAB'
     if window_size != (-1, -1) and not (window_size[0] < 0 and window_size[1] == 0):
         return f'window={window_size}'
     if window_size == (-1, -1) and max_target_len > 0 and not is_arbitrary:

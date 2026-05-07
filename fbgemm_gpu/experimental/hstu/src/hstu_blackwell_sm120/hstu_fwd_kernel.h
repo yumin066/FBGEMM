@@ -1668,7 +1668,7 @@ void run_hstu_fwd_sm120_fp8_ws_tma_impl(Hstu_fwd_params& params, cudaStream_t st
   static constexpr bool Use_paired_persistent =
       Is_causal && !Is_context && !Is_local && !Is_arbitrary &&
       (!Is_target || Paged_KV) &&
-      (kHeadDim <= 128 || Paged_KV);
+      (kHeadDim <= 128 || (Paged_KV && !Has_rab));
   static constexpr bool Use_persistent = Use_full_persistent || Use_paired_persistent;
   const int persistent_work_units = Use_paired_persistent ? total_tile_pairs : total_tiles;
   int sm_count = 0;
@@ -1793,16 +1793,35 @@ void run_hstu_fwd_sm120(Hstu_fwd_params& params, cudaStream_t stream) {
 
   if constexpr (Is_fp8_type) {
     BOOL_SWITCH(params.is_paged_kv, Paged_KV, [&] {
-      if constexpr (Paged_KV) {
-        TORCH_CHECK(!Has_rab, "SM120 FP8 paged KV initial path does not support RAB");
+      if constexpr (Paged_KV && Has_rab && kHeadDim == 128) {
+        // Non-paged FP8+RAB hdim128 uses kBlockN=128 in the cp.async
+        // fallback, but paged KV is page-size aligned and must use kBlockN=64.
+        run_hstu_fwd_sm120_fp8_ws_tma_impl<
+            elem_type, kHeadDim, 128, 64, 8,
+            Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc, Has_rab,
+            Paged_KV, true, true>(params, stream);
+      } else if constexpr (Paged_KV) {
         TORCH_CHECK(kHeadDim % 128 == 0 && kBlockN == 64,
             "SM120 FP8 paged KV path requires headDim divisible by 128 and kBlockN=64");
-      }
-      if constexpr (!Has_rab) {
         if constexpr ((kHeadDim % 128 == 0 && kBlockN == 64) || (kBlockN % 128) == 0) {
           // WS TMA kernel: non-paged K/V use contiguous TMA; paged history K/V
-          // uses page-cache TMA indexed by runtime page_id. Paged target tail
-          // remains a guarded load-warp copy.
+          // uses page-cache TMA indexed by runtime page_id. Paged Has_rab also
+          // stays on WS; RAB/DRAB is added directly in the math fragment.
+          run_hstu_fwd_sm120_fp8_ws_tma_impl<
+              elem_type, kHeadDim, kBlockM, kBlockN, kNWarps,
+              Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc, Has_rab,
+              Paged_KV, Is_Q_in_regs, Share_Q_K_smem>(params, stream);
+        } else {
+          TORCH_CHECK(
+              false,
+              "SM120 FP8 WS blockscaled path currently requires headDim divisible by 128 with kBlockN64 or kBlockN divisible by 128, got headDim=",
+              kHeadDim, ", kBlockN=", kBlockN);
+        }
+      } else if constexpr (!Has_rab) {
+        if constexpr ((kHeadDim % 128 == 0 && kBlockN == 64) || (kBlockN % 128) == 0) {
+          // WS TMA kernel: non-paged K/V use contiguous TMA; paged history K/V
+          // uses page-cache TMA indexed by runtime page_id. Paged Has_rab also
+          // stays on WS; RAB/DRAB is added directly in the math fragment.
           run_hstu_fwd_sm120_fp8_ws_tma_impl<
               elem_type, kHeadDim, kBlockM, kBlockN, kNWarps,
               Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc, Has_rab,
@@ -1815,7 +1834,7 @@ void run_hstu_fwd_sm120(Hstu_fwd_params& params, cudaStream_t stream) {
         }
       } else {
         if constexpr ((kBlockN % 64) == 0) {
-          // cp.async fallback for Has_rab=true (WS kernel does not support RAB).
+          // cp.async fallback for non-paged Has_rab=true.
           using Kernel_traits = Hstu_fwd_kernel_traits_sm120_fp8<
               kHeadDim, kBlockM, kBlockN, kNWarps,
               Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc, Has_rab,

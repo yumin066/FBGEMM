@@ -391,16 +391,19 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
             elif quant_mode == 2:
                 # Blockwise FP8 quantization
                 dim = q.shape[-1]
-                bm, bn = get_bm_and_bn_block_size_fwd(rab, dim)
                 is_paged_kv = (
                     kv_cache is not None
                     and page_offsets is not None
                     and page_ids is not None
                     and last_page_lens is not None
                 )
+                bm, bn = get_bm_and_bn_block_size_fwd(rab, dim)
                 if is_paged_kv:
-                    if rab is not None:
-                        raise ValueError("SM120 FP8 paged KV initial path does not support RAB")
+                    # Paged SM120 FP8 K/V tiles are page-size aligned.  RAB
+                    # normally selects BN=128 for hdim128 non-paged fallback,
+                    # but paged WS must keep BN equal to page_size=64.
+                    bm, bn = 128, kv_cache.shape[2]
+                if is_paged_kv:
                     if dim % 128 != 0 or bn != 64:
                         raise ValueError("SM120 FP8 paged KV path requires headDim divisible by 128 and kBlockN=64")
                     if kv_cache.shape[2] != bn:

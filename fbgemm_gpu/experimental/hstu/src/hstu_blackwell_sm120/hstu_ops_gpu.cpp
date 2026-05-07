@@ -425,7 +425,6 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_120(
 
   if (is_paged_kv) {
     TORCH_CHECK(quant_mode == 2, "SM120 paged KV initial path requires quant_mode=2");
-    TORCH_CHECK(!has_rab, "SM120 FP8 paged KV initial path does not support RAB");
     TORCH_CHECK(head_size == 128 || head_size == 256,
         "SM120 FP8 paged KV path requires head_size=128 or 256");
     const bool is_full_paged_kv =
