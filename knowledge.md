@@ -1,6 +1,6 @@
 # HSTU 架构实现对比：Blackwell (SM120) vs Hopper (SM90) vs Ampere (SM80)
 
-> 更新日期：2026-05-06
+> 更新日期：2026-05-07
 
 ---
 
@@ -16,9 +16,19 @@
 - full paged KV 不需要新 device load path：host 端允许 `num_targets=None` 且 `window_size=(-1,-1)`，device 端 `Is_target=false` 时 `actual_seqlen_h=actual_seqlen_k`，所有 K/V tile 都落在 paged history 分支并复用 page-cache TMA。全量 benchmark `182` 中，full paged 相对 non-paged FP8 全部 36 个 full case 平均 `-3.0%`，`seq>=1024` 平均 `-0.1%`，`seq>=4096` 平均 `+1.5%`；causal paged 仍平均约 `-8.2%`。
 - paged KV 的公平 correctness 口径必须和 non-paged 一样，比较 kernel 输出与 dequantized FP8/e8m0 reference。原先 paged reference 用 raw fp16 cache，会把量化误差算进 kernel 误差。改成公平口径后，`449/450` 日志显示 paged causal/full/edge cases 的 cosine 回到 `0.9996+`。
 - 如果要证明 paged 和 non-paged 逻辑等价，需要同一份 raw Q/K/V，同时让 V block-scale 粒度一致。`451_phase24_paged_same_input_sweep.log` 使用同一批随机 Q/K/V 构造 contiguous K/V 和 paged cache，并统一 `block_size=64`；full/causal、H=1/4、SEQ=128/256/512 均为 `max_err=0`，说明 aligned case 下两条路径输出 bitwise 一致。
-- `run_hstu8_examples.sh` 现在把原 14 个 HSTU8 non-paged example 逐个生成 paged mirror。Phase 28 后 D=128/D=256 的 RAB/DRAB extra cases 也逐个生成 paged mirror，覆盖 full、causal、context+causal、target+causal、local、arbitrary；local paged 不再是 `PASS-UNSUPPORTED`。最新 examples 日志 `591` 为 `142/142 passed`；`sweep_accuracy.py` 的 `paged_f_*` 列覆盖每个 non-paged full sweep 行，日志 `591` 通过。
-- 当前 Python `quant_mode=2` wrapper 对 full paged 仍继承 V block-scale 的 N 对齐限制：例如 `seq=160` 会在量化阶段报 `quant_mode=2 requires N divisible by 128`，不会进入 SM120 kernel。causal/target paged 的 partial last page 仍已有 examples 覆盖。
+- `run_hstu8_examples.sh` 现在把原 14 个 HSTU8 non-paged example 逐个生成 paged mirror。Phase 28 后 D=128/D=256 的 RAB/DRAB extra cases 也逐个生成 paged mirror，覆盖 full、causal、context+causal、target+causal、local、arbitrary；local paged 不再是 `PASS-UNSUPPORTED`。Phase 29 后 partial-last-page/target tail 按 K physical offset 通过。最新 examples 日志 `592` 为 `142/142 passed`；`sweep_accuracy.py` 的 `paged_f_*` 列覆盖每个 non-paged full sweep 行，日志 `592` 通过。
+- Phase 29 后 Python `quant_mode=2` wrapper 已不再用 N 对齐限制直接拒绝 irregular varlen；full/causal/target paged 的 irregular tail 由 wrapper padding 和 K physical offset 处理。
 - paged causal TMA SASS 含 `UTMALDG.4D`，当前 SF TMA 版资源为 `REG:168 STACK:0 LOCAL:0`，无 `LDL/STL` 命中；`UTMALDG` 计数为 `10`。后续若要小 seq 也不回退，应拆 cp.async-paged 和 TMA-paged 为两个 dispatch specialization，避免短序列也携带 page TMA descriptor 固定开销。
+
+## Phase 29 FP8 irregular seqlen + hstu_test.py coverage 结论
+
+- SM120 FP8 `quant_mode=2` wrapper 现在采用 actual/padded seqlen 口径处理 irregular varlen：Q/SFA 按 `kBlockM=128` padding，non-paged K/V/SFB/SFV 按实际 `kBlockN` padding，arbitrary `func` 按 padded Q offset 重排，kernel 输出再按 actual Q length unpad 回 compact layout。aligned case 继续保留原 fast path。
+- block-scale quantizer 不应再用 `actual_len % block_size == 0` 作为 SM120 FP8 入口 guard。padding 应发生在量化前，padded token 填 0，scale metadata 按 padded physical layout 生成。
+- paged KV target tail 不能用 Q offset 推导 K/V/SF physical start。actual K 可能包含 page cache 中已有 previous history，而 contiguous K/V 只包含 new history + target；wrapper 必须在 K/V physical layout 中插入 `page_size - last_page_lens` gap，使 target tail 从 `kBlockN` 边界开始，kernel target load 使用 `sum_s_k + actual_seqlen_k - actual_seqlen_t + last_page_offset + target_block*kBlockN`。
+- V block-scale 对 target tail 的 N-block 对齐很敏感。若 paged target tail 仍从 logical 99 这类非 BN 边界开始，hdim256 target 会在同一 tile 中混用两段 V scale，曾观察到 `d=256, seq=99, target+none` cosine 降到约 `0.9928`。插入 K/V physical gap 后该问题消失。
+- RAB/DRAB bias 坐标保持 logical K col。paged target block 需要对 RAB col 减去 `last_page_offset`；history block 中 page padding col 应跳过，避免把 padding token 的 bias 加入 `acc_s`。
+- `hstu_test.py::HSTU8Test::test_sm120_fp8_blockscale_matrix` 当前覆盖 D=128/D=256、seq=99/128/256、full/causal/local/context/target/arbitrary、none/RAB/DRAB、non-paged/paged，共 216 个 subcases。验证日志：fixed matrix `1test_results/592_phase29_hstu8_matrix_k_offsets.log` 通过，全文件 pytest `1test_results/592_phase29_hstu_test_full_after_k_offsets.log` 为 `3 passed, 1 skipped`。
+- 回归验证：build `1test_results/592_phase29_rebuild_paged_k_offsets.log`，examples `1test_results/592_phase29_examples_after_k_offsets.log` 为 `142/142 passed`，sweep `1test_results/592_phase29_sweep.log` 通过，全量 benchmark `2benchmark_results/592_282d811e_phase29_irregular_paged_hstu_test_full_benchmark.log` 完成。benchmark 中 BF16 hdim256+RAB/DRAB/arbitrary baseline 的 unsupported/invalid-argument 行不表示 SM120 FP8 失败。
 
 ## Phase 26 FP8 paged RAB/DRAB 实现结论
 

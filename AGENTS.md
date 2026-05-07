@@ -27,6 +27,7 @@
 
 当前工作焦点：
 
+- Phase 29：已完成 repo 自带 `hstu_test.py` 的 SM120 FP8 `quant_mode=2` irregular seqlen 和 paged KV 验收矩阵。wrapper 侧构造 block-aligned physical Q/K/V/SF/func layout，向 SM120 kernel 传 padded `cu_seqlens` 和 actual `seqused`，输出再 unpad；`(99,99)` 等非 block 对齐输入现在真实运行，不再由 alignment guard 跳过。最新日志：fixed matrix `1test_results/592_phase29_hstu8_matrix_k_offsets.log`，全文件 pytest `1test_results/592_phase29_hstu_test_full_after_k_offsets.log`。
 - Phase 28：补齐 SM120 FP8 paged KV + RAB/DRAB 覆盖。当前 D=128/D=256 的 full、pure causal、context+causal、target+causal、local、arbitrary + paged KV + RAB/DRAB 都已真实运行通过；local paged 不再是 `PASS-UNSUPPORTED`。
 - Phase 27：逐步将 SM120 FP8 non-paged RAB/DRAB 切到 WS。当前已完成 D=128/D=256 non-paged RAB/DRAB 全配置：full、pure causal、context+causal、target+causal、local、arbitrary 都走 FP8 WS TMA；D=128 RAB 已改用 `kBlockN=64`。
 - Phase 26：支持 SM120 FP8 paged KV cache 与 RAB/DRAB 配置。Phase 28 后 paged RAB/DRAB 覆盖已扩展到 complex mask/local。
@@ -57,7 +58,7 @@ FP8 paged KV Phase 24/26/28 稳定基线：
 - kernel benchmark `176` 显示 36 个 paged causal case 相比旧 benchmark `175` 平均 latency 提升约 `62%`，`seq>=1024` 平均提升约 `110%`；paged 相对 non-paged FP8 差距从约 `-58.8%` 收敛到约 `-14.2%`。
 - kernel benchmark `181` 的 paged TMA + SF TMA 版相对 `176` cp.async paged：`seq>=1024` 平均 paged TFLOPS 提升约 `+4.42%`，`seq>=4096` 提升约 `+6.27%`；paged 相对 non-paged FP8 的 `seq>=4096` 平均差距约 `-8.52%`。
 - full paged KV 已接入同一 paged TMA history 路径：correctness 日志为 `1test_results/447_phase24_paged_full_guard_sweep.log` 和 `448_phase24_paged_full_guard_examples.log`，后者为 `31/31 passed`。公平误差对比应使用 dequantized FP8/e8m0 reference；`1test_results/449_phase24_paged_fair_ref_sweep.log` 显示 paged causal/full `cos=0.9996~0.9997`，`450_phase24_paged_fair_ref_edges.log` 显示 partial page/target/full edge `cos>=0.99962`。same-input 对照 `451_phase24_paged_same_input_sweep.log` 用同一份 raw Q/K/V 和同一 FP8 block scale 构造 non-paged 与 paged，full/causal 的 `max_err=0`。benchmark `182` 显示 full paged 相对 non-paged FP8：全部 36 个 full case 平均 `-3.0%`，`seq>=1024` 平均 `-0.1%`，`seq>=4096` 平均 `+1.5%`；causal paged 仍平均约 `-8.2%`。
-- `run_hstu8_examples.sh` 已把原 14 个 non-paged example 逐个镜像到 paged KV，并覆盖 D=128/D=256。Phase 27 后额外覆盖 D=128/D=256 non-paged full/local/context/target/arbitrary + RAB/DRAB；Phase 28 后这些 RAB/DRAB extra cases 也逐个镜像到 paged KV。最新日志 `1test_results/591_phase28_paged_rab_complex_examples.log` 为 `142/142 passed`；`sweep_accuracy.py` 最新日志 `1test_results/591_phase28_paged_rab_complex_sweep.log` 通过。
+- `run_hstu8_examples.sh` 已把原 14 个 non-paged example 逐个镜像到 paged KV，并覆盖 D=128/D=256。Phase 27 后额外覆盖 D=128/D=256 non-paged full/local/context/target/arbitrary + RAB/DRAB；Phase 28 后这些 RAB/DRAB extra cases 也逐个镜像到 paged KV。Phase 29 后 partial-last-page/target tail 也按 K physical offset 通过。最新日志 `1test_results/592_phase29_examples_after_k_offsets.log` 为 `142/142 passed`；`sweep_accuracy.py` 最新日志 `1test_results/592_phase29_sweep.log` 通过。
 - paged causal TMA SASS：`4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_paged_causal_tma_sf_tma.sass` 含 `UTMALDG.4D`，资源为 `REG:168 STACK:0 LOCAL:0`，无 `LDL/STL` 命中；`UTMALDG` 计数为 `10`，包含 paged K/V 和 SFB/SFV TMA。
 - 剩余差距主要来自 page-id/descriptor 额外控制流、paged target tail guarded copy，以及小 seq 下 page TMA descriptor 固定开销。
 
@@ -81,6 +82,16 @@ FP8 paged RAB/DRAB Phase 26/28 当前状态：
 - Scheduler 口径：paged full RAB/DRAB 走 full persistent；D=128 paged pure causal/target+causal RAB/DRAB 走 paired persistent；D=256 paged RAB/DRAB 以及 context/local/arbitrary 走 3D grid。
 - host guard 当前允许 no-target paged full/local/arbitrary/context window；带 `num_targets` 的 paged KV 仍要求 `window_size_left < 0 && window_size_right == 0`，即 target/local-window 组合仍不属于当前支持范围。
 - SASS：`I128_paged_causal_rab` 为 `REG:168 STACK:0 LOCAL:0`，无 `LDL/STL`；`I256_paged_causal_rab` 为 `REG:168 STACK:8 LOCAL:0`，有 1 个 `STL` 和 1 个 `LDL`。尝试将 hdim256 RAB-add loop 改为 `#pragma unroll 1` 会恶化到 `STACK:128`，不保留。
+
+FP8 irregular seqlen Phase 29 当前状态：
+
+- SM120 FP8 block-scale 主路径仍是 `quant_mode=2`、headDim128/headDim256、forward。Phase 29 已补齐 `hstu_test.py` 中的 irregular length fixed matrix，当前显式覆盖 `seq=99/128/256`。
+- 实现口径采用 Hopper-style actual/padded seqlen：Python wrapper 对 SM120 FP8 `quant_mode=2` 在需要时 padding physical Q/K/V、scale factor table 和 arbitrary `func`；传给 kernel 的 `cu_seqlens_q/k` 是 padded offset，`seqused_q/k` 是 actual total length。aligned case 继续走原 fast path。
+- Q/SFA padding 对齐 `kBlockM=128`；non-paged K/V/SFB/SFV padding 对齐实际 `kBlockN`，当前 FP8 hdim128/256 RAB 主路径为 64。输出从 SM120 kernel 返回后按 actual `seqused_q` unpad 回原 API 期望的 compact `[total_q, H, D]`。
+- paged KV target tail 不能用 Q offset 推导 K/V physical start。actual K 可能包含已经在 page cache 中的 previous history，而 contiguous K/V 只包含 new history + target；wrapper 必须在 K/V physical layout 中插入 last-page gap，让 target tail 从 `kBlockN` 边界开始，kernel target load 使用 `sum_s_k + actual_seqlen_k - actual_seqlen_t + last_page_offset + target_block*kBlockN`。
+- RAB/DRAB 坐标仍按 logical K col 取 bias；paged target block 需要减去 `last_page_offset`，history page padding col 需要跳过。
+- `hstu_test.py::HSTU8Test::test_sm120_fp8_blockscale_matrix` 覆盖 D=128/D=256、seq=99/128/256、full/causal/local/context/target/arbitrary、none/RAB/DRAB、non-paged/paged，共 216 个 subcases。最新日志 `1test_results/592_phase29_hstu8_matrix_k_offsets.log` 为 `1 passed`。
+- 最新全文件 pytest 日志 `1test_results/592_phase29_hstu_test_full_after_k_offsets.log` 为 `3 passed, 1 skipped`。`run_hstu8_examples.sh` 最新日志 `1test_results/592_phase29_examples_after_k_offsets.log` 为 `142/142 passed`；`sweep_accuracy.py` 最新日志 `1test_results/592_phase29_sweep.log` 通过；全量 benchmark 日志为 `2benchmark_results/592_282d811e_phase29_irregular_paged_hstu_test_full_benchmark.log`。benchmark 中 BF16 hdim256+RAB/DRAB/arbitrary baseline 可出现 unsupported/invalid-argument 行，不作为 SM120 FP8 correctness 失败。
 
 FP8 non-paged RAB/DRAB Phase 27 当前状态：
 
@@ -157,7 +168,15 @@ HSTU_SWEEP_FP8_QUANT_MODE=2 python /home/scratch.minyu_gpu/project/shopee/fbgemm
 
 判定标准：各配置 `fp8_gt_cos >= 0.995`，当前优良基线通常 `>= 0.9996`；BF16 路径应关注 `bf16_gt_cos` 和 `bf16_gt_max`，不要只看 `bf16_fp8_cos`。
 
-BF16 正确性应优先使用 `hstu_test.py` 的 `HSTU16Test`，不要用 `run_hstu8_examples.sh` 作为 BF16 结论。当前常用构建关闭了 hdim32/64/256，因此 BF16 定向测试应先选 `attn_hidden_dims=(128, 128)`：
+所有 HSTU CUDA/CuTe 正确性验证都必须包含 repo 自带 pytest：
+
+```bash
+PYTHONPATH=/home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/fbgemm_gpu/experimental/hstu python -m pytest -q /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/fbgemm_gpu/experimental/hstu/test/hstu_test.py 2>&1 | tee /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/1test_results/NNN_hstu_test.log
+```
+
+当前 SM120 口径下 `HSTUPagedKVTest` 是 BF16 paged KV 测试，class decorator 会跳过；FP8 paged KV correctness 已纳入 `HSTU8Test::test_sm120_fp8_blockscale_matrix`，并继续由 `run_hstu8_examples.sh`、`sweep_accuracy.py` 和 paged same-input/edge case 覆盖。最新全文件 pytest 日志为 `1test_results/592_phase29_hstu_test_full_after_k_offsets.log`，结果 `3 passed, 1 skipped`。固定 SM120 FP8 `quant_mode=2` matrix 覆盖 `D=128/256 × seq=99/128/256 × full/causal/local/context/target/arbitrary × none/rab/drab × non-paged/paged`，审计日志见 `1test_results/592_phase29_hstu8_matrix_k_offsets.log`。
+
+BF16 正确性应优先使用 `hstu_test.py` 的 `HSTU16Test`，不要用 `run_hstu8_examples.sh` 作为 BF16 结论。当前常用构建关闭了 hdim32/64，BF16 hdim256 只作为 full/causal 基线，不应把 hdim256+RAB 或 arbitrary 当作 HSTU16 默认支持面：
 
 ```bash
 PYTHONPATH=/home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/fbgemm_gpu/experimental/hstu python /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/fbgemm_gpu/experimental/hstu/test/hstu_test.py 2>&1 | tee /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/1test_results/NNN_bf16_hstu16_single.log
@@ -177,13 +196,15 @@ example cases：
 bash /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/run_hstu8_examples.sh
 ```
 
-该脚本覆盖原 14 个 HSTU8/FP8 block-scale non-paged 示例，并追加 paged KV mirror/full/edge。Phase 25 后同一套语义同时覆盖 D=128 和 D=256；Phase 27 后额外覆盖 D=128/D=256 non-paged full/local/context/target/arbitrary + RAB/DRAB；Phase 28 后这些 RAB/DRAB extra cases 也逐个镜像到 paged KV，local paged 应真实运行通过，不再标为 `PASS-UNSUPPORTED`。当前判定标准为全脚本通过，最新日志 `1test_results/591_phase28_paged_rab_complex_examples.log` 为 `142/142 passed`。该脚本不替代 BF16 的 `HSTU16Test`。
+该脚本覆盖原 14 个 HSTU8/FP8 block-scale non-paged 示例，并追加 paged KV mirror/full/edge。Phase 25 后同一套语义同时覆盖 D=128 和 D=256；Phase 27 后额外覆盖 D=128/D=256 non-paged full/local/context/target/arbitrary + RAB/DRAB；Phase 28 后这些 RAB/DRAB extra cases 也逐个镜像到 paged KV，local paged 应真实运行通过，不再标为 `PASS-UNSUPPORTED`。当前判定标准为全脚本通过，最新日志 `1test_results/592_phase29_examples_after_k_offsets.log` 为 `142/142 passed`。该脚本不替代 BF16 的 `HSTU16Test`。
 
 benchmark：
 
 ```bash
 PYTHONUSERBASE=/home/scratch.minyu_gpu/project/.cache/pip-user python /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/fbgemm_gpu/experimental/hstu/benchmark/bench_hstu_attn_sm120.py 2>&1 | tee /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/2benchmark_results/NNN_xxx.log
 ```
+
+`bench_hstu_attn_sm120.py` 默认覆盖 `full/causal/local/context/target/arbitrary` × `none/rab/drab`，并对每个逻辑 case 输出 BF16、non-paged FP8、paged FP8 三列。可用 `--mask-configs`、`--bias-configs` 和 `--columns bf16 fp8 paged` 做子集筛选；旧 `--full-only` / `--causal-only` 仍保留为 alias。BF16、FP8、paged 三列独立计时，BF16 unsupported 不应阻塞 FP8/paged 结果。TFLOPS 按实际 valid attention pairs 计算，不再按 full 矩阵统一估算。
 
 profile：
 

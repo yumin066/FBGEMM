@@ -45,6 +45,179 @@ def _debug_tensor_sample(name: str, t: Optional[torch.Tensor], max_elems: int = 
         f"sample={sample_list}"
     )
 
+
+def _round_up_to_multiple(x: int, multiple: int) -> int:
+    return ((x + multiple - 1) // multiple) * multiple
+
+
+def _int_list(t: torch.Tensor) -> list[int]:
+    return [int(x) for x in t.detach().cpu().tolist()]
+
+
+def _actual_varlen_lengths(
+    cu_seqlens: torch.Tensor,
+    seqused: Optional[torch.Tensor],
+) -> list[int]:
+    if seqused is not None:
+        return _int_list(seqused)
+    cu = _int_list(cu_seqlens)
+    return [cu[i + 1] - cu[i] for i in range(len(cu) - 1)]
+
+
+def _pad_varlen_tensor_to_block(
+    x: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    seqused: Optional[torch.Tensor],
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    """Build a block-aligned physical varlen tensor and actual-length seqused."""
+    actual_lengths = _actual_varlen_lengths(cu_seqlens, seqused)
+    old_cu = _int_list(cu_seqlens)
+    padded_lengths = [_round_up_to_multiple(length, block_size) for length in actual_lengths]
+    changed = any((old_cu[i + 1] - old_cu[i]) != padded_lengths[i] for i in range(len(actual_lengths)))
+
+    actual_tensor = torch.tensor(actual_lengths, dtype=torch.int32, device=cu_seqlens.device)
+    if not changed:
+        return x, cu_seqlens, actual_tensor if seqused is not None else seqused, False
+
+    new_cu_host = [0]
+    for length in padded_lengths:
+        new_cu_host.append(new_cu_host[-1] + length)
+    new_cu = torch.tensor(new_cu_host, dtype=torch.int32, device=cu_seqlens.device)
+    out = torch.zeros(
+        (new_cu_host[-1], *x.shape[1:]),
+        dtype=x.dtype,
+        device=x.device,
+    )
+    for i, actual in enumerate(actual_lengths):
+        if actual == 0:
+            continue
+        out[new_cu_host[i] : new_cu_host[i] + actual] = x[
+            old_cu[i] : old_cu[i] + actual
+        ]
+    return out.contiguous(), new_cu, actual_tensor, True
+
+
+def _pad_arbitrary_func_to_q_layout(
+    func: Optional[torch.Tensor],
+    old_cu_q: torch.Tensor,
+    new_cu_q: torch.Tensor,
+    actual_q: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    if func is None or actual_q is None:
+        return func
+    old_cu = _int_list(old_cu_q)
+    new_cu = _int_list(new_cu_q)
+    actual = _int_list(actual_q)
+    if old_cu == new_cu:
+        return func
+
+    tail = max(0, int(func.size(-1)) - old_cu[-1])
+    padded = torch.zeros(
+        (*func.shape[:-1], new_cu[-1] + tail),
+        dtype=func.dtype,
+        device=func.device,
+    )
+    for i, length in enumerate(actual):
+        if length == 0:
+            continue
+        padded[..., new_cu[i] : new_cu[i] + length] = func[
+            ..., old_cu[i] : old_cu[i] + length
+        ]
+    return padded.contiguous()
+
+
+def _unpad_varlen_tensor_from_block(
+    x: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    actual_lengths: torch.Tensor,
+) -> torch.Tensor:
+    cu = _int_list(cu_seqlens_padded)
+    actual = _int_list(actual_lengths)
+    pieces = [
+        x[cu[i] : cu[i] + actual[i]]
+        for i in range(len(actual))
+        if actual[i] > 0
+    ]
+    if not pieces:
+        return x[:0]
+    return torch.cat(pieces, dim=0).contiguous()
+
+
+def _pad_paged_kv_tail_to_page_layout(
+    x: torch.Tensor,
+    cu_seqlens_q_original: torch.Tensor,
+    cu_seqlens_k_original: torch.Tensor,
+    actual_q_lengths: Optional[torch.Tensor],
+    seqused_k: Optional[torch.Tensor],
+    num_targets: Optional[torch.Tensor],
+    last_page_lens: Optional[torch.Tensor],
+    page_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    old_offsets = _int_list(cu_seqlens_q_original)
+    actual_q = (
+        _int_list(actual_q_lengths)
+        if actual_q_lengths is not None
+        else [old_offsets[i + 1] - old_offsets[i] for i in range(len(old_offsets) - 1)]
+    )
+    actual_k = _actual_varlen_lengths(cu_seqlens_k_original, seqused_k)
+    targets = (
+        _int_list(num_targets)
+        if num_targets is not None
+        else [0 for _ in actual_k]
+    )
+    last_pages = (
+        _int_list(last_page_lens)
+        if last_page_lens is not None
+        else [page_size for _ in actual_k]
+    )
+
+    new_offsets = [0]
+    for b, actual_k_len in enumerate(actual_k):
+        target_len = targets[b]
+        actual_q_len = actual_q[b]
+        if target_len > actual_q_len or target_len > actual_k_len:
+            raise ValueError(
+                f"num_targets[{b}]={target_len} exceeds q/k lengths "
+                f"{actual_q_len}/{actual_k_len}")
+        cache_len = actual_k_len - target_len
+        if target_len > 0:
+            last_page = last_pages[b]
+            if not (1 <= last_page <= page_size):
+                raise ValueError(f"invalid last_page_lens[{b}]={last_page}")
+            physical_len = cache_len + (page_size - last_page) + target_len
+        else:
+            physical_len = max(actual_q_len, actual_k_len)
+        new_offsets.append(new_offsets[-1] + _round_up_to_multiple(physical_len, page_size))
+
+    new_cu = torch.tensor(new_offsets, dtype=torch.int32, device=cu_seqlens_q_original.device)
+    actual_k_tensor = torch.tensor(actual_k, dtype=torch.int32, device=cu_seqlens_q_original.device)
+    out = x.new_zeros((new_offsets[-1], *x.shape[1:]))
+
+    for b, actual_q_len in enumerate(actual_q):
+        old_start = old_offsets[b]
+        new_start = new_offsets[b]
+        target_len = targets[b]
+        new_history_len = actual_q_len - target_len
+        if new_history_len > 0:
+            out[new_start : new_start + new_history_len] = x[
+                old_start : old_start + new_history_len
+            ]
+
+        if target_len > 0:
+            last_page = last_pages[b]
+            cache_len = actual_k[b] - target_len
+            target_start = new_start + cache_len + (page_size - last_page)
+            target_end = target_start + target_len
+            if target_end > new_offsets[b + 1]:
+                raise ValueError(
+                    "paged target tail does not fit in padded physical K/V layout")
+            src_start = old_start + new_history_len
+            out[target_start:target_end] = x[src_start : src_start + target_len]
+
+    return out.contiguous(), new_cu, actual_k_tensor
+
+
 def quantize_for_two_directions(x, seq_offsets, fp8_type=torch.float8_e4m3fn):
     B = seq_offsets.size(0) - 1
     fp8_max = 448.0 if fp8_type == torch.float8_e4m3fn else 57344.0
@@ -116,12 +289,6 @@ def quantize_for_block_scale_qk_along_d(x, seq_offsets, fp8_type=torch.float8_e4
             end = int(seq_offsets[i + 1].item())
             actual_len = end - start
 
-            # User-requested constraint for current debug path.
-            if actual_len % 128 != 0:
-                raise ValueError(
-                    f"AssertError: quant_mode=2 requires N divisible by 128, got N={actual_len} in batch {i}"
-                )
-
             cur = x[start:end].view(actual_len, head, d_chunks, 128)
             cur_scale = torch.amax(cur.abs(), dim=3, keepdim=False).to(torch.float32) / fp8_max
             cur_scale = _round_descale_to_e8m0(cur_scale)
@@ -156,10 +323,6 @@ def quantize_for_block_scale_v_along_n(x, seq_offsets, block_size=128, fp8_type=
     with torch.no_grad():
         for i in range(B):
             actual_len = seq_offsets[i + 1] - seq_offsets[i]
-            if int(actual_len.item()) % block_size != 0:
-                raise ValueError(
-                    f"AssertError: quant_mode=2 requires N divisible by block_size={block_size}, got N={int(actual_len.item())} in batch {i}"
-                )
             cur_bs_tensor = x[seq_offsets[i]:(seq_offsets[i] + actual_len)]
             actual_len_padding_block_num = (actual_len + block_size - 1) // block_size
             cu_seqlens_x_descale[i + 1] = cu_seqlens_x_descale[i] + actual_len_padding_block_num
@@ -376,6 +539,7 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
             cu_seqlens_q_block_descale = None
             cu_seqlens_kv_block_descale = None
             cu_seqlens_v_block_descale = None
+            sm120_fp8_unpad_q: Optional[tuple[torch.Tensor, torch.Tensor]] = None
             if quant_mode == 0:
                 # Per-tensor FP8 quantization
                 fp8_max = 448.0
@@ -409,7 +573,41 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
                     if kv_cache.shape[2] != bn:
                         raise ValueError(f"SM120 FP8 paged KV requires page_size={bn}")
                 q_raw, k_raw, v_raw = q, k, v
-                kv_quant_offsets = cu_seqlens_q if is_paged_kv else cu_seqlens_k
+
+                original_cu_seqlens_q = cu_seqlens_q
+                q, cu_seqlens_q, seqused_q_actual, q_was_padded = _pad_varlen_tensor_to_block(
+                    q, cu_seqlens_q, seqused_q, bm)
+                if q_was_padded:
+                    func = _pad_arbitrary_func_to_q_layout(
+                        func, original_cu_seqlens_q, cu_seqlens_q, seqused_q_actual)
+                    seqused_q = seqused_q_actual
+                    sm120_fp8_unpad_q = (cu_seqlens_q, seqused_q_actual)
+
+                if is_paged_kv:
+                    # Paged history lives in page-aligned kv_cache.  The contiguous
+                    # K/V tensors carry the new-history/target tail.  When target
+                    # rows follow a partial last page, keep the same page padding
+                    # in the physical K/V layout so every target tile starts on a
+                    # kBlockN boundary and V block scales stay tile-aligned.
+                    original_cu_seqlens_k = cu_seqlens_k
+                    k, cu_seqlens_k, seqused_k_actual = _pad_paged_kv_tail_to_page_layout(
+                        k, original_cu_seqlens_q, original_cu_seqlens_k,
+                        seqused_q_actual, seqused_k, num_targets, last_page_lens, bn)
+                    v, _, _ = _pad_paged_kv_tail_to_page_layout(
+                        v, original_cu_seqlens_q, original_cu_seqlens_k,
+                        seqused_q_actual, seqused_k, num_targets, last_page_lens, bn)
+                    seqused_k = seqused_k_actual
+                    kv_quant_offsets = cu_seqlens_k
+                else:
+                    original_cu_seqlens_k = cu_seqlens_k
+                    k, cu_seqlens_k, seqused_k_actual, k_was_padded = _pad_varlen_tensor_to_block(
+                        k, cu_seqlens_k, seqused_k, bn)
+                    v, _, _, _ = _pad_varlen_tensor_to_block(
+                        v, original_cu_seqlens_k, seqused_k, bn)
+                    if k_was_padded:
+                        seqused_k = seqused_k_actual
+                    kv_quant_offsets = cu_seqlens_k
+
                 q, q_descale, cu_seqlens_q_block_descale = quantize_for_block_scale_qk_along_d(
                     q, cu_seqlens_q, fp8_type=torch.float8_e4m3fn)
                 k, k_descale, cu_seqlens_kv_block_descale = quantize_for_block_scale_qk_along_d(
@@ -483,6 +681,8 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
                 page_ids,
                 last_page_lens,
             )
+            if sm120_fp8_unpad_q is not None:
+                out = _unpad_varlen_tensor_from_block(out, sm120_fp8_unpad_q[0], sm120_fp8_unpad_q[1])
         elif major_version == 8:
             out, rab_padded = torch.ops.fbgemm.hstu_varlen_fwd_80(
                 q,

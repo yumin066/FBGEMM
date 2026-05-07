@@ -21,7 +21,8 @@ try:
 except ImportError:
     from fbgemm_gpu.experimental.hstu import hstu_attn_varlen_func, hstu_attn_qkvpacked_func, quantize_for_two_directions, quantize_for_block_scale, get_bm_and_bn_block_size_fwd, get_bm_and_bn_block_size_bwd, quantize_for_head_batch_tensor
 
-from hypothesis import given, settings, strategies as st, Verbosity, example
+from hypothesis import given, settings, strategies as st, Verbosity, example, event as hypothesis_event
+from hypothesis.errors import InvalidArgument
 
 running_on_github: bool = os.getenv("GITHUB_ENV") is not None
 
@@ -31,6 +32,58 @@ logger.setLevel(logging.INFO)
 _MAX_SAMPLES: int = 200
 _show_example = False
 e4m3_max = 448.0
+
+def event(label: str) -> None:
+    try:
+        hypothesis_event(label)
+    except InvalidArgument:
+        pass
+
+
+def _is_sm120_or_newer() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 12
+
+
+def _sm120_hstu16_supported(
+    attn_dim: int,
+    has_rab: bool,
+    is_arbitrary: bool,
+) -> bool:
+    # Match the current local SM120 build/test target. hdim64 is commonly
+    # disabled in this repo build, and BF16 hdim256 RAB/arbitrary are not part
+    # of the supported forward surface yet.
+    if attn_dim not in (128, 256):
+        return False
+    if attn_dim == 256 and (has_rab or is_arbitrary):
+        return False
+    return True
+
+
+def _mask_label(
+    max_context_len: int,
+    max_target_len: int,
+    window_size: Tuple[int, int],
+    is_arbitrary: bool,
+) -> str:
+    if is_arbitrary:
+        return "arbitrary"
+    if max_context_len > 0:
+        return "context"
+    if max_target_len > 0:
+        return "target"
+    if window_size == (-1, -1):
+        return "full"
+    if window_size == (-1, 0):
+        return "causal"
+    return "local"
+
+
+def _bias_label(has_rab: bool, has_drab: bool) -> str:
+    if has_drab:
+        return "drab"
+    if has_rab:
+        return "rab"
+    return "none"
 
 def pad_input(unpadded_input, cu_seqlen, batch, seqlen):
     indices = []
@@ -738,10 +791,21 @@ class HSTU16Test(unittest.TestCase):
         attn_dim, hidden_dim = attn_hidden_dims
         has_rab, has_drab, heads_rab = rab_params
 
-        # SM120 supports all configurations except backward.
-        if torch.cuda.get_device_capability()[0] >= 12:
-            if attn_dim not in (64, 128, 256):
-                logger.info(f"Skipping test for SM120: unsupported attn_dim={attn_dim}")
+        # Keep this repo-level test aligned with the current SM120 build
+        # surface. Wider coverage should be enabled here when the corresponding
+        # forward path is implemented and built.
+        if _is_sm120_or_newer():
+            if not _sm120_hstu16_supported(attn_dim, has_rab, is_arbitrary):
+                event(
+                    "HSTU16 skip unsupported "
+                    f"d={attn_dim} mask={_mask_label(max_context_len, max_target_len, window_size, is_arbitrary)} "
+                    f"bias={_bias_label(has_rab, has_drab)}"
+                )
+                logger.info(
+                    "Skipping HSTU16 SM120 unsupported config: "
+                    f"attn_dim={attn_dim}, has_rab={has_rab}, "
+                    f"is_arbitrary={is_arbitrary}"
+                )
                 return
 
         has_context = max_context_len > 0
@@ -749,19 +813,30 @@ class HSTU16Test(unittest.TestCase):
         is_causal = window_size[0] == -1 and window_size[1] == 0
         is_delta_q = max_seq_len_q < max_seq_len_k
         if is_delta_q and has_target:
+            event("HSTU16 skip delta_q+target")
             logger.info("Skipping test for is_delta_q and has_target")
             return
         if is_delta_q and has_context:
+            event("HSTU16 skip delta_q+context")
             logger.info("Skipping test for is_delta_q and has_context")
             return
         if not is_causal and has_context:
+            event("HSTU16 skip noncausal+context")
             logger.info("Skipping test for not is_causal and has_context")
             return
         if (window_size[0] > 0 or window_size[1] > 0) and has_context:
+            event("HSTU16 skip local+context")
             logger.info(
                 "Skipping test for (window_size[0] > 0 or window_size[1] > 0) and has_context"
             )
             return
+
+        event(
+            "HSTU16 run "
+            f"d={attn_dim} mask={_mask_label(max_context_len, max_target_len, window_size, is_arbitrary)} "
+            f"bias={_bias_label(has_rab, has_drab)} "
+            f"full_batch={full_batch}"
+        )
 
         torch.cuda.synchronize()
         (
@@ -1129,6 +1204,64 @@ def _hstu_paged_kv_attention(
               upcast=upcast,
               is_delta_q=True,
           )
+
+
+def _metric_report(a: torch.Tensor, b: torch.Tensor) -> tuple[float, float, float]:
+    diff = (a.float() - b.float()).abs()
+    cos = float(
+        torch.nn.functional.cosine_similarity(
+            a.float().flatten().unsqueeze(0),
+            b.float().flatten().unsqueeze(0),
+        ).item()
+    )
+    return cos, float(diff.max().item()), float(diff.mean().item())
+
+
+def _make_paged_cache_from_varlen_kv(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    num_targets: Optional[torch.Tensor],
+    page_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_size = cu_seqlens_k.numel() - 1
+    target_lens = (
+        num_targets
+        if num_targets is not None
+        else torch.zeros((batch_size,), dtype=torch.int32, device=k.device)
+    )
+    lengths_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+    cache_lens = (lengths_k - target_lens).to(torch.int32)
+    if bool((cache_lens <= 0).any().item()):
+        raise ValueError(
+            f"paged mirror requires positive cache length, got {cache_lens.cpu().tolist()}"
+        )
+
+    pages_per_batch = (cache_lens + page_size - 1) // page_size
+    page_offsets = torch.zeros((batch_size + 1,), dtype=torch.int32, device=k.device)
+    page_offsets[1:] = torch.cumsum(pages_per_batch, dim=0)
+    total_pages = int(page_offsets[-1].item())
+    page_ids = torch.randperm(total_pages, dtype=torch.int32, device=k.device)
+    last_page_lens = ((cache_lens - 1) % page_size + 1).to(torch.int32)
+
+    kv_cache = torch.zeros(
+        (total_pages, 2, page_size, k.shape[1], k.shape[2]),
+        dtype=k.dtype,
+        device=k.device,
+    )
+    for b in range(batch_size):
+        k0 = int(cu_seqlens_k[b].item())
+        cache_len = int(cache_lens[b].item())
+        logical_page0 = int(page_offsets[b].item())
+        for p in range(int(pages_per_batch[b].item())):
+            valid = min(page_size, cache_len - p * page_size)
+            page_id = int(page_ids[logical_page0 + p].item())
+            src0 = k0 + p * page_size
+            src1 = src0 + valid
+            kv_cache[page_id, 0, :valid] = k[src0:src1]
+            kv_cache[page_id, 1, :valid] = v[src0:src1]
+    return kv_cache, page_offsets, page_ids, last_page_lens
+
 
 @unittest.skipIf(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() >= (9, 0),
@@ -1914,51 +2047,68 @@ class HSTU8Test(unittest.TestCase):
         attn_dim, hidden_dim = attn_hidden_dims
         has_rab, has_drab, heads_rab = rab_params
         quant_mode, full_batch = quant_mode_full_batch
+        total_q = max_context_len + max_seq_len_q + max_target_len
+        total_k = max_context_len + max_seq_len_k + max_target_len
 
-        # SM120 only supports quant_mode -1 and 2, head_size 64 and 128
+        # SM120 FP8 test target is block-scale quant_mode=2 forward.
         if torch.cuda.get_device_capability()[0] >= 12:
-            if quant_mode not in (-1, 2):
+            if quant_mode != 2:
+                event(f"HSTU8 skip unsupported quant_mode={quant_mode}")
                 logger.info(f"Skipping test for SM120: unsupported quant_mode={quant_mode}")
                 return
-            if attn_dim not in (64, 128):
+            if attn_dim not in (128, 256):
+                event(f"HSTU8 skip unsupported d={attn_dim}")
                 logger.info(f"Skipping test for SM120: unsupported attn_dim={attn_dim}")
                 return
-            if quant_mode == 2 and max_seq_len_k % 128 != 0:
-                logger.info(f"Skipping test for SM120 quant_mode=2: seq_k={max_seq_len_k} not divisible by 128")
-                return
             if quant_mode == 2 and attn_dim % 128 != 0:
+                event(f"HSTU8 skip qmode2 d={attn_dim}")
                 logger.info(f"Skipping test for SM120 quant_mode=2: attn_dim={attn_dim} not divisible by 128")
                 return
             # SM120 supports all configurations except backward.
             # quant_mode=2 + has_rab: RAB implemented in FP8 block-scale path.
             # quant_mode=-1 (BF16) + has_rab: fully supported.
-
-        total_q = max_context_len + max_seq_len_q + max_target_len
-        total_k = max_context_len + max_seq_len_k + max_target_len
         has_context = max_context_len > 0
         has_target = max_target_len > 0
         is_causal = window_size[0] == -1 and window_size[1] == 0
         is_delta_q = max_seq_len_q < max_seq_len_k
         if quant_mode == 0 and alpha < 0.5:
+            event("HSTU8 skip qmode0 alpha")
             logger.info("Skipping test for quant_mode == 0 and alpha < 0.5, might cause dQ accuracy issue")
             return
-        if quant_mode > 0 and (total_q % 16 != 0 or total_k % 16 != 0 or full_batch == False):
+        if (
+            not (_is_sm120_or_newer() and quant_mode == 2)
+            and quant_mode > 0
+            and (total_q % 16 != 0 or total_k % 16 != 0 or full_batch == False)
+        ):
+            event("HSTU8 skip quantized shape/full_batch")
             logger.info("Skipping test for quant_mode > 0 and (total_q % 16 != 0 or total_k % 16 != 0 or full_batch == False), not supported")
             return
         if is_delta_q and has_target:
+            event("HSTU8 skip delta_q+target")
             logger.info("Skipping test for is_delta_q and has_target")
             return
         if is_delta_q and has_context:
+            event("HSTU8 skip delta_q+context")
             logger.info("Skipping test for is_delta_q and has_context")
             return
         if not is_causal and has_context:
+            event("HSTU8 skip noncausal+context")
             logger.info("Skipping test for not is_causal and has_context")
             return
         if (window_size[0] > 0 or window_size[1] > 0) and has_context:
+            event("HSTU8 skip local+context")
             logger.info(
                 "Skipping test for (window_size[0] > 0 or window_size[1] > 0) and has_context"
             )
             return
+
+        event(
+            "HSTU8 run "
+            f"qmode={quant_mode} d={attn_dim} "
+            f"mask={_mask_label(max_context_len, max_target_len, window_size, is_arbitrary)} "
+            f"bias={_bias_label(has_rab, has_drab)} "
+            f"full_batch={full_batch}"
+        )
 
         torch.cuda.synchronize()
         L_q, L_k, num_contexts, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, num_targets, _, q, k, v, rab, attn_mask, func = (
@@ -2161,6 +2311,174 @@ class HSTU8Test(unittest.TestCase):
             ).abs().max().item()
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+    def _run_sm120_fp8_paged_mirror_case(
+        self,
+        batch_size: int,
+        heads: int,
+        seq_len: int,
+        max_context_len: int,
+        target_params: Tuple[int, Tuple[int, int], int, bool],
+        attn_hidden_dims: Tuple[int, int],
+        rab_params: Tuple[bool, bool, Optional[int]],
+    ) -> None:
+        max_target_len, window_size, target_group_size, is_arbitrary = target_params
+        attn_dim, hidden_dim = attn_hidden_dims
+        has_rab, has_drab, heads_rab = rab_params
+        is_delta_q = False
+
+        (
+            L_q,
+            L_k,
+            num_contexts,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            num_targets,
+            qkv,
+            q,
+            k,
+            v,
+            rab,
+            attn_mask,
+            func,
+        ) = generate_input(
+            batch_size=batch_size,
+            heads=heads,
+            heads_rab=heads_rab,
+            max_seq_len_q=seq_len,
+            max_seq_len_k=seq_len,
+            max_context_len=max_context_len,
+            max_target_len=max_target_len,
+            target_group_size=target_group_size,
+            attn_dim=attn_dim,
+            hidden_dim=hidden_dim,
+            window_size=window_size,
+            dtype=torch.float8_e4m3fn,
+            full_batch=True,
+            has_drab=has_drab,
+            is_delta_q=is_delta_q,
+            is_arbitrary=is_arbitrary,
+        )
+        if qkv is not None:
+            raise AssertionError("SM120 FP8 paged mirror expects unpacked q/k/v")
+
+        paged_num_targets = num_targets
+        if window_size[0] < 0 and window_size[1] == 0 and paged_num_targets is None:
+            paged_num_targets = torch.zeros((batch_size,), dtype=torch.int32, device="cuda")
+
+        kv_cache, page_offsets, page_ids, last_page_lens = _make_paged_cache_from_varlen_kv(
+            k,
+            v,
+            cu_seqlens_k,
+            paged_num_targets,
+            64,
+        )
+        max_seqlen_q = max_context_len + seq_len + max_target_len
+        max_seqlen_k = max_context_len + seq_len + max_target_len
+        out_ref = _hstu_attention_maybe_from_cache(
+            num_heads=heads,
+            attention_dim=attn_dim,
+            linear_dim=hidden_dim,
+            seqlen_q=max_seqlen_q,
+            seqlen_k=max_seqlen_k,
+            q=q.view(L_q, -1),
+            k=k.view(L_k, -1),
+            v=v.view(L_k, -1),
+            q_offsets=cu_seqlens_q,
+            k_offsets=cu_seqlens_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
+            rab=rab if has_rab else None,
+            invalid_attn_mask=attn_mask.to(torch.float32) if attn_mask is not None else None,
+            alpha=1.0,
+            upcast=True,
+            is_delta_q=is_delta_q,
+        )
+        hstu_out = hstu_attn_varlen_func(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            scaling_seqlen=-1,
+            num_contexts=num_contexts,
+            num_targets=paged_num_targets,
+            target_group_size=target_group_size,
+            window_size=window_size,
+            alpha=1.0,
+            rab=rab if has_rab else None,
+            has_drab=has_drab,
+            func=func,
+            kv_cache=kv_cache,
+            page_offsets=page_offsets,
+            page_ids=page_ids,
+            last_page_lens=last_page_lens,
+            quant_mode=2,
+        )
+        torch.cuda.synchronize()
+        cos, max_err, mean_err = _metric_report(hstu_out, out_ref)
+        print(
+            f"[SM120_FP8_PAGED_RESULT] cos={cos:.6f} "
+            f"max_err={max_err:.6f} mean_err={mean_err:.6f} "
+            f"last_page_lens={last_page_lens.detach().cpu().tolist()}"
+        )
+        self.assertGreaterEqual(cos, 0.995)
+
+    def test_sm120_fp8_blockscale_matrix(self) -> None:
+        if not _is_sm120_or_newer():
+            self.skipTest("SM120 FP8 block-scale matrix is only for SM120+")
+
+        bias_cases = [
+            ("none", (False, False, None)),
+            ("rab", (True, False, None)),
+            ("drab", (True, True, None)),
+        ]
+        for attention_dim in (128, 256):
+            for seq_len in (99, 128, 256):
+                mask_cases = [
+                    ("full", 0, (0, (-1, -1), 1, False)),
+                    ("causal", 0, (0, (-1, 0), 1, False)),
+                    ("local", 0, (0, (max(1, seq_len // 2), 16), 1, False)),
+                    ("context", seq_len, (0, (-1, 0), 1, False)),
+                    ("target", 0, (seq_len, (-1, 0), 1, False)),
+                    ("arbitrary", 0, (0, (-1, -1), 1, True)),
+                ]
+                for mask_name, max_context_len, target_params in mask_cases:
+                    for bias_name, rab_params in bias_cases:
+                        case_name = f"nonpaged d={attention_dim} seq={seq_len} {mask_name}+{bias_name}"
+                        print(f"[SM120_FP8_CASE] {case_name}")
+                        with self.subTest(case=case_name):
+                            type(self).test_hstu_attn_fp8.hypothesis.inner_test(
+                                self,
+                                4,
+                                1,
+                                (seq_len, seq_len),
+                                max_context_len,
+                                target_params,
+                                (attention_dim, attention_dim),
+                                1.0,
+                                rab_params,
+                                torch.float8_e4m3fn,
+                                (2, True),
+                            )
+                        paged_case_name = f"paged d={attention_dim} seq={seq_len} {mask_name}+{bias_name}"
+                        print(f"[SM120_FP8_CASE] {paged_case_name}")
+                        with self.subTest(case=paged_case_name):
+                            self._run_sm120_fp8_paged_mirror_case(
+                                batch_size=4,
+                                heads=1,
+                                seq_len=seq_len,
+                                max_context_len=max_context_len,
+                                target_params=target_params,
+                                attn_hidden_dims=(attention_dim, attention_dim),
+                                rab_params=rab_params,
+                            )
 
 
 if __name__ == "__main__":

@@ -14,24 +14,31 @@ Usage:
     python benchmark/bench_hstu_attn_sm120.py --mode e2e
     python benchmark/bench_hstu_attn_sm120.py --mode all
     python benchmark/bench_hstu_attn_sm120.py --seqlens 512 1024 2048 4096
+    python benchmark/bench_hstu_attn_sm120.py --mode kernel --mask-configs all --bias-configs all
+    python benchmark/bench_hstu_attn_sm120.py --mode kernel --mask-configs full causal --bias-configs none rab
+    python benchmark/bench_hstu_attn_sm120.py --mode kernel --columns fp8 paged
 """
 
 import argparse
 import sys
-from typing import List, Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, "/home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/fbgemm_gpu/experimental/hstu")
+sys.path.insert(0, "/home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/fbgemm_gpu/experimental/hstu/test")
 
 try:
     from hstu.cuda_hstu_attention import (
+        get_bm_and_bn_block_size_fwd,
         quantize_for_block_scale_qk_along_d,
         quantize_for_block_scale_v_along_n,
         quantize_paged_kv_cache_for_block_scale,
         pack_descale_to_e8m0x4_int32,
     )
+    from hstu_test import generate_input
     import hstu  # noqa: F401
 except ImportError as e:
     print(f"ERROR: Failed to import hstu: {e}", file=sys.stderr)
@@ -40,6 +47,27 @@ except ImportError as e:
 
 WARMUP = 10
 ITERS = 50
+MASK_CONFIGS = ("full", "causal", "local", "context", "target", "arbitrary")
+BIAS_CONFIGS = ("none", "rab", "drab")
+COLUMNS = ("bf16", "fp8", "paged")
+
+
+@dataclass(frozen=True)
+class BenchCase:
+    mask: str
+    bias: str = "none"
+
+    @property
+    def has_rab(self) -> bool:
+        return self.bias != "none"
+
+    @property
+    def has_drab(self) -> bool:
+        return self.bias == "drab"
+
+    @property
+    def label(self) -> str:
+        return self.mask if self.bias == "none" else f"{self.mask}+{self.bias}"
 
 
 # ---------------------------------------------------------------------------
@@ -57,37 +85,168 @@ def check_sm120() -> None:
         )
 
 
-def make_cu_seqlens(batch_size: int, seqlen: int, device="cuda") -> torch.Tensor:
-    lengths = torch.full((batch_size,), seqlen, dtype=torch.int32, device=device)
-    cu = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
-    cu[1:] = torch.cumsum(lengths, dim=0)
-    return cu
+def _case_shape(case: BenchCase, seqlen: int) -> Tuple[int, int, Tuple[int, int], bool]:
+    if case.mask == "full":
+        return 0, 0, (-1, -1), False
+    if case.mask == "causal":
+        return 0, 0, (-1, 0), False
+    if case.mask == "local":
+        return 0, 0, (seqlen // 2, 16), False
+    if case.mask == "context":
+        return seqlen, 0, (-1, 0), False
+    if case.mask == "target":
+        return 0, seqlen, (-1, 0), False
+    if case.mask == "arbitrary":
+        return 0, 0, (-1, -1), True
+    raise ValueError(f"unknown mask config: {case.mask}")
 
 
-def make_bf16_inputs(batch_size, seqlen, nheads, headdim):
-    total = batch_size * seqlen
-    q = torch.randn(total, nheads, headdim, dtype=torch.bfloat16, device="cuda")
-    k = torch.randn(total, nheads, headdim, dtype=torch.bfloat16, device="cuda")
-    v = torch.randn(total, nheads, headdim, dtype=torch.bfloat16, device="cuda")
-    cu_seqlens = make_cu_seqlens(batch_size, seqlen)
-    return q, k, v, cu_seqlens
+def build_cases(mask_configs: Sequence[str], bias_configs: Sequence[str]) -> List[BenchCase]:
+    return [BenchCase(mask, bias) for mask in mask_configs for bias in bias_configs]
 
 
-def fp8_block_n(headdim: int) -> int:
-    """No-RAB SM120 FP8 kBlockN used by the current forward dispatcher."""
-    if headdim == 64:
-        return 128
-    return 64
+def fp8_block_n(headdim: int, has_rab: bool = False) -> int:
+    """SM120 FP8 kBlockN used by the current forward dispatcher."""
+    _, bn = get_bm_and_bn_block_size_fwd(object() if has_rab else None, headdim)
+    return bn
+
+
+def bf16_unsupported_reason(headdim: int, case: BenchCase) -> str:
+    """Return why the BF16 baseline is unavailable for this SM120 benchmark case."""
+    if headdim == 256 and case.has_rab:
+        return "current SM120 BF16 baseline does not support hdim256 RAB/DRAB"
+    if headdim == 256 and case.mask == "arbitrary":
+        return "current SM120 BF16 baseline does not support hdim256 arbitrary"
+    return ""
+
+
+def column_unsupported_reason(column: str, headdim: int, case: BenchCase) -> str:
+    """Return why a benchmark output column is unavailable for a logical case."""
+    if column == "bf16":
+        return bf16_unsupported_reason(headdim, case)
+    if column == "fp8":
+        if headdim % 128 != 0:
+            return "SM120 FP8 block-scale benchmark requires headDim divisible by 128"
+        return ""
+    if column == "paged":
+        if headdim not in (128, 256):
+            return "SM120 FP8 paged KV benchmark supports headDim 128 or 256"
+        if fp8_block_n(headdim, case.has_rab) != 64:
+            return "SM120 FP8 paged KV benchmark requires page_size=kBlockN=64"
+        return ""
+    raise ValueError(f"unknown benchmark column: {column}")
+
+
+def has_supported_column(columns: Sequence[str], headdim: int, case: BenchCase) -> bool:
+    return any(not column_unsupported_reason(column, headdim, case) for column in columns)
+
+
+def print_unsupported_summary(
+    headdims: Sequence[int],
+    cases: Sequence[BenchCase],
+    columns: Sequence[str],
+) -> None:
+    rows = []
+    for column in columns:
+        for headdim in headdims:
+            grouped = {}
+            for case in cases:
+                reason = column_unsupported_reason(column, headdim, case)
+                if reason:
+                    grouped.setdefault(reason, []).append(case.label)
+            for reason, labels in grouped.items():
+                rows.append((column, headdim, reason, labels))
+
+    print("Unsupported selected cases:")
+    if not rows:
+        print("  none")
+        print()
+        return
+    for column, headdim, reason, labels in rows:
+        print(
+            f"  {column:>5} d={headdim}: {', '.join(labels)} "
+            f"# {reason}"
+        )
+    print()
 
 
 def fp8_round_bf16(x: torch.Tensor) -> torch.Tensor:
     return x.to(torch.float8_e4m3fn).to(torch.bfloat16)
 
 
-def quantize_fp8_bs(q_bf16, k_bf16, v_bf16, batch_size, seqlen, nheads, headdim):
+def make_case_inputs(batch_size: int, seqlen: int, nheads: int,
+                     headdim: int, case: BenchCase) -> dict:
+    max_context_len, max_target_len, window_size, is_arbitrary = _case_shape(case, seqlen)
+    (
+        _,
+        _,
+        num_contexts,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_q,
+        seqused_k,
+        num_targets,
+        _,
+        q,
+        k,
+        v,
+        rab,
+        attn_mask,
+        func,
+    ) = generate_input(
+        batch_size=batch_size,
+        heads=nheads,
+        heads_rab=None,
+        max_seq_len_q=seqlen,
+        max_seq_len_k=seqlen,
+        max_context_len=max_context_len,
+        max_target_len=max_target_len,
+        target_group_size=1,
+        attn_dim=headdim,
+        hidden_dim=headdim,
+        window_size=window_size,
+        dtype=torch.bfloat16,
+        full_batch=True,
+        has_drab=case.has_drab,
+        is_delta_q=False,
+        is_arbitrary=is_arbitrary,
+    )
+
+    max_seqlen_q = max_context_len + seqlen + max_target_len
+    max_seqlen_k = max_context_len + seqlen + max_target_len
+    if attn_mask is None:
+        pairs = 0
+        for b in range(batch_size):
+            q_len = int((cu_seqlens_q[b + 1] - cu_seqlens_q[b]).item())
+            k_len = int((cu_seqlens_k[b + 1] - cu_seqlens_k[b]).item())
+            pairs += q_len * k_len
+    else:
+        pairs = int(attn_mask.bool().sum().item())
+
+    return {
+        "case": case,
+        "q": q.detach().contiguous(),
+        "k": k.detach().contiguous(),
+        "v": v.detach().contiguous(),
+        "cu_q": cu_seqlens_q,
+        "cu_k": cu_seqlens_k,
+        "seqused_q": seqused_q,
+        "seqused_k": seqused_k,
+        "num_contexts": num_contexts,
+        "num_targets": num_targets,
+        "rab": rab.detach().to(torch.bfloat16).contiguous() if case.has_rab else None,
+        "func": func,
+        "window_size": window_size,
+        "target_group_size": 1,
+        "max_seqlen_q": max_seqlen_q,
+        "max_seqlen_k": max_seqlen_k,
+        "pairs": pairs,
+    }
+
+
+def quantize_fp8_bs(q_bf16, k_bf16, v_bf16, cu_q, cu_k, headdim, has_rab=False):
     """Quantize BF16 Q/K/V to FP8 block-scale (quant_mode=2) format."""
-    cu_seqlens = make_cu_seqlens(batch_size, seqlen)
-    block_n = fp8_block_n(headdim)
+    block_n = fp8_block_n(headdim, has_rab)
 
     # Round to FP8 range first (same as sweep_accuracy.py)
     q_in = fp8_round_bf16(q_bf16)
@@ -96,15 +255,15 @@ def quantize_fp8_bs(q_bf16, k_bf16, v_bf16, batch_size, seqlen, nheads, headdim)
 
     # Q/K: block-scale along D (headdim axis)
     q_fp8, q_descale, cu_q_blk = quantize_for_block_scale_qk_along_d(
-        q_in, cu_seqlens, fp8_type=torch.float8_e4m3fn
+        q_in, cu_q, fp8_type=torch.float8_e4m3fn
     )
     k_fp8, k_descale, cu_kv_blk = quantize_for_block_scale_qk_along_d(
-        k_in, cu_seqlens, fp8_type=torch.float8_e4m3fn
+        k_in, cu_k, fp8_type=torch.float8_e4m3fn
     )
 
     # V: block-scale along N (sequence axis)
     v_fp8, v_descale, cu_v_blk = quantize_for_block_scale_v_along_n(
-        v_in, cu_seqlens, block_size=block_n, fp8_type=torch.float8_e4m3fn
+        v_in, cu_k, block_size=block_n, fp8_type=torch.float8_e4m3fn
     )
     # Pack descale factors to e8m0×4 int32 format for kernel.
     # sf_v is expanded from [H, total_blocks] → [H, total_tokens] via repeat_interleave
@@ -117,73 +276,62 @@ def quantize_fp8_bs(q_bf16, k_bf16, v_bf16, batch_size, seqlen, nheads, headdim)
             sf_q, sf_k, sf_v,
             q_descale, k_descale, v_descale,
             cu_q_blk, cu_kv_blk, cu_v_blk,
-            cu_seqlens)
+            cu_q, cu_k)
 
 
-def make_paged_kv_raw_inputs(batch_size, seqlen, nheads, headdim, window_size):
-    """
-    Build an equivalent paged-KV case for the same benchmark shape.
+def make_paged_cache_from_varlen_kv(inputs: dict, page_size: int):
+    k = inputs["k"]
+    v = inputs["v"]
+    cu_k = inputs["cu_k"]
+    num_targets = inputs["num_targets"]
+    batch_size = cu_k.numel() - 1
+    target_lens = (
+        num_targets
+        if num_targets is not None
+        else torch.zeros((batch_size,), dtype=torch.int32, device="cuda")
+    )
+    lengths_k = cu_k[1:] - cu_k[:-1]
+    cache_lens = (lengths_k - target_lens).to(torch.int32)
+    if bool((cache_lens <= 0).any().item()):
+        raise ValueError(f"paged benchmark requires positive cache length, got {cache_lens.cpu().tolist()}")
 
-    For causal, use target_len=0 and place the whole K/V sequence in the cache.
-    For full, pass num_targets=None so the dispatcher instantiates the full
-    paged-history path.
-    """
-    if window_size not in {(-1, 0), (-1, -1)}:
-        raise ValueError("paged KV benchmark supports only causal (-1,0) and full (-1,-1)")
-    if headdim % 128 != 0:
-        raise ValueError("SM120 FP8 paged KV benchmark requires headDim divisible by 128")
+    pages_per_batch = (cache_lens + page_size - 1) // page_size
+    page_offsets = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
+    page_offsets[1:] = torch.cumsum(pages_per_batch, dim=0)
+    total_pages = int(page_offsets[-1].item())
+    page_ids = torch.randperm(total_pages, dtype=torch.int32, device="cuda")
+    last_page_lens = ((cache_lens - 1) % page_size + 1).to(torch.int32)
 
-    page_size = fp8_block_n(headdim)
+    kv_cache = torch.zeros(
+        (total_pages, 2, page_size, k.shape[1], k.shape[2]),
+        dtype=k.dtype,
+        device=k.device,
+    )
+    for b in range(batch_size):
+        k0 = int(cu_k[b].item())
+        cache_len = int(cache_lens[b].item())
+        logical_page0 = int(page_offsets[b].item())
+        for p in range(int(pages_per_batch[b].item())):
+            valid = min(page_size, cache_len - p * page_size)
+            page_id = int(page_ids[logical_page0 + p].item())
+            src0 = k0 + p * page_size
+            src1 = src0 + valid
+            kv_cache[page_id, 0, :valid] = k[src0:src1]
+            kv_cache[page_id, 1, :valid] = v[src0:src1]
+    return kv_cache, page_offsets, page_ids, last_page_lens
+
+
+def quantize_paged_kv_inputs(inputs: dict, headdim: int):
+    q_raw = inputs["q"]
+    k_raw = inputs["k"]
+    v_raw = inputs["v"]
+    cu_q = inputs["cu_q"]
+    page_size = fp8_block_n(headdim, inputs["case"].has_rab)
     if page_size != 64:
         raise ValueError(f"SM120 FP8 paged KV benchmark requires page_size=64, got {page_size}")
-    if seqlen % page_size != 0:
-        raise ValueError(f"paged KV benchmark requires seq divisible by {page_size}, got {seqlen}")
-
-    total_q = batch_size * seqlen
-    pages_per_batch = seqlen // page_size
-    total_pages = batch_size * pages_per_batch
-
-    q_raw = torch.randn(total_q, nheads, headdim, dtype=torch.bfloat16, device="cuda")
-    # K/V tensors are required by the op schema.  With num_targets=0, the paged
-    # kernel reads K/V from kv_cache only; these tensors are still quantized so
-    # descriptor metadata matches the production wrapper path.
-    k_raw = torch.randn(total_q, nheads, headdim, dtype=torch.bfloat16, device="cuda")
-    v_raw = torch.randn(total_q, nheads, headdim, dtype=torch.bfloat16, device="cuda")
-    kv_cache_raw = torch.randn(
-        total_pages, 2, page_size, nheads, headdim,
-        dtype=torch.bfloat16,
-        device="cuda",
+    kv_cache_raw, page_offsets, page_ids, last_page_lens = make_paged_cache_from_varlen_kv(
+        inputs, page_size
     )
-
-    cu_q = make_cu_seqlens(batch_size, seqlen)
-    cu_k = make_cu_seqlens(batch_size, seqlen)
-    num_targets = (
-        torch.zeros(batch_size, dtype=torch.int32, device="cuda")
-        if window_size == (-1, 0)
-        else None
-    )
-
-    page_offsets = torch.zeros(batch_size + 1, dtype=torch.int32, device="cuda")
-    page_offsets[1:] = torch.arange(
-        1, batch_size + 1, dtype=torch.int32, device="cuda"
-    ) * pages_per_batch
-    page_ids = torch.randperm(total_pages, dtype=torch.int32, device="cuda")
-    last_page_lens = torch.full(
-        (batch_size,), page_size, dtype=torch.int32, device="cuda"
-    )
-
-    return (
-        q_raw, k_raw, v_raw, kv_cache_raw,
-        cu_q, cu_k, num_targets, page_offsets, page_ids, last_page_lens,
-    )
-
-
-def quantize_paged_kv_inputs(raw_inputs, headdim):
-    (
-        q_raw, k_raw, v_raw, kv_cache_raw,
-        cu_q, cu_k, num_targets, page_offsets, page_ids, last_page_lens,
-    ) = raw_inputs
-    page_size = fp8_block_n(headdim)
     q_raw = fp8_round_bf16(q_raw)
     k_raw = fp8_round_bf16(k_raw)
     v_raw = fp8_round_bf16(v_raw)
@@ -216,33 +364,26 @@ def quantize_paged_kv_inputs(raw_inputs, headdim):
         q_fp8, k_fp8, v_fp8, kv_cache_fp8,
         sf_q, sf_k, sf_v,
         q_descale, k_descale, v_descale,
-        cu_q, cu_k, cu_q_blk, cu_k_blk, cu_v_blk,
-        num_targets, page_offsets, page_ids, last_page_lens,
+        cu_q, inputs["cu_k"], cu_q_blk, cu_k_blk, cu_v_blk,
+        inputs["num_targets"], page_offsets, page_ids, last_page_lens,
     )
 
 
-def make_fp8_paged_kv_inputs(batch_size, seqlen, nheads, headdim, window_size):
-    return quantize_paged_kv_inputs(
-        make_paged_kv_raw_inputs(batch_size, seqlen, nheads, headdim, window_size),
-        headdim,
-    )
-
-
-def run_kernel_bf16(q, k, v, cu_seqlens, seqlen, batch_size, window_size=(-1, -1)):
+def run_kernel_bf16(inputs: dict):
     """Run BF16 kernel directly via torch.ops."""
     out, _ = torch.ops.fbgemm.hstu_varlen_fwd_120(
-        q, k, v,
-        cu_seqlens, cu_seqlens,   # cu_seqlens_q, cu_seqlens_k
-        None, None,                # seqused_q, seqused_k
-        seqlen, seqlen,            # max_seqlen_q, max_seqlen_k
-        seqlen,                    # scaling_seqlen (must be int)
-        None,                      # num_contexts
-        None,                      # num_targets
-        1,                         # target_group_size
-        window_size[0], window_size[1],
+        inputs["q"], inputs["k"], inputs["v"],
+        inputs["cu_q"], inputs["cu_k"],
+        inputs["seqused_q"], inputs["seqused_k"],
+        inputs["max_seqlen_q"], inputs["max_seqlen_k"],
+        -1,                        # scaling_seqlen: default to max_seqlen_q
+        inputs["num_contexts"],
+        inputs["num_targets"],
+        inputs["target_group_size"],
+        inputs["window_size"][0], inputs["window_size"][1],
         1.0,                       # alpha
-        None,                      # rab
-        None,                      # func_boundaries
+        inputs["rab"],
+        inputs["func"],
         -1,                        # quant_mode (BF16)
         None, None, None,          # descale_q/k/v
         None, None, None,          # sf_q/k/v
@@ -251,21 +392,25 @@ def run_kernel_bf16(q, k, v, cu_seqlens, seqlen, batch_size, window_size=(-1, -1
     return out
 
 
-def run_kernel_fp8bs(q_fp8, k_fp8, v_fp8, sf_q, sf_k, sf_v,
-                     q_descale, k_descale, v_descale,
-                     cu_seqlens, cu_q_blk, cu_kv_blk, cu_v_blk,
-                     seqlen, window_size=(-1, -1)):
+def run_kernel_fp8bs(inputs: dict, fp8_inputs):
     """Run FP8 block-scale kernel directly via torch.ops."""
+    (
+        q_fp8, k_fp8, v_fp8,
+        sf_q, sf_k, sf_v,
+        q_descale, k_descale, v_descale,
+        cu_q_blk, cu_kv_blk, cu_v_blk,
+        cu_q, cu_k,
+    ) = fp8_inputs
     out, _ = torch.ops.fbgemm.hstu_varlen_fwd_120(
         q_fp8, k_fp8, v_fp8,
-        cu_seqlens, cu_seqlens,
-        None, None,
-        seqlen, seqlen,
-        seqlen,                     # scaling_seqlen (must be int)
-        None, None, 1,
-        window_size[0], window_size[1],
+        cu_q, cu_k,
+        inputs["seqused_q"], inputs["seqused_k"],
+        inputs["max_seqlen_q"], inputs["max_seqlen_k"],
+        -1,
+        inputs["num_contexts"], inputs["num_targets"], inputs["target_group_size"],
+        inputs["window_size"][0], inputs["window_size"][1],
         1.0,
-        None, None,
+        inputs["rab"], inputs["func"],
         2,                          # quant_mode=2 (FP8 block-scale)
         q_descale, k_descale, v_descale,  # raw descales (for reference, unused by mode=2)
         sf_q, sf_k, sf_v,           # block-scale SF tensors (packed e8m0×4 int32)
@@ -274,7 +419,7 @@ def run_kernel_fp8bs(q_fp8, k_fp8, v_fp8, sf_q, sf_k, sf_v,
     return out
 
 
-def run_kernel_fp8bs_paged(paged_inputs, seqlen, window_size=(-1, 0)):
+def run_kernel_fp8bs_paged(inputs: dict, paged_inputs):
     """Run SM120 FP8 paged-KV kernel directly via torch.ops."""
     (
         q_fp8, k_fp8, v_fp8, kv_cache_fp8,
@@ -286,13 +431,13 @@ def run_kernel_fp8bs_paged(paged_inputs, seqlen, window_size=(-1, 0)):
     out, _ = torch.ops.fbgemm.hstu_varlen_fwd_120(
         q_fp8, k_fp8, v_fp8,
         cu_q, cu_k,
-        None, None,
-        seqlen, seqlen,
-        seqlen,
-        None, num_targets, 1,
-        window_size[0], window_size[1],
+        inputs["seqused_q"], inputs["seqused_k"],
+        inputs["max_seqlen_q"], inputs["max_seqlen_k"],
+        -1,
+        inputs["num_contexts"], num_targets, inputs["target_group_size"],
+        inputs["window_size"][0], inputs["window_size"][1],
         1.0,
-        None, None,
+        inputs["rab"], inputs["func"],
         2,
         q_descale, k_descale, v_descale,
         sf_q, sf_k, sf_v,
@@ -320,28 +465,6 @@ def time_kernel(fn, warmup=WARMUP, iters=ITERS):
     return sum(lats) / len(lats), min(lats), max(lats)
 
 
-def attention_flops(
-    batch_size: int,
-    seqlen: int,
-    nheads: int,
-    headdim: int,
-    window_size: Tuple[int, int],
-) -> float:
-    """FWD attention FLOPs for GEMM1 + GEMM2 over valid (query, key) pairs."""
-    left, right = window_size
-    if left < 0 and right < 0:
-        pairs_per_sequence = seqlen * seqlen
-    else:
-        pairs_per_sequence = 0
-        for q_idx in range(seqlen):
-            k_begin = 0 if left < 0 else max(0, q_idx - left)
-            k_end = seqlen - 1 if right < 0 else min(seqlen - 1, q_idx + right)
-            if k_end >= k_begin:
-                pairs_per_sequence += k_end - k_begin + 1
-
-    return 4.0 * batch_size * pairs_per_sequence * nheads * headdim
-
-
 # ---------------------------------------------------------------------------
 # Kernel-only benchmark: measures only the CUDA attention kernel time
 # ---------------------------------------------------------------------------
@@ -351,7 +474,8 @@ def bench_kernel_only(
     seqlen: int,
     nheads: int,
     headdim: int,
-    window_size: Tuple[int, int],
+    case: BenchCase,
+    columns: Sequence[str],
 ) -> dict:
     """
     Returns dict with keys: bf16_ms, fp8_ms, bf16_tflops, fp8_tflops, speedup_pct.
@@ -360,62 +484,61 @@ def bench_kernel_only(
     result = {}
 
     try:
-        q_bf16, k_bf16, v_bf16, cu_seqlens = make_bf16_inputs(
-            batch_size, seqlen, nheads, headdim
-        )
-
-        # BF16 kernel
-        bf16_avg, _, _ = time_kernel(
-            lambda: run_kernel_bf16(q_bf16, k_bf16, v_bf16, cu_seqlens, seqlen,
-                                    batch_size, window_size)
-        )
-        result["bf16_ms"] = bf16_avg
-
+        inputs = make_case_inputs(batch_size, seqlen, nheads, headdim, case)
+        result["pairs"] = inputs["pairs"]
     except Exception as e:
-        result["bf16_error"] = str(e)
+        result["input_error"] = str(e)
+        return result
 
-    try:
+    if "fp8" in columns:
         # Prepare FP8 inputs (quantization done once, not timed)
-        q_bf16_2, k_bf16_2, v_bf16_2, _ = make_bf16_inputs(
-            batch_size, seqlen, nheads, headdim
-        )
-        (q_fp8, k_fp8, v_fp8,
-         sf_q, sf_k, sf_v,
-         q_dsc, k_dsc, v_dsc,
-         cu_q_blk, cu_kv_blk, cu_v_blk,
-         cu_seqlens2) = quantize_fp8_bs(
-            q_bf16_2, k_bf16_2, v_bf16_2, batch_size, seqlen, nheads, headdim
-        )
+        reason = column_unsupported_reason("fp8", headdim, case)
+        if reason:
+            result["fp8_unsupported"] = reason
+        else:
+            try:
+                fp8_inputs = quantize_fp8_bs(
+                    inputs["q"], inputs["k"], inputs["v"],
+                    inputs["cu_q"], inputs["cu_k"], headdim, case.has_rab
+                )
+                fp8_avg, _, _ = time_kernel(lambda: run_kernel_fp8bs(inputs, fp8_inputs))
+                result["fp8_ms"] = fp8_avg
 
-        fp8_avg, _, _ = time_kernel(
-            lambda: run_kernel_fp8bs(
-                q_fp8, k_fp8, v_fp8, sf_q, sf_k, sf_v,
-                q_dsc, k_dsc, v_dsc,
-                cu_seqlens2, cu_q_blk, cu_kv_blk, cu_v_blk,
-                seqlen, window_size
-            )
-        )
-        result["fp8_ms"] = fp8_avg
+            except Exception as e:
+                result["fp8_error"] = str(e)
 
-    except Exception as e:
-        result["fp8_error"] = str(e)
-
-    try:
+    if "paged" in columns:
         # Prepare paged-KV FP8 inputs once; kernel-only timing excludes
         # page/cache construction and FP8 quantization.
-        paged_inputs = make_fp8_paged_kv_inputs(
-            batch_size, seqlen, nheads, headdim, window_size
-        )
-        paged_avg, _, _ = time_kernel(
-            lambda: run_kernel_fp8bs_paged(paged_inputs, seqlen, window_size)
-        )
-        result["paged_ms"] = paged_avg
+        reason = column_unsupported_reason("paged", headdim, case)
+        if reason:
+            result["paged_unsupported"] = reason
+        else:
+            try:
+                paged_inputs = quantize_paged_kv_inputs(inputs, headdim)
+                paged_avg, _, _ = time_kernel(
+                    lambda: run_kernel_fp8bs_paged(inputs, paged_inputs)
+                )
+                result["paged_ms"] = paged_avg
 
-    except Exception as e:
-        result["paged_error"] = str(e)
+            except Exception as e:
+                result["paged_error"] = str(e)
+
+    if "bf16" in columns:
+        # BF16 is timed last so unsupported BF16 specializations do not prevent
+        # FP8/paged measurements for the same logical case.
+        reason = column_unsupported_reason("bf16", headdim, case)
+        if reason:
+            result["bf16_unsupported"] = reason
+        else:
+            try:
+                bf16_avg, _, _ = time_kernel(lambda: run_kernel_bf16(inputs))
+                result["bf16_ms"] = bf16_avg
+            except Exception as e:
+                result["bf16_error"] = str(e)
 
     # Compute TFLOPS
-    total_flops = attention_flops(batch_size, seqlen, nheads, headdim, window_size)
+    total_flops = 4.0 * result.get("pairs", 0) * nheads * headdim
     if "bf16_ms" in result:
         result["bf16_tflops"] = total_flops / (result["bf16_ms"] * 1e-3) / 1e12
     if "fp8_ms" in result:
@@ -440,34 +563,23 @@ def bench_kernel_only(
 # End-to-end benchmark: includes quantization overhead
 # ---------------------------------------------------------------------------
 
-def run_e2e_bf16(q_bf16, k_bf16, v_bf16, cu_seqlens, seqlen,
-                 batch_size, window_size):
-    return run_kernel_bf16(q_bf16, k_bf16, v_bf16, cu_seqlens, seqlen,
-                           batch_size, window_size)
+def run_e2e_bf16(inputs: dict):
+    return run_kernel_bf16(inputs)
 
 
-def run_e2e_fp8bs(q_bf16, k_bf16, v_bf16, seqlen, batch_size, nheads, headdim,
-                  window_size):
+def run_e2e_fp8bs(inputs: dict, headdim: int):
     """Full end-to-end FP8: quantization + kernel."""
-    (q_fp8, k_fp8, v_fp8,
-     sf_q, sf_k, sf_v,
-     q_dsc, k_dsc, v_dsc,
-     cu_q_blk, cu_kv_blk, cu_v_blk,
-     cu_seqlens) = quantize_fp8_bs(
-        q_bf16, k_bf16, v_bf16, batch_size, seqlen, nheads, headdim
+    fp8_inputs = quantize_fp8_bs(
+        inputs["q"], inputs["k"], inputs["v"],
+        inputs["cu_q"], inputs["cu_k"], headdim, inputs["case"].has_rab
     )
-    return run_kernel_fp8bs(
-        q_fp8, k_fp8, v_fp8, sf_q, sf_k, sf_v,
-        q_dsc, k_dsc, v_dsc,
-        cu_seqlens, cu_q_blk, cu_kv_blk, cu_v_blk,
-        seqlen, window_size
-    )
+    return run_kernel_fp8bs(inputs, fp8_inputs)
 
 
-def run_e2e_fp8bs_paged(raw_paged_inputs, headdim, seqlen, window_size):
+def run_e2e_fp8bs_paged(inputs: dict, headdim: int):
     """Paged-KV e2e path: quantize Q/target tensors/cache, then run kernel."""
-    paged_inputs = quantize_paged_kv_inputs(raw_paged_inputs, headdim)
-    return run_kernel_fp8bs_paged(paged_inputs, seqlen, window_size)
+    paged_inputs = quantize_paged_kv_inputs(inputs, headdim)
+    return run_kernel_fp8bs_paged(inputs, paged_inputs)
 
 
 def bench_e2e(
@@ -475,65 +587,65 @@ def bench_e2e(
     seqlen: int,
     nheads: int,
     headdim: int,
-    window_size: Tuple[int, int],
+    case: BenchCase,
+    columns: Sequence[str],
 ) -> dict:
     """Returns dict with end-to-end BF16 and FP8 latencies and speedup."""
     result = {}
 
     try:
-        q_bf16, k_bf16, v_bf16, cu_seqlens = make_bf16_inputs(
-            batch_size, seqlen, nheads, headdim
-        )
-        bf16_avg, _, _ = time_kernel(
-            lambda: run_e2e_bf16(q_bf16, k_bf16, v_bf16, cu_seqlens, seqlen,
-                                 batch_size, window_size)
-        )
-        result["bf16_ms"] = bf16_avg
-
-        total_flops_e2e = attention_flops(
-            batch_size, seqlen, nheads, headdim, window_size
-        )
-        result["bf16_tflops"] = total_flops_e2e / (bf16_avg * 1e-3) / 1e12
-
+        inputs = make_case_inputs(batch_size, seqlen, nheads, headdim, case)
+        result["pairs"] = inputs["pairs"]
     except Exception as e:
-        result["bf16_error"] = str(e)
+        result["input_error"] = str(e)
+        return result
 
-    try:
-        q_bf16_2, k_bf16_2, v_bf16_2, _ = make_bf16_inputs(
-            batch_size, seqlen, nheads, headdim
-        )
-        fp8_avg, _, _ = time_kernel(
-            lambda: run_e2e_fp8bs(q_bf16_2, k_bf16_2, v_bf16_2, seqlen,
-                                  batch_size, nheads, headdim, window_size)
-        )
-        result["fp8_ms"] = fp8_avg
+    if "fp8" in columns:
+        reason = column_unsupported_reason("fp8", headdim, case)
+        if reason:
+            result["fp8_unsupported"] = reason
+        else:
+            try:
+                fp8_avg, _, _ = time_kernel(lambda: run_e2e_fp8bs(inputs, headdim))
+                result["fp8_ms"] = fp8_avg
 
-        total_flops_e2e = attention_flops(
-            batch_size, seqlen, nheads, headdim, window_size
-        )
-        result["fp8_tflops"] = total_flops_e2e / (fp8_avg * 1e-3) / 1e12
+                total_flops_e2e = 4.0 * inputs["pairs"] * nheads * headdim
+                result["fp8_tflops"] = total_flops_e2e / (fp8_avg * 1e-3) / 1e12
 
-    except Exception as e:
-        result["fp8_error"] = str(e)
+            except Exception as e:
+                result["fp8_error"] = str(e)
 
-    try:
-        raw_paged_inputs = make_paged_kv_raw_inputs(
-            batch_size, seqlen, nheads, headdim, window_size
-        )
-        paged_avg, _, _ = time_kernel(
-            lambda: run_e2e_fp8bs_paged(
-                raw_paged_inputs, headdim, seqlen, window_size
-            )
-        )
-        result["paged_ms"] = paged_avg
+    if "paged" in columns:
+        reason = column_unsupported_reason("paged", headdim, case)
+        if reason:
+            result["paged_unsupported"] = reason
+        else:
+            try:
+                paged_avg, _, _ = time_kernel(
+                    lambda: run_e2e_fp8bs_paged(inputs, headdim)
+                )
+                result["paged_ms"] = paged_avg
 
-        total_flops_e2e = attention_flops(
-            batch_size, seqlen, nheads, headdim, window_size
-        )
-        result["paged_tflops"] = total_flops_e2e / (paged_avg * 1e-3) / 1e12
+                total_flops_e2e = 4.0 * inputs["pairs"] * nheads * headdim
+                result["paged_tflops"] = total_flops_e2e / (paged_avg * 1e-3) / 1e12
 
-    except Exception as e:
-        result["paged_error"] = str(e)
+            except Exception as e:
+                result["paged_error"] = str(e)
+
+    if "bf16" in columns:
+        reason = column_unsupported_reason("bf16", headdim, case)
+        if reason:
+            result["bf16_unsupported"] = reason
+        else:
+            try:
+                bf16_avg, _, _ = time_kernel(lambda: run_e2e_bf16(inputs))
+                result["bf16_ms"] = bf16_avg
+
+                total_flops_e2e = 4.0 * inputs["pairs"] * nheads * headdim
+                result["bf16_tflops"] = total_flops_e2e / (bf16_avg * 1e-3) / 1e12
+
+            except Exception as e:
+                result["bf16_error"] = str(e)
 
     if "bf16_ms" in result and "fp8_ms" in result:
         result["speedup_pct"] = (
@@ -551,22 +663,13 @@ def bench_e2e(
 # Pretty print helpers
 # ---------------------------------------------------------------------------
 
-def _ws_str(ws):
-    if ws == (-1, 0):
-        return "causal"
-    elif ws == (-1, -1):
-        return "full"
-    else:
-        return f"w={ws}"
-
-
 def print_kernel_table(
-    batch_sizes, seqlens, nheads_list, headdims, window_sizes
+    batch_sizes, seqlens, nheads_list, headdims, cases, columns
 ):
-    print("=" * 100)
+    print("=" * 120)
     print("KERNEL-ONLY BENCHMARK  (FP8 quantization not included)")
-    print("=" * 100)
-    hdr = (f"{'Config':<56} {'BF16(ms)':>9} {'BF16 TFLOPS':>12}"
+    print("=" * 120)
+    hdr = (f"{'Config':<72} {'BF16(ms)':>9} {'BF16 TFLOPS':>12}"
            f" {'FP8(ms)':>9} {'FP8 TFLOPS':>12}"
            f" {'Paged(ms)':>10} {'Paged TFLOPS':>13} {'Paged/F8':>9}"
            f" {'Speedup':>9}")
@@ -577,29 +680,25 @@ def print_kernel_table(
         for seqlen in seqlens:
             for nheads in nheads_list:
                 for headdim in headdims:
-                    for ws in window_sizes:
+                    for case in cases:
+                        if not has_supported_column(columns, headdim, case):
+                            continue
                         cfg = (f"bs={bs} seq={seqlen} h={nheads} "
-                               f"d={headdim} {_ws_str(ws)}")
-                        res = bench_kernel_only(bs, seqlen, nheads, headdim, ws)
+                               f"d={headdim} {case.label}")
+                        res = bench_kernel_only(bs, seqlen, nheads, headdim, case, columns)
 
-                        bf16_str = (f"{res['bf16_ms']:9.3f}"
-                                    if "bf16_ms" in res
-                                    else f"{'ERR':>9}")
-                        bf16_tf = (f"{res['bf16_tflops']:12.1f}"
-                                   if "bf16_tflops" in res
-                                   else f"{'ERR':>12}")
-                        fp8_str = (f"{res['fp8_ms']:9.3f}"
-                                   if "fp8_ms" in res
-                                   else f"{'ERR':>9}")
-                        fp8_tf = (f"{res['fp8_tflops']:12.1f}"
-                                  if "fp8_tflops" in res
-                                  else f"{'ERR':>12}")
-                        paged_str = (f"{res['paged_ms']:10.3f}"
-                                     if "paged_ms" in res
-                                     else f"{'N/A':>10}")
-                        paged_tf = (f"{res['paged_tflops']:13.1f}"
-                                    if "paged_tflops" in res
-                                    else f"{'N/A':>13}")
+                        bf16_str = (f"{res['bf16_ms']:9.3f}" if "bf16_ms" in res
+                                    else (f"{'N/A':>9}" if "bf16" not in columns or "bf16_unsupported" in res else f"{'ERR':>9}"))
+                        bf16_tf = (f"{res['bf16_tflops']:12.1f}" if "bf16_tflops" in res
+                                   else (f"{'N/A':>12}" if "bf16" not in columns or "bf16_unsupported" in res else f"{'ERR':>12}"))
+                        fp8_str = (f"{res['fp8_ms']:9.3f}" if "fp8_ms" in res
+                                   else (f"{'N/A':>9}" if "fp8" not in columns or "fp8_unsupported" in res else f"{'ERR':>9}"))
+                        fp8_tf = (f"{res['fp8_tflops']:12.1f}" if "fp8_tflops" in res
+                                  else (f"{'N/A':>12}" if "fp8" not in columns or "fp8_unsupported" in res else f"{'ERR':>12}"))
+                        paged_str = (f"{res['paged_ms']:10.3f}" if "paged_ms" in res
+                                     else (f"{'N/A':>10}" if "paged" not in columns or "paged_unsupported" in res else f"{'ERR':>10}"))
+                        paged_tf = (f"{res['paged_tflops']:13.1f}" if "paged_tflops" in res
+                                    else (f"{'N/A':>13}" if "paged" not in columns or "paged_unsupported" in res else f"{'ERR':>13}"))
                         paged_vs = (f"{res['paged_vs_fp8_pct']:+8.1f}%"
                                     if "paged_vs_fp8_pct" in res
                                     else f"{'N/A':>9}")
@@ -608,7 +707,7 @@ def print_kernel_table(
                                    else f"{'N/A':>9}")
 
                         print(
-                            f"  {cfg:<54} {bf16_str} {bf16_tf} {fp8_str} {fp8_tf}"
+                            f"  {cfg:<70} {bf16_str} {bf16_tf} {fp8_str} {fp8_tf}"
                             f" {paged_str} {paged_tf} {paged_vs} {speedup}"
                         )
 
@@ -618,16 +717,18 @@ def print_kernel_table(
                             print(f"    FP8  ERROR: {res['fp8_error']}")
                         if "paged_error" in res:
                             print(f"    PAGED ERROR: {res['paged_error']}")
+                        if "input_error" in res:
+                            print(f"    INPUT ERROR: {res['input_error']}")
     print()
 
 
 def print_e2e_table(
-    batch_sizes, seqlens, nheads_list, headdims, window_sizes
+    batch_sizes, seqlens, nheads_list, headdims, cases, columns
 ):
-    print("=" * 100)
+    print("=" * 120)
     print("END-TO-END BENCHMARK  (includes FP8 quantization overhead)")
-    print("=" * 100)
-    hdr = (f"{'Config':<56} {'BF16(ms)':>9} {'BF16 TFLOPS':>12}"
+    print("=" * 120)
+    hdr = (f"{'Config':<72} {'BF16(ms)':>9} {'BF16 TFLOPS':>12}"
            f" {'FP8 e2e(ms)':>11} {'FP8 TFLOPS':>12}"
            f" {'Paged(ms)':>10} {'Paged TFLOPS':>13} {'Paged/F8':>9}"
            f" {'Speedup':>9}")
@@ -638,29 +739,25 @@ def print_e2e_table(
         for seqlen in seqlens:
             for nheads in nheads_list:
                 for headdim in headdims:
-                    for ws in window_sizes:
+                    for case in cases:
+                        if not has_supported_column(columns, headdim, case):
+                            continue
                         cfg = (f"bs={bs} seq={seqlen} h={nheads} "
-                               f"d={headdim} {_ws_str(ws)}")
-                        res = bench_e2e(bs, seqlen, nheads, headdim, ws)
+                               f"d={headdim} {case.label}")
+                        res = bench_e2e(bs, seqlen, nheads, headdim, case, columns)
 
-                        bf16_str = (f"{res['bf16_ms']:9.3f}"
-                                    if "bf16_ms" in res
-                                    else f"{'ERR':>9}")
-                        bf16_tf = (f"{res['bf16_tflops']:12.1f}"
-                                   if "bf16_tflops" in res
-                                   else f"{'ERR':>12}")
-                        fp8_str = (f"{res['fp8_ms']:11.3f}"
-                                   if "fp8_ms" in res
-                                   else f"{'ERR':>11}")
-                        fp8_tf = (f"{res['fp8_tflops']:12.1f}"
-                                  if "fp8_tflops" in res
-                                  else f"{'ERR':>12}")
-                        paged_str = (f"{res['paged_ms']:10.3f}"
-                                     if "paged_ms" in res
-                                     else f"{'N/A':>10}")
-                        paged_tf = (f"{res['paged_tflops']:13.1f}"
-                                    if "paged_tflops" in res
-                                    else f"{'N/A':>13}")
+                        bf16_str = (f"{res['bf16_ms']:9.3f}" if "bf16_ms" in res
+                                    else (f"{'N/A':>9}" if "bf16" not in columns or "bf16_unsupported" in res else f"{'ERR':>9}"))
+                        bf16_tf = (f"{res['bf16_tflops']:12.1f}" if "bf16_tflops" in res
+                                   else (f"{'N/A':>12}" if "bf16" not in columns or "bf16_unsupported" in res else f"{'ERR':>12}"))
+                        fp8_str = (f"{res['fp8_ms']:11.3f}" if "fp8_ms" in res
+                                   else (f"{'N/A':>11}" if "fp8" not in columns or "fp8_unsupported" in res else f"{'ERR':>11}"))
+                        fp8_tf = (f"{res['fp8_tflops']:12.1f}" if "fp8_tflops" in res
+                                  else (f"{'N/A':>12}" if "fp8" not in columns or "fp8_unsupported" in res else f"{'ERR':>12}"))
+                        paged_str = (f"{res['paged_ms']:10.3f}" if "paged_ms" in res
+                                     else (f"{'N/A':>10}" if "paged" not in columns or "paged_unsupported" in res else f"{'ERR':>10}"))
+                        paged_tf = (f"{res['paged_tflops']:13.1f}" if "paged_tflops" in res
+                                    else (f"{'N/A':>13}" if "paged" not in columns or "paged_unsupported" in res else f"{'ERR':>13}"))
                         paged_vs = (f"{res['paged_vs_fp8_pct']:+8.1f}%"
                                     if "paged_vs_fp8_pct" in res
                                     else f"{'N/A':>9}")
@@ -671,7 +768,7 @@ def print_e2e_table(
                             speedup = f"{'N/A':>9}"
 
                         print(
-                            f"  {cfg:<54} {bf16_str} {bf16_tf} {fp8_str} {fp8_tf}"
+                            f"  {cfg:<70} {bf16_str} {bf16_tf} {fp8_str} {fp8_tf}"
                             f" {paged_str} {paged_tf} {paged_vs} {speedup}"
                         )
 
@@ -681,6 +778,8 @@ def print_e2e_table(
                             print(f"    FP8  ERROR: {res['fp8_error']}")
                         if "paged_error" in res:
                             print(f"    PAGED ERROR: {res['paged_error']}")
+                        if "input_error" in res:
+                            print(f"    INPUT ERROR: {res['input_error']}")
     print()
 
 
@@ -689,47 +788,40 @@ def print_e2e_table(
 # ---------------------------------------------------------------------------
 
 def check_accuracy(
-    batch_sizes, seqlens, nheads_list, headdims, window_sizes
+    batch_sizes, seqlens, nheads_list, headdims, cases
 ):
-    print("=" * 100)
+    print("=" * 120)
     print("ACCURACY CHECK  (FP8 quant_mode=2 vs BF16)")
-    print("=" * 100)
-    hdr = f"{'Config':<56} {'max_err':>10} {'mean_err':>10} {'cos_sim':>10} {'PASS?':>6}"
+    print("=" * 120)
+    hdr = f"{'Config':<72} {'max_err':>10} {'mean_err':>10} {'cos_sim':>10} {'PASS?':>6}"
     print(hdr)
     print("-" * len(hdr))
 
     all_pass = True
+    skipped = 0
     for bs in batch_sizes:
         for seqlen in seqlens:
             for nheads in nheads_list:
                 for headdim in headdims:
-                    for ws in window_sizes:
+                    for case in cases:
                         cfg = (f"bs={bs} seq={seqlen} h={nheads} "
-                               f"d={headdim} {_ws_str(ws)}")
+                               f"d={headdim} {case.label}")
                         try:
-                            q_bf16, k_bf16, v_bf16, cu_seqlens = make_bf16_inputs(
-                                bs, seqlen, nheads, headdim
-                            )
+                            inputs = make_case_inputs(bs, seqlen, nheads, headdim, case)
+                            bf16_reason = column_unsupported_reason("bf16", headdim, case)
+                            fp8_reason = column_unsupported_reason("fp8", headdim, case)
+                            if bf16_reason or fp8_reason:
+                                skipped += 1
+                                continue
                             # BF16 reference
-                            ref = run_kernel_bf16(
-                                q_bf16, k_bf16, v_bf16, cu_seqlens,
-                                seqlen, bs, ws
-                            ).float()
+                            ref = run_kernel_bf16(inputs).float()
 
                             # FP8 output
-                            (q_fp8, k_fp8, v_fp8,
-                             sf_q, sf_k, sf_v,
-                             q_dsc, k_dsc, v_dsc,
-                             cu_q_blk, cu_kv_blk, cu_v_blk,
-                             cu_seqlens2) = quantize_fp8_bs(
-                                q_bf16, k_bf16, v_bf16, bs, seqlen, nheads, headdim
+                            fp8_inputs = quantize_fp8_bs(
+                                inputs["q"], inputs["k"], inputs["v"],
+                                inputs["cu_q"], inputs["cu_k"], headdim, case.has_rab
                             )
-                            fp8_out = run_kernel_fp8bs(
-                                q_fp8, k_fp8, v_fp8, sf_q, sf_k, sf_v,
-                                q_dsc, k_dsc, v_dsc,
-                                cu_seqlens2, cu_q_blk, cu_kv_blk, cu_v_blk,
-                                seqlen, ws
-                            ).float()
+                            fp8_out = run_kernel_fp8bs(inputs, fp8_inputs).float()
 
                             max_err = (fp8_out - ref).abs().max().item()
                             mean_err = (fp8_out - ref).abs().mean().item()
@@ -741,15 +833,17 @@ def check_accuracy(
                             if not passed:
                                 all_pass = False
                             status = "PASS" if passed else "FAIL"
-                            print(f"  {cfg:<54} {max_err:10.5f} {mean_err:10.5f} {cos_sim:10.6f} {status:>6}")
+                            print(f"  {cfg:<70} {max_err:10.5f} {mean_err:10.5f} {cos_sim:10.6f} {status:>6}")
                         except Exception as e:
                             all_pass = False
-                            print(f"  {cfg:<54} ERROR: {e}")
+                            print(f"  {cfg:<70} ERROR: {e}")
     print()
     if all_pass:
         print("All accuracy checks PASSED.")
     else:
         print("Some accuracy checks FAILED!")
+    if skipped:
+        print(f"Skipped {skipped} unsupported accuracy configs listed in the startup summary.")
     print()
     return all_pass
 
@@ -786,11 +880,41 @@ def parse_args():
     )
     parser.add_argument(
         "--causal-only", action="store_true",
-        help="Only benchmark causal attention",
+        help="Only benchmark causal attention (alias for --mask-configs causal)",
     )
     parser.add_argument(
         "--full-only", action="store_true",
-        help="Only benchmark full attention",
+        help="Only benchmark full attention (alias for --mask-configs full)",
+    )
+    parser.add_argument(
+        "--mask-configs",
+        nargs="+",
+        default=["all"],
+        metavar="MASK",
+        help=(
+            "Mask configs to benchmark. Use 'all' or any of: "
+            f"{', '.join(MASK_CONFIGS)}. Default: all"
+        ),
+    )
+    parser.add_argument(
+        "--bias-configs",
+        nargs="+",
+        default=["all"],
+        metavar="BIAS",
+        help=(
+            "Bias configs to benchmark. Use 'all' or any of: "
+            f"{', '.join(BIAS_CONFIGS)}. Default: all"
+        ),
+    )
+    parser.add_argument(
+        "--columns",
+        nargs="+",
+        default=["all"],
+        metavar="COL",
+        help=(
+            "Output columns to time. Use 'all' or any of: "
+            f"{', '.join(COLUMNS)}. Default: all"
+        ),
     )
     parser.add_argument(
         "--warmup", type=int, default=WARMUP,
@@ -803,6 +927,17 @@ def parse_args():
     return parser.parse_args()
 
 
+def _expand_choices(name: str, values: Sequence[str], allowed: Sequence[str]) -> List[str]:
+    if "all" in values:
+        if len(values) > 1:
+            raise ValueError(f"--{name} cannot combine 'all' with explicit values")
+        return list(allowed)
+    bad = [v for v in values if v not in allowed]
+    if bad:
+        raise ValueError(f"invalid --{name} values {bad}; allowed: {list(allowed)}")
+    return list(values)
+
+
 def main():
     args = parse_args()
     check_sm120()
@@ -811,18 +946,28 @@ def main():
     WARMUP = args.warmup
     ITERS = args.iters
 
+    if args.causal_only and args.full_only:
+        raise ValueError("--causal-only and --full-only are mutually exclusive")
     if args.causal_only:
-        window_sizes = [(-1, 0)]
+        mask_configs = ["causal"]
     elif args.full_only:
-        window_sizes = [(-1, -1)]
+        mask_configs = ["full"]
     else:
-        window_sizes = [(-1, -1), (-1, 0)]
+        mask_configs = _expand_choices("mask-configs", args.mask_configs, MASK_CONFIGS)
+    bias_configs = _expand_choices("bias-configs", args.bias_configs, BIAS_CONFIGS)
+    columns = _expand_choices("columns", args.columns, COLUMNS)
+    cases = build_cases(mask_configs, bias_configs)
 
     print(f"Device: {torch.cuda.get_device_name(0)}")
     print(f"Capability: SM{torch.cuda.get_device_capability()[0]}"
           f"{torch.cuda.get_device_capability()[1]}")
     print(f"Warmup={WARMUP} Iters={ITERS}")
+    print(f"Mask configs={mask_configs}")
+    print(f"Bias configs={bias_configs}")
+    print(f"Columns={columns}")
+    print(f"Total logical configs={len(cases)}")
     print()
+    print_unsupported_summary(args.headdims, cases, columns)
 
     if args.mode in ("accuracy", "all"):
         # Use smaller config for accuracy check to save time
@@ -831,7 +976,7 @@ def main():
             seqlens=[128, 256, 512],
             nheads_list=[1, 4],
             headdims=args.headdims,
-            window_sizes=[(-1, -1)],
+            cases=cases,
         )
 
     if args.mode in ("kernel", "all"):
@@ -840,7 +985,8 @@ def main():
             seqlens=args.seqlens,
             nheads_list=args.nheads,
             headdims=args.headdims,
-            window_sizes=window_sizes,
+            cases=cases,
+            columns=columns,
         )
 
     if args.mode in ("e2e", "all"):
@@ -849,7 +995,8 @@ def main():
             seqlens=args.seqlens,
             nheads_list=args.nheads,
             headdims=args.headdims,
-            window_sizes=window_sizes,
+            cases=cases,
+            columns=columns,
         )
 
 

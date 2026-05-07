@@ -592,8 +592,8 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
                   bidh_kv, page_id * params.page_size, kBlockN, lane);
             } else {
               const int target_block = nb - n_block_paged;
-              const int target_start = binfo.sum_s_q + actual_seqlen_q - actual_seqlen_t
-                  + target_block * kBlockN;
+              const int target_start = binfo.sum_s_k + actual_seqlen_k - actual_seqlen_t
+                  + last_page_offset + target_block * kBlockN;
               const int rows_valid = std::max(0, std::min(kBlockN, actual_seqlen_t - target_block * kBlockN));
               const FP8Elem* src = reinterpret_cast<const FP8Elem*>(params.k_ptr)
                   + (int64_t)target_start * params.k_row_stride
@@ -643,8 +643,8 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
               }
             } else if (nb >= n_block_paged) {
               const int target_block = nb - n_block_paged;
-              const int target_start = binfo.sum_s_q + actual_seqlen_q - actual_seqlen_t
-                  + target_block * kBlockN;
+              const int target_start = binfo.sum_s_k + actual_seqlen_k - actual_seqlen_t
+                  + last_page_offset + target_block * kBlockN;
               const int rows_valid = std::max(0, std::min(kBlockN, actual_seqlen_t - target_block * kBlockN));
               const bool use_target_tma =
                   (rows_valid == kBlockN) && (target_start % kBlockN == 0);
@@ -750,8 +750,8 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
                   bidh_kv, page_id * params.page_size, kBlockN, lane);
             } else {
               const int target_block = nb - n_block_paged;
-              const int target_start = binfo.sum_s_q + actual_seqlen_q - actual_seqlen_t
-                  + target_block * kBlockN;
+              const int target_start = binfo.sum_s_k + actual_seqlen_k - actual_seqlen_t
+                  + last_page_offset + target_block * kBlockN;
               const int rows_valid = std::max(0, std::min(kBlockN, actual_seqlen_t - target_block * kBlockN));
               const FP8Elem* src = reinterpret_cast<const FP8Elem*>(params.v_ptr)
                   + (int64_t)target_start * params.v_row_stride
@@ -801,8 +801,8 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
               }
             } else if (nb >= n_block_paged) {
               const int target_block = nb - n_block_paged;
-              const int target_start = binfo.sum_s_q + actual_seqlen_q - actual_seqlen_t
-                  + target_block * kBlockN;
+              const int target_start = binfo.sum_s_k + actual_seqlen_k - actual_seqlen_t
+                  + last_page_offset + target_block * kBlockN;
               const int rows_valid = std::max(0, std::min(kBlockN, actual_seqlen_t - target_block * kBlockN));
               const bool use_target_tma =
                   (rows_valid == kBlockN) && (target_start % kBlockN == 0);
@@ -1472,10 +1472,14 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
             }
             const int block_col = int(get<Col>(coord));
             int col = block_col + base_col;
-            if constexpr (Paged_KV) {
-              const int row = block_row + m_block * kBlockM + actual_seqlen_offset;
-              if (row >= actual_seqlen_h) {
+            if constexpr (Paged_KV && Is_target) {
+              if (nb >= n_block_paged) {
                 col -= last_page_offset;
+              }
+            }
+            if constexpr (Paged_KV && Is_target) {
+              if (nb < n_block_paged && col >= actual_seqlen_h) {
+                continue;
               }
             }
             if (0 <= col && col < actual_seqlen_k) {
