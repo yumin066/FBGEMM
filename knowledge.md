@@ -28,6 +28,17 @@
 - hdim256 paged+RAB/DRAB 不走 paired persistent scheduler，保持 3D-grid WS。host launcher 和 device kernel 中的 `Use_paired_persistent` 条件必须同步，否则会出现 grid 语义不一致；examples 可能仍偶然通过，但调度是错误的。
 - SASS 状态：D=128 paged causal+RAB 为 `REG:168 STACK:0 LOCAL:0` 且无 `LDL/STL`；D=256 paged causal+RAB 为 `REG:168 STACK:8 LOCAL:0`，当前仍有 1 个 `STL` 和 1 个 `LDL`。尝试把 hdim256 RAB-add loop 改成 `#pragma unroll 1` 会恶化到 `STACK:128`，不要保留。
 
+## Phase 27 FP8 non-paged RAB/DRAB WS 实现结论
+
+- `headDim=128/256 + non-paged + RAB/DRAB` 已全量切到 FP8 WS TMA，覆盖 full、pure causal、context+causal、target+causal、local、arbitrary。
+- D=128 non-paged RAB/DRAB 从旧 BN128 cp.async fallback 改为 BN64 WS。Python `get_bm_and_bn_block_size_fwd(rab, 128)`、C++ `get_tile_size_fwd_sm120<128, Has_rab, fp8>` 和 WS specialization 必须保持 `{128,64,8}`，否则 V block-scale metadata 会和 kernel tile 不一致。
+- non-paged RAB WS 复用 paged RAB 的 direct global RAB add，不新增 RAB SMEM tile。RAB bias 在 GEMM1 后、mask/activation 前直接加到 `acc_s`。
+- scheduler 与 WS 条件一致：full RAB 对 D=128/D=256 走 full persistent；pure causal RAB 只有 D=128 走 paired persistent；D=256 pure causal RAB 和 context/target/local/arbitrary RAB 走 3D grid。
+- D=256 arbitrary+RAB/DRAB 切 WS 的理由是路径统一；同频 kernel-only recheck 中 WS `avg_ms=0.08997`，fallback `avg_ms=0.08974`，基本持平，不计作性能收益。
+- resource usage 状态：D=128 non-paged RAB WS 代表实例为 `REG:168 LOCAL:0`，当前扫描到的 non-paged 代表实例 `STACK:0`；D=256 non-paged RAB WS 代表实例均为 `REG:168 LOCAL:0`，full `STACK:0`，pure causal `STACK:16`，context `STACK:8`，target `STACK:24`，local `STACK:32`，arbitrary `STACK:16`。target/local 的 stack frame 是后续压 live range 的优先对象。
+- 同机 kernel-only 对照显示，D=256 non-arbitrary non-paged RAB WS 明显快于 fallback：`bs=2,seq=1024,h=4,d=256` full `0.0693ms vs 0.1111ms`，local `0.0583ms vs 0.0825ms`，context `0.1264ms vs 0.2118ms`，target `0.0798ms vs 0.1246ms`。arbitrary 基本持平，仅作为统一路径。D=128 RAB WS 如需性能结论，需要补同频 kernel-only 对照。
+- correctness：final build `1test_results/590_phase27_d128_d256_all_rab_ws_build.log`，examples `1test_results/590_phase27_d128_d256_all_rab_ws_examples.log` 为 `102/102 passed`，sweep `1test_results/590_phase27_d128_d256_all_rab_ws_sweep.log` 通过。
+
 ---
 
 ## Phase 25 FP8 headDim256 实现结论

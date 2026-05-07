@@ -1794,8 +1794,9 @@ void run_hstu_fwd_sm120(Hstu_fwd_params& params, cudaStream_t stream) {
   if constexpr (Is_fp8_type) {
     BOOL_SWITCH(params.is_paged_kv, Paged_KV, [&] {
       if constexpr (Paged_KV && Has_rab && kHeadDim == 128) {
-        // Non-paged FP8+RAB hdim128 uses kBlockN=128 in the cp.async
-        // fallback, but paged KV is page-size aligned and must use kBlockN=64.
+        // Paged FP8+RAB hdim128 is explicitly pinned to BN64/page_size64.
+        // Non-paged hdim128 RAB also uses BN64 WS, so wrapper metadata and
+        // kernel tile shape stay aligned.
         run_hstu_fwd_sm120_fp8_ws_tma_impl<
             elem_type, kHeadDim, 128, 64, 8,
             Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc, Has_rab,
@@ -1817,6 +1818,15 @@ void run_hstu_fwd_sm120(Hstu_fwd_params& params, cudaStream_t stream) {
               "SM120 FP8 WS blockscaled path currently requires headDim divisible by 128 with kBlockN64 or kBlockN divisible by 128, got headDim=",
               kHeadDim, ", kBlockN=", kBlockN);
         }
+      } else if constexpr (Has_rab && (kHeadDim == 128 || kHeadDim == 256)) {
+        static_assert(kBlockN == 64,
+            "SM120 FP8 hdim128/256 non-paged RAB WS path requires kBlockN=64");
+        // Hdim128/256 RAB/DRAB uses BN64 block-scale layout and direct global
+        // RAB add in the math fragment.
+        run_hstu_fwd_sm120_fp8_ws_tma_impl<
+            elem_type, kHeadDim, kBlockM, kBlockN, kNWarps,
+            Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc, Has_rab,
+            Paged_KV, Is_Q_in_regs, Share_Q_K_smem>(params, stream);
       } else if constexpr (!Has_rab) {
         if constexpr ((kHeadDim % 128 == 0 && kBlockN == 64) || (kBlockN % 128) == 0) {
           // WS TMA kernel: non-paged K/V use contiguous TMA; paged history K/V
@@ -1834,7 +1844,7 @@ void run_hstu_fwd_sm120(Hstu_fwd_params& params, cudaStream_t stream) {
         }
       } else {
         if constexpr ((kBlockN % 64) == 0) {
-          // cp.async fallback for non-paged Has_rab=true.
+          // Remaining FP8 Has_rab fallback for dimensions not yet enabled in WS.
           using Kernel_traits = Hstu_fwd_kernel_traits_sm120_fp8<
               kHeadDim, kBlockM, kBlockN, kNWarps,
               Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc, Has_rab,

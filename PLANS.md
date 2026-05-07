@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-当前主线处于 Phase 26：支持 SM120 FP8 paged KV cache 与 RAB/DRAB 组合。第一版 correctness 已打通：paged causal+RAB/DRAB 支持 D=128 和 D=256，local paged 仍保持明确 unsupported。
+当前主线处于 Phase 27：逐步将 SM120 FP8 non-paged RAB/DRAB 切到 WS。当前已完成 `headDim=128/256 + non-paged + RAB/DRAB` 全配置：full、pure causal、context+causal、target+causal、local、arbitrary 默认走 FP8 WS TMA；D=128 RAB 已从旧 BN128 fallback 切到 BN64 WS。
 
 Phase 25 的 SM120 forward headDim256 已完成第一阶段支持。FP8 hdim256 correctness 路径已打通，pure non-paged causal 的 residual register spill 已清理；验收覆盖当前 hdim128 已支持的 FP8 non-paged 配置组合，以及当前 hdim128 paged KV 已支持的 full、causal、context+causal、target+causal、arbitrary 组合。
 
@@ -24,6 +24,40 @@ Phase 25 的 SM120 forward headDim256 已完成第一阶段支持。FP8 hdim256 
 - Phase 24：`run_hstu8_examples.sh` 的 paged mirror 最新日志 `1test_results/456_phase24_paged_mirror_examples_final.log` 为 `31/31 passed`；`sweep_accuracy.py` paged mirror 最新日志 `1test_results/455_phase24_paged_mirror_sweep.log` 通过。
 - Phase 25 hdim256 已接入：SM120 编译/dispatch/runtime guard 支持 hdim256，FP8 WS 使用 `{kBlockM=128,kBlockN=64,kHeadDim=256}`；correctness 和 SASS 日志见 Phase 25 记录。
 - Phase 26 paged RAB/DRAB 已接入：paged causal+RAB/DRAB examples 对 D=128/D=256、seq=128/256 全部通过；RAB bias 在 WS math fragment 中从 global RAB tensor 直接加到 `acc_s`，不新增 RAB SMEM tile。D=128 paged causal+RAB SASS 为 `REG:168 STACK:0 LOCAL:0` 且无 `LDL/STL`；D=256 paged causal+RAB 为 `REG:168 STACK:8 LOCAL:0`，有 1 个 `STL` 和 1 个 `LDL`，作为残余风险记录。
+- Phase 27 non-paged RAB/DRAB WS 当前版已接入：D=128/D=256 full、pure causal、context+causal、target+causal、local、arbitrary non-paged RAB/DRAB 走 WS TMA，correctness 通过。`bs=2,seq=1024,h=4,d=256` kernel-only latency 相比 fallback：full `0.0693ms vs 0.1111ms`，local `0.0583ms vs 0.0825ms`，context `0.1264ms vs 0.2118ms`，target `0.0798ms vs 0.1246ms`；arbitrary WS 与 fallback 基本持平，用于统一路径。
+
+## Phase 27：non-paged RAB/DRAB 逐步切到 WS
+
+目标：在不破坏现有 no-RAB 和 paged RAB 路径的前提下，把 non-paged FP8 RAB/DRAB 从 cp.async fallback 逐步迁移到 WS TMA。
+
+当前状态：
+
+- 已完成 D=128/D=256 全配置：full、pure causal、context+causal、target+causal、local、arbitrary + non-paged + RAB/DRAB 走 FP8 WS TMA。
+- `headDim=128 + non-paged + RAB/DRAB` 已从旧 BN128 cp.async fallback 切到 BN64 WS。Python `get_bm_and_bn_block_size_fwd(rab, 128)`、C++ `get_tile_size_fwd_sm120<128, Has_rab, fp8>` 和 WS specialization 都必须保持 `{128,64,8}`。
+- `headDim=256 + arbitrary + non-paged + RAB/DRAB` 也走 WS；同频 kernel-only 对照显示 WS 与 fallback 基本持平，因此该项属于路径统一，不作为性能收益来源。
+- WS RAB 实现复用 Phase 26 的 direct global RAB add：GEMM1 后、mask/activation 前，根据 fragment identity 坐标从 global BF16 RAB 加到 `acc_s`，不新增 RAB SMEM tile。
+- scheduler 与 WS 条件一致：full RAB 对 D=128/D=256 走 full persistent；pure causal RAB 只有 D=128 走 paired persistent；D=256 pure causal RAB 和 context/target/local/arbitrary RAB 走 3D grid。
+
+验证记录：
+
+- final build：`1test_results/590_phase27_d128_d256_all_rab_ws_build.log`。
+- examples：`1test_results/590_phase27_d128_d256_all_rab_ws_examples.log`，`102/102 passed`。
+- sweep：`1test_results/590_phase27_d128_d256_all_rab_ws_sweep.log` 通过。
+- resource usage：`1test_results/590_phase27_d128_d256_all_rab_ws_resource.log` 和 `1test_results/590_phase27_d128_rab_ws_resource.log`。D=128 non-paged RAB WS 代表实例为 `REG:168 LOCAL:0`，当前扫描到的 non-paged 代表实例 `STACK:0`；D=256 non-paged RAB WS 代表实例均为 `REG:168 LOCAL:0`，full `STACK:0`，pure causal `STACK:16`，context `STACK:8`，target `STACK:24`，local `STACK:32`，arbitrary `STACK:16`。
+- kernel-only 对照：
+  - WS：`2benchmark_results/586_phase27_d256_nonarbitrary_rab_ws_kernel_only.log`
+  - fallback：`2benchmark_results/587_phase27_d256_rab_fallback_kernel_only.log`
+  - `bs=2,seq=1024,h=4,d=256 full`：WS `0.0693ms`，fallback `0.1111ms`。
+  - `bs=2,seq=1024,h=4,d=256 local`：WS `0.0583ms`，fallback `0.0825ms`。
+  - `bs=2,seq=1024,h=4,d=256 context`：WS `0.1264ms`，fallback `0.2118ms`。
+  - `bs=2,seq=1024,h=4,d=256 target`：WS `0.0798ms`，fallback `0.1246ms`。
+  - `bs=2,seq=1024,h=4,d=256 arbitrary`：此前 fallback 约 `0.0897ms`；当前切到 WS 是路径统一，非主要性能收益来源。
+
+剩余风险：
+
+- 新 WS specialization 仍有 stack frame，尤其 target/local；需要后续继续压 live range，并补 SASS `LDL/STL` dump 做最终提交前检查。
+- e2e quick timing 对 full/local 会被 Python wrapper 和量化开销稀释，不应用来否定 kernel-only 收益；性能判断以 kernel-only 对照为准。
+- hdim128 non-paged RAB/DRAB 已切到 WS；后续若关注性能，需要补 D=128 RAB kernel-only 同频对照。
 
 ## Phase 26：SM120 FP8 paged KV + RAB/DRAB
 
@@ -32,8 +66,8 @@ Phase 25 的 SM120 forward headDim256 已完成第一阶段支持。FP8 hdim256 
 当前状态：
 
 - 已移除 Python wrapper、`hstu_varlen_fwd_120` host guard 和 FP8 dispatch 中对 paged+RAB 的拒绝。
-- paged+RAB/DRAB 走 FP8 WS TMA kernel；non-paged RAB/DRAB 仍保留原 non-WS cp.async fallback。
-- hdim128 paged+RAB 需要强制使用 `kBlockN=64`，不能沿用 non-paged hdim128 RAB fallback 的 `kBlockN=128`。Python block-scale wrapper 在 paged KV 下以 `kv_cache.shape[2]` 作为 BN；C++ dispatch 对 `Paged_KV && Has_rab && kHeadDim==128` 显式实例化 `{kBlockM=128,kBlockN=64,kNWarps=8}`。
+- paged+RAB/DRAB 走 FP8 WS TMA kernel；Phase 27 后 D=128/D=256 non-paged RAB/DRAB 全配置也已切到 WS。
+- hdim128 RAB 需要强制使用 `kBlockN=64`，不能沿用旧 non-paged hdim128 RAB fallback 的 `kBlockN=128`。Python block-scale wrapper 对 `rab is not None && dim == 128` 返回 BN64；paged KV 下继续以 `kv_cache.shape[2]` 作为 BN。
 - WS math 路径新增 `add_rab_bs`：GEMM1 后、mask/activation 前，用 fragment identity 坐标把 BF16 RAB bias 直接从 global tensor 加到 `acc_s`。该方案不占用额外 SMEM，避免 hdim256 paged 路径超过 SM120 dynamic SMEM limit。
 - hdim256 paged+RAB/DRAB 不走 paired persistent scheduler，保持 3D-grid WS，避免 persistent wrapper 进一步扩大 live range；host 和 device 两侧 `Use_paired_persistent` 条件必须保持一致。
 - `run_hstu8_examples.sh` 不再把 paged RAB/DRAB 标记为 unsupported；local paged 仍为 `PASS-UNSUPPORTED`。
@@ -423,7 +457,7 @@ Phase 20 的 `kBlockM=256` 路线暂时搁置。
 - 重新编译 HSTU extension。
 - `HSTU_SWEEP_FP8_QUANT_MODE=2 python sweep_accuracy.py`，要求 `fp8_gt_cos >= 0.995`，理想值 `>= 0.9996`。
 - BF16 相关改动运行 `hstu_test.py` 的 `HSTU16Test` 定向用例，至少覆盖 aligned WS 场景和不对齐 fallback 场景。
-- FP8 相关改动运行 `bash run_hstu8_examples.sh`，要求全脚本通过；Phase 26 当前口径为 `62/62 passed`，其中 paged causal+RAB/DRAB 必须真实运行通过，local paged mirror 应为明确的 `PASS-UNSUPPORTED`。
+- FP8 相关改动运行 `bash run_hstu8_examples.sh`，要求全脚本通过；Phase 27 当前口径为 `102/102 passed`，其中 D=128/D=256 non-paged RAB/DRAB extra cases 必须通过，paged causal+RAB/DRAB 必须真实运行通过，local paged mirror 应为明确的 `PASS-UNSUPPORTED`。
 - paged KV 相关改动运行 SM120 FP8 paged KV 定向测试，至少覆盖 `page_size == kBlockN`、full、causal、last page 非满、target length 为 0 和非 0。
 - Phase 25 hdim256 相关改动必须额外覆盖 BF16 hdim256 full/causal、FP8 hdim256 当前 hdim128 已支持的全部 non-paged/paged 配置组合，以及 same-input paged vs non-paged 对照。
 

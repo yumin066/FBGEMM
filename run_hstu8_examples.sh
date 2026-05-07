@@ -124,6 +124,37 @@ for dim in (128, 256):
         cases.append(kw_dim)
         labels.append(f'D={dim} {label}')
 
+NONPAGED_EXTRA_CASES = []
+for dim in (128, 256):
+    for seq in (128, 256):
+        extra_specs = [
+            ('full', 0, (0, (-1, -1), 1, False)),
+            ('local', 0, (0, (seq // 2, 16), 1, False)),
+            ('context+causal', seq, (0, (-1, 0), 1, False)),
+            ('target+causal', 0, (seq, (-1, 0), 1, False)),
+            ('arbitrary', 0, (0, (-1, -1), 1, True)),
+        ]
+        for tag, max_context_len, target_params in extra_specs:
+            for rab_tag, rab_params in (
+                ('rab', (True, False, None)),
+                ('drab', (True, True, None)),
+            ):
+                NONPAGED_EXTRA_CASES.append((
+                    f'D={dim} seq={seq} {tag}+{rab_tag}',
+                    dict(
+                        batch_size=4,
+                        heads=1,
+                        seq_len_params=(seq, seq),
+                        max_context_len=max_context_len,
+                        target_params=target_params,
+                        attn_hidden_dims=(dim, dim),
+                        alpha=1.0,
+                        rab_params=rab_params,
+                        dtype=torch.float8_e4m3fn,
+                        quant_mode_full_batch=(2, True),
+                    ),
+                ))
+
 def metric_report(a, b):
     diff = (a.float() - b.float()).abs()
     cos = float(torch.nn.functional.cosine_similarity(
@@ -525,6 +556,16 @@ for i, (kw, label) in enumerate(zip(cases, labels)):
     sys.stdout.flush()
 
 case_id = len(cases)
+for label, kw in NONPAGED_EXTRA_CASES:
+    case_id += 1
+    try:
+        inner(t, **kw)
+        print(f'case {case_id:2d} PASS  [nonpaged extra {label}]')
+        passed += 1
+    except Exception as e:
+        print(f'case {case_id:2d} FAIL  [nonpaged extra {label}] -- {e}')
+    sys.stdout.flush()
+
 for label, kw in PAGED_CASES:
     case_id += 1
     try:
@@ -567,7 +608,7 @@ for label, kw in PAGED_FULL_CASES:
         print(f'case {case_id:2d} FAIL  [{label}] -- {e}')
     sys.stdout.flush()
 
-total = len(cases) + len(PAGED_CASES) + len(PAGED_FULL_CASES)
+total = len(cases) + len(NONPAGED_EXTRA_CASES) + len(PAGED_CASES) + len(PAGED_FULL_CASES)
 print(f'\nResult: {passed}/{total} passed')
 sys.exit(0 if passed == total else 1)
 PYEOF

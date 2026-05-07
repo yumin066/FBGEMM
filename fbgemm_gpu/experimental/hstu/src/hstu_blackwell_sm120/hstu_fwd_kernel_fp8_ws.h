@@ -225,8 +225,11 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
 
   static_assert(Kernel_traits::Is_fp8, "Phase 6 WS: FP8 path only");
   static_assert(
-      !Kernel_traits::Has_rab || Kernel_traits::Paged_KV,
-      "FP8 WS RAB/DRAB is currently only enabled for paged KV");
+      !Kernel_traits::Has_rab ||
+          Kernel_traits::Paged_KV ||
+          Kernel_traits::kHeadDim == 128 ||
+          Kernel_traits::kHeadDim == 256,
+      "FP8 WS non-paged RAB/DRAB is currently only enabled for hdim128/256");
   static_assert(
       !(Use_full_persistent && Use_paired_persistent),
       "Only one FP8 WS persistent scheduler can be enabled");
@@ -1457,7 +1460,6 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
               + params.seqlen_k_rounded * actual_seqlen_offset;
           const RabElement* rab_ptr =
               reinterpret_cast<const RabElement*>(params.rab_ptr) + rab_offset;
-          const int base_row = m_block * kBlockM + actual_seqlen_offset;
           const int base_col = nb * kBlockN;
 
           CUTE_UNROLL
@@ -1468,11 +1470,13 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
             if (q_idx >= actual_seqlen_q) {
               continue;
             }
-            const int row = block_row + base_row;
             const int block_col = int(get<Col>(coord));
             int col = block_col + base_col;
-            if (Paged_KV && row >= actual_seqlen_h) {
-              col -= last_page_offset;
+            if constexpr (Paged_KV) {
+              const int row = block_row + m_block * kBlockM + actual_seqlen_offset;
+              if (row >= actual_seqlen_h) {
+                col -= last_page_offset;
+              }
             }
             if (0 <= col && col < actual_seqlen_k) {
               tSrS(flat) += static_cast<float>(

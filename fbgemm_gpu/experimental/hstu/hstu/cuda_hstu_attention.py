@@ -268,7 +268,7 @@ def get_bm_and_bn_block_size_fwd(rab, dim):
         if dim == 64:
             return 128, 64   # kBlockM=128, kBlockN=64 (utils.h: {128, 64, 4} for FP8+rab+hdim64)
         elif dim == 128:
-            return 128, 128  # kBlockM=128, kBlockN=128 (utils.h: {128, 128, 8} for FP8+rab+hdim128)
+            return 128, 64   # kBlockM=128, kBlockN=64 (utils.h: {128, 64, 8} for FP8+rab+hdim128 WS)
         else:
             return 128, 64   # kBlockM=128, kBlockN=64 (utils.h: {128, 64, 8} for FP8+rab+hdim>128)
     else:

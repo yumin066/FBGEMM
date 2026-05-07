@@ -27,6 +27,7 @@
 
 当前工作焦点：
 
+- Phase 27：逐步将 SM120 FP8 non-paged RAB/DRAB 切到 WS。当前已完成 D=128/D=256 non-paged RAB/DRAB 全配置：full、pure causal、context+causal、target+causal、local、arbitrary 都走 FP8 WS TMA；D=128 RAB 已改用 `kBlockN=64`。
 - Phase 26：支持 SM120 FP8 paged KV cache 与 RAB/DRAB 配置。paged causal+RAB/DRAB 已支持 D=128/D=256；local paged 仍按 `PASS-UNSUPPORTED` 处理。
 - Phase 25：SM120 headDim256 forward 已接入；FP8 hdim256 correctness 路径已打通，pure non-paged causal residual register spill 已清理。
 - BF16 hdim256 作为 correctness/dispatch 基线；backward 不进第一阶段。
@@ -55,7 +56,7 @@ FP8 paged KV Phase 24/26 稳定基线：
 - kernel benchmark `176` 显示 36 个 paged causal case 相比旧 benchmark `175` 平均 latency 提升约 `62%`，`seq>=1024` 平均提升约 `110%`；paged 相对 non-paged FP8 差距从约 `-58.8%` 收敛到约 `-14.2%`。
 - kernel benchmark `181` 的 paged TMA + SF TMA 版相对 `176` cp.async paged：`seq>=1024` 平均 paged TFLOPS 提升约 `+4.42%`，`seq>=4096` 提升约 `+6.27%`；paged 相对 non-paged FP8 的 `seq>=4096` 平均差距约 `-8.52%`。
 - full paged KV 已接入同一 paged TMA history 路径：correctness 日志为 `1test_results/447_phase24_paged_full_guard_sweep.log` 和 `448_phase24_paged_full_guard_examples.log`，后者为 `31/31 passed`。公平误差对比应使用 dequantized FP8/e8m0 reference；`1test_results/449_phase24_paged_fair_ref_sweep.log` 显示 paged causal/full `cos=0.9996~0.9997`，`450_phase24_paged_fair_ref_edges.log` 显示 partial page/target/full edge `cos>=0.99962`。same-input 对照 `451_phase24_paged_same_input_sweep.log` 用同一份 raw Q/K/V 和同一 FP8 block scale 构造 non-paged 与 paged，full/causal 的 `max_err=0`。benchmark `182` 显示 full paged 相对 non-paged FP8：全部 36 个 full case 平均 `-3.0%`，`seq>=1024` 平均 `-0.1%`，`seq>=4096` 平均 `+1.5%`；causal paged 仍平均约 `-8.2%`。
-- `run_hstu8_examples.sh` 已把原 14 个 non-paged example 逐个镜像到 paged KV，并覆盖 D=128/D=256。Phase 26 后 causal+RAB/DRAB 是真实运行通过，local 仍由 SM120 FP8 paged window guard 标为 `PASS-UNSUPPORTED`。最新日志 `1test_results/578_phase26_paged_rab_examples.log` 为 `62/62 passed`。`sweep_accuracy.py` 的最新日志 `1test_results/578_phase26_paged_rab_sweep.log` 通过，same-input full/causal 仍为 `max_err=0`。
+- `run_hstu8_examples.sh` 已把原 14 个 non-paged example 逐个镜像到 paged KV，并覆盖 D=128/D=256。Phase 27 后额外覆盖 D=128/D=256 non-paged full/local/context/target/arbitrary + RAB/DRAB；local paged 仍由 SM120 FP8 paged window guard 标为 `PASS-UNSUPPORTED`。最新日志 `1test_results/590_phase27_d128_d256_all_rab_ws_examples.log` 为 `102/102 passed`；`sweep_accuracy.py` 最新日志 `1test_results/590_phase27_d128_d256_all_rab_ws_sweep.log` 通过。
 - paged causal TMA SASS：`4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_paged_causal_tma_sf_tma.sass` 含 `UTMALDG.4D`，资源为 `REG:168 STACK:0 LOCAL:0`，无 `LDL/STL` 命中；`UTMALDG` 计数为 `10`，包含 paged K/V 和 SFB/SFV TMA。
 - 剩余差距主要来自 page-id/descriptor 额外控制流、paged target tail guarded copy，以及小 seq 下 page TMA descriptor 固定开销。
 
@@ -73,11 +74,20 @@ FP8 headDim256 Phase 25 当前状态：
 
 FP8 paged RAB/DRAB Phase 26 当前状态：
 
-- paged+RAB/DRAB 走 FP8 WS TMA kernel；non-paged RAB/DRAB 仍保留 non-WS cp.async fallback。
-- hdim128 paged+RAB 必须使用 `kBlockN=64`，不能沿用 non-paged hdim128 RAB fallback 的 `kBlockN=128`；Python block-scale wrapper 在 paged KV 下以 `kv_cache.shape[2]` 作为 BN，C++ dispatch 对 `Paged_KV && Has_rab && kHeadDim==128` 显式实例化 `{128,64,8}`。
+- paged+RAB/DRAB 走 FP8 WS TMA kernel；Phase 27 后 D=128/D=256 non-paged RAB/DRAB 全配置也走 FP8 WS TMA。
+- hdim128 RAB 必须使用 `kBlockN=64`，不能沿用旧 non-paged hdim128 RAB fallback 的 `kBlockN=128`；Python block-scale wrapper 对 `rab is not None && dim == 128` 返回 BN64，paged KV 下也继续以 `kv_cache.shape[2]` 作为 BN。
 - RAB/DRAB bias 在 GEMM1 后、mask/activation 前由 math warp 直接从 global BF16 RAB tensor 加到 `acc_s`，不额外占用 SMEM。
 - hdim256 paged+RAB/DRAB 当前不走 paired persistent scheduler，保持 3D-grid WS；host 端和 device kernel 端的 `Use_paired_persistent` 条件必须同步。
 - SASS：`I128_paged_causal_rab` 为 `REG:168 STACK:0 LOCAL:0`，无 `LDL/STL`；`I256_paged_causal_rab` 为 `REG:168 STACK:8 LOCAL:0`，有 1 个 `STL` 和 1 个 `LDL`。尝试将 hdim256 RAB-add loop 改为 `#pragma unroll 1` 会恶化到 `STACK:128`，不保留。
+
+FP8 non-paged RAB/DRAB Phase 27 当前状态：
+
+- D=128/D=256 non-paged RAB/DRAB 已切到 FP8 WS TMA，覆盖 full、pure causal、context+causal、target+causal、local、arbitrary，使用 `{kBlockM=128,kBlockN=64,kNWarps=8}` 和 direct global RAB add。
+- D=128 non-paged RAB/DRAB 的 V block-scale BN 已从旧 fallback 的 128 改为 64；Python wrapper、C++ tile-size 和 WS specialization 必须保持一致。
+- Scheduler 口径：full RAB 对 D=128/D=256 使用 full persistent；pure causal RAB 只有 D=128 使用 paired persistent；D=256 pure causal RAB 和 context/target/local/arbitrary RAB 使用 3D grid。
+- D=256 arbitrary + non-paged RAB/DRAB 也切到 WS；同频 kernel-only 对照中 WS 与 fallback 基本持平，因此这是路径统一改动，不是性能优化改动。
+- Resource usage：D=128 non-paged RAB WS 代表实例为 `REG:168 LOCAL:0`，当前扫描到的 non-paged 代表实例 `STACK:0`；D=256 non-paged RAB WS 代表实例为 `REG:168 LOCAL:0`，full `STACK:0`，pure causal `STACK:16`，context `STACK:8`，target `STACK:24`，local `STACK:32`，arbitrary `STACK:16`。资源日志见 `1test_results/590_phase27_d128_d256_all_rab_ws_resource.log` 和 `1test_results/590_phase27_d128_rab_ws_resource.log`。
+- Kernel-only 对照日志：WS `2benchmark_results/586_phase27_d256_nonarbitrary_rab_ws_kernel_only.log`，fallback `2benchmark_results/587_phase27_d256_rab_fallback_kernel_only.log`。`bs=2,seq=1024,h=4,d=256` latency：full `0.0693ms vs 0.1111ms`，local `0.0583ms vs 0.0825ms`，context `0.1264ms vs 0.2118ms`，target `0.0798ms vs 0.1246ms`。arbitrary 切 WS 是路径统一；此前同形状 fallback 约 `0.0897ms`，WS 无明确性能收益但也未观察到实质损失。
 
 ## 核心路径
 
@@ -165,7 +175,7 @@ example cases：
 bash /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/run_hstu8_examples.sh
 ```
 
-该脚本覆盖原 14 个 HSTU8/FP8 block-scale non-paged 示例，并追加 paged KV mirror/full/edge。Phase 25 后同一套语义同时覆盖 D=128 和 D=256；Phase 26 后 paged causal+RAB/DRAB 也应真实运行通过，local paged 仍标为 `PASS-UNSUPPORTED`。当前判定标准为全脚本通过，最新日志 `1test_results/578_phase26_paged_rab_examples.log` 为 `62/62 passed`。该脚本不替代 BF16 的 `HSTU16Test`。
+该脚本覆盖原 14 个 HSTU8/FP8 block-scale non-paged 示例，并追加 paged KV mirror/full/edge。Phase 25 后同一套语义同时覆盖 D=128 和 D=256；Phase 26 后 paged causal+RAB/DRAB 也应真实运行通过，local paged 仍标为 `PASS-UNSUPPORTED`。Phase 27 后额外覆盖 D=128/D=256 non-paged full/local/context/target/arbitrary + RAB/DRAB。当前判定标准为全脚本通过，最新日志 `1test_results/590_phase27_d128_d256_all_rab_ws_examples.log` 为 `102/102 passed`。该脚本不替代 BF16 的 `HSTU16Test`。
 
 benchmark：
 
@@ -195,7 +205,7 @@ cd /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu
 
 SASS 中重点搜索 `LDL`/`STL` 以定位 register spill。
 
-Phase 23 FP8 WS SASS 参考保留在 `PLANS.md` 的 Phase 23 验证记录中。当前仍以 `REG:168 STACK:0 LOCAL:0`、无 `LDL/STL` 作为 FP8 WS 稳定基线；任何新 specialization，尤其是 hdim256 和 paged RAB/DRAB，都必须重新 dump SASS 检查 spill。当前 hdim256 full、causal、paged full、paged causal 代表实例已达到无 spill；hdim256 paged causal+RAB 仍有 `STACK:8` 和 1 对 `STL/LDL`，需要作为残余风险看待。
+Phase 23 FP8 WS SASS 参考保留在 `PLANS.md` 的 Phase 23 验证记录中。当前仍以 `REG:168 STACK:0 LOCAL:0`、无 `LDL/STL` 作为 FP8 WS 稳定基线；任何新 specialization，尤其是 hdim256 和 RAB/DRAB，都必须重新 dump SASS 检查 spill。当前 hdim256 full、causal、paged full、paged causal 代表实例已达到无 spill；hdim256 paged causal+RAB 仍有 `STACK:8` 和 1 对 `STL/LDL`，hdim256 non-paged causal+RAB 仍有 `STACK:16` 和 12 条 `LDL/STL`，需要作为残余风险看待。
 
 ## 性能分析重点
 

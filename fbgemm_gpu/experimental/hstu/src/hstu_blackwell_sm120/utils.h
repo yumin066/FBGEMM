@@ -70,9 +70,9 @@ constexpr std::tuple<int, int, int> get_tile_size_fwd_sm120() {
       if constexpr (Headdim <= 64) {
         return {128, 64, 4};
       } else if constexpr (Headdim == 128) {
-        // kNWarps=8 → 256 threads matches SM120BlockScaledBuilder::kNumMathThreads=256
-        // assert(16 * kNWarps <= kBlockM): 16*8=128 <= 128 ✓
-        return {128, 128, 8};
+        // Use BN64 so non-paged RAB/DRAB can share the WS TMA path with paged
+        // KV and hdim256 RAB; V block-scale metadata must match this tile size.
+        return {128, 64, 8};
       } else {
         return {128, 64, 8};
       }
