@@ -22,6 +22,19 @@
 
 ---
 
+## Phase 25 FP8 headDim256 实现结论
+
+- SM120 FP8 hdim256 当前采用 `{kBlockM=128,kBlockN=64,kHeadDim=256,kNWarps=8}`。`kBlockN=64` 保持现有 AtomLayout `<8,1,1>` 和 GEMM2 A 直接寄存器路径，不需要把 `nBlockM` 降到 64。
+- Q/K block-scale 不能把 hdim128 的 single-scale layout 简单扩展为多行 scale。当前 kernel 侧仍期望每 token 一个 int32；hdim256 时该 int32 的 lane0/lane1 分别存两个 128-D chunk 的 e8m0 scale，hdim128 则继续把同一个 scale replicate 到 4 个 lane。
+- hdim256 GEMM1 分两个 128-D chunk 执行：每个 chunk 读取对应 Q/K fragment 和对应 SFA/SFB lane，然后累加到同一个 `acc_s`。因此 K stage 的 `k_empty` release 必须放在两个 chunk 的 GEMM1 完成之后；否则 load warp 可能覆盖当前 K stage，paged multi-page/random data 会出现错误。
+- paged hdim256 target tail 若是完整且按 `kBlockN` 对齐的 block，可以直接复用 contiguous K/V TMA 和 SFB/SFV TMA；只有 partial 或不对齐 target tail 才需要 guarded copy fallback。否则 hdim256 target random-data case 会与 non-paged 不一致。
+- hdim256 arbitrary 会因为 `ValidBlockIds` 加上双 K/V stage 超过 SM120 dynamic SMEM opt-in limit。当前解决方式是 hdim256 arbitrary 使用 single K/V stage，stage1 alias stage0，并禁止 load/math stage 翻转。
+- Phase 25 spill-fix 后 correctness 日志：build `1test_results/553_phase25_hdim256_spill_final_rebuild.log`，examples `1test_results/553_phase25_hdim256_spill_final_examples.log` 为 `62/62 passed`，sweep `1test_results/553_phase25_hdim256_spill_final_sweep.log` 通过且 D=256 same-input paged full/causal `max_err=0`，BF16 hdim256 directed full/causal `1test_results/542_phase25_bf16_hdim256_directed.log` 通过。
+- hdim256 pure non-paged causal 的 spill 来源不是 `__launch_bounds__` 本身，而是 paired persistent wrapper 与 hdim256 causal math body 的 live range 叠加。保留 `__launch_bounds__(...,1)`，但让 hdim256 non-paged causal 回到普通 3D grid，并把 masked/unmasked 双实例改为 runtime mask 单体 N-loop，可把 `I256_causal` 从 `STACK:16`、15 条 `LDL/STL` 降到 `REG:168 STACK:0 LOCAL:0`、`LDL=0/STL=0`。
+- hdim256 不启用 in-mainloop O-store；该优化对 hdim128 causal 有收益，但 hdim256 下会扩大 mainloop live range。当前 `I256_full`、`I256_causal`、`I256_paged_full`、`I256_paged_causal` 代表实例均为 `REG:168 STACK:0 LOCAL:0` 且无 `LDL/STL`。
+
+---
+
 ## 18. WS 分支同步死锁排查（`__syncthreads` vs `bar.sync`）
 
 **场景**：在 FP8 WS kernel 中，为了做 Q 持久化复制，在 math 分支新增了一个 `__syncthreads()`，结果 `seq=128/256` 可跑，`seq=512` 卡死。

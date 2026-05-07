@@ -76,20 +76,20 @@ __device__ __forceinline__ void cp_async_cg_16B(
       : : "r"(smem_addr), "l"(gmem_addr) : "memory");
 }
 
-template <typename FP8Elem>
+template <typename FP8Elem, int kHeadDim>
 __device__ __forceinline__ void copy_fp8_tile_rowmajor_to_sw128(
     FP8Elem* __restrict__ dst_smem,
     const FP8Elem* __restrict__ src_gmem,
     int64_t src_row_stride,
     int rows_valid,
     int lane) {
-  constexpr int kHeadDim = 128;
   constexpr int kVecElems = 16;
   constexpr int kVecsPerRow = kHeadDim / kVecElems;
   static_assert(sizeof(FP8Elem) == 1, "FP8 paged copy expects 1-byte elements");
   using Vec = uint4;
   const Vec zero = make_uint4(0, 0, 0, 0);
 
+  int issued_in_group = 0;
   for (int vec = lane; vec < rows_valid * kVecsPerRow; vec += 32) {
     const int row = vec / kVecsPerRow;
     const int d = (vec - row * kVecsPerRow) * kVecElems;
@@ -97,9 +97,16 @@ __device__ __forceinline__ void copy_fp8_tile_rowmajor_to_sw128(
     cp_async_cg_16B(
         dst_smem + row * kHeadDim + swizzled_d,
         src_gmem + row * src_row_stride + d);
+    if (++issued_in_group == 8) {
+      asm volatile("cp.async.commit_group;\n" : : : "memory");
+      asm volatile("cp.async.wait_group 0;\n" : : : "memory");
+      issued_in_group = 0;
+    }
   }
-  asm volatile("cp.async.commit_group;\n" : : : "memory");
-  asm volatile("cp.async.wait_group 0;\n" : : : "memory");
+  if (issued_in_group != 0) {
+    asm volatile("cp.async.commit_group;\n" : : : "memory");
+    asm volatile("cp.async.wait_group 0;\n" : : : "memory");
+  }
   asm volatile("fence.proxy.async.shared::cta;\n" : : : "memory");
 
   for (int vec = lane + rows_valid * kVecsPerRow; vec < 64 * kVecsPerRow; vec += 32) {
@@ -432,11 +439,15 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       constexpr int kSmemKVElems = kBlockN * kHeadDim;
       FP8Elem* const sK_base[2] = {
           reinterpret_cast<FP8Elem*>(smem_q),
-          reinterpret_cast<FP8Elem*>(smem_q) + 2 * kSmemKVElems
+          Kernel_traits::kUseSingleKVStage
+              ? reinterpret_cast<FP8Elem*>(smem_q)
+              : reinterpret_cast<FP8Elem*>(smem_q) + 2 * kSmemKVElems
       };
       FP8Elem* const sVt_base[2] = {
           reinterpret_cast<FP8Elem*>(smem_q) + kSmemKVElems,
-          reinterpret_cast<FP8Elem*>(smem_q) + 3 * kSmemKVElems
+          Kernel_traits::kUseSingleKVStage
+              ? reinterpret_cast<FP8Elem*>(smem_q) + kSmemKVElems
+              : reinterpret_cast<FP8Elem*>(smem_q) + 3 * kSmemKVElems
       };
 
       // q_tma_mbar_ptr is initialized with the other WS mbarriers above.
@@ -569,7 +580,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
               const FP8Elem* src = reinterpret_cast<const FP8Elem*>(params.kv_cache_ptr)
                   + (int64_t)page_id * params.kv_cache_kvtensor_stride
                   + (int64_t)bidh_kv * params.kv_cache_row_stride;
-              copy_fp8_tile_rowmajor_to_sw128(
+              copy_fp8_tile_rowmajor_to_sw128<FP8Elem, kHeadDim>(
                   dst, src, params.kv_cache_head_stride, kBlockN, lane);
               copy_packed_sf_tile(
                   sf_dst, params.sf_k_packed_ptr, params.kv_block_descale_head_stride,
@@ -582,7 +593,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
               const FP8Elem* src = reinterpret_cast<const FP8Elem*>(params.k_ptr)
                   + (int64_t)target_start * params.k_row_stride
                   + (int64_t)bidh_kv * params.k_head_stride;
-              copy_fp8_tile_rowmajor_to_sw128(
+              copy_fp8_tile_rowmajor_to_sw128<FP8Elem, kHeadDim>(
                   dst, src, params.k_row_stride, rows_valid, lane);
               copy_packed_sf_tile(
                   sf_dst, params.sf_k_packed_ptr, params.kv_block_descale_head_stride,
@@ -607,7 +618,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
 
           auto load_paged_tma_or_target_k =
               [&](int nb, int stage, uint64_t* k_ready_mbar_ptr) {
-            const bool use_paged_history_tma = n_block_paged >= 16;
+            const bool use_paged_history_tma = (kHeadDim > 128) || n_block_paged >= 16;
             if (nb < n_block_paged && use_paged_history_tma) {
               const int page_id = params.page_ids[page_offset + nb];
               const int sf_page_block = (page_id * params.page_size) / kBlockN;
@@ -623,6 +634,36 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
                              tKPgK_tma(_, _, _, Int<0>{}, page_id), tKPsK_d_1);
                   cute::copy(params.tma_sfb.with(*k_ready_mbar_ptr),
                              tSFBgSFB_tma(_, _, _, sf_page_block), tSFBsSFB_d_1);
+                }
+              }
+            } else if (nb >= n_block_paged) {
+              const int target_block = nb - n_block_paged;
+              const int target_start = binfo.sum_s_q + actual_seqlen_q - actual_seqlen_t
+                  + target_block * kBlockN;
+              const int rows_valid = std::max(0, std::min(kBlockN, actual_seqlen_t - target_block * kBlockN));
+              const bool use_target_tma =
+                  (rows_valid == kBlockN) && (target_start % kBlockN == 0);
+              if (use_target_tma) {
+                const int nb_abs = target_start / kBlockN;
+                const int sf_abs = (params.total_pages * params.page_size + target_start) / kBlockN;
+                if (tidx == kNMathThreads + 32) {
+                  arrive_expect_tx_mbar(k_ready_mbar_ptr, kSmemKSFBBytes);
+                  if (stage == 0) {
+                    cute::copy(params.tma_k.with(*k_ready_mbar_ptr),
+                               tKgK_tma(_, _, _, nb_abs), tKsK_d_0);
+                    cute::copy(params.tma_sfb.with(*k_ready_mbar_ptr),
+                               tSFBgSFB_tma(_, _, _, sf_abs), tSFBsSFB_d_0);
+                  } else {
+                    cute::copy(params.tma_k.with(*k_ready_mbar_ptr),
+                               tKgK_tma(_, _, _, nb_abs), tKsK_d_1);
+                    cute::copy(params.tma_sfb.with(*k_ready_mbar_ptr),
+                               tSFBgSFB_tma(_, _, _, sf_abs), tSFBsSFB_d_1);
+                  }
+                }
+              } else {
+                copy_paged_or_target_k(nb, stage);
+                if (tidx == kNMathThreads + 32) {
+                  arrive_mbar(k_ready_mbar_ptr);
                 }
               }
             } else {
@@ -648,7 +689,9 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
             if (is_jump && masking_step_load == n_masking_steps - 1)
               n_valid = std::min(n_valid, n_block_history);
 
-            kv_load_stage ^= 1;
+            if constexpr (!Kernel_traits::kUseSingleKVStage) {
+              kv_load_stage ^= 1;
+            }
           }
         } else {
           for (int n_valid = n_block_max - 1, masking_step_load = 0; n_valid >= n_block_min;
@@ -676,7 +719,9 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
             if (is_jump && masking_step_load == n_masking_steps - 1)
               n_valid = std::min(n_valid, n_block_history);
 
-            kv_load_stage ^= 1;
+            if constexpr (!Kernel_traits::kUseSingleKVStage) {
+              kv_load_stage ^= 1;
+            }
           }
         }
       }
@@ -693,7 +738,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
                   + (int64_t)page_id * params.kv_cache_kvtensor_stride
                   + params.kv_cache_page_stride
                   + (int64_t)bidh_kv * params.kv_cache_row_stride;
-              copy_fp8_tile_rowmajor_to_sw128(
+              copy_fp8_tile_rowmajor_to_sw128<FP8Elem, kHeadDim>(
                   dst, src, params.kv_cache_head_stride, kBlockN, lane);
               copy_packed_sf_tile(
                   sf_dst, params.sf_v_packed_ptr, params.v_block_descale_head_stride,
@@ -706,7 +751,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
               const FP8Elem* src = reinterpret_cast<const FP8Elem*>(params.v_ptr)
                   + (int64_t)target_start * params.v_row_stride
                   + (int64_t)bidh_kv * params.v_head_stride;
-              copy_fp8_tile_rowmajor_to_sw128(
+              copy_fp8_tile_rowmajor_to_sw128<FP8Elem, kHeadDim>(
                   dst, src, params.v_row_stride, rows_valid, lane);
               copy_packed_sf_tile(
                   sf_dst, params.sf_v_packed_ptr, params.v_block_descale_head_stride,
@@ -731,7 +776,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
 
           auto load_paged_tma_or_target_v =
               [&](int nb, int stage, uint64_t* v_ready_mbar_ptr) {
-            const bool use_paged_history_tma = n_block_paged >= 16;
+            const bool use_paged_history_tma = (kHeadDim > 128) || n_block_paged >= 16;
             if (nb < n_block_paged && use_paged_history_tma) {
               const int page_id = params.page_ids[page_offset + nb];
               const int sf_page_block = (page_id * params.page_size) / kBlockN;
@@ -747,6 +792,36 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
                              tVPgVt_tma(_, _, _, Int<0>{}, page_id), tVPsVt_d_1);
                   cute::copy(params.tma_sfv.with(*v_ready_mbar_ptr),
                              tSFVgSFV_tma(_, _, _, sf_page_block), tSFVsSFV_d_1);
+                }
+              }
+            } else if (nb >= n_block_paged) {
+              const int target_block = nb - n_block_paged;
+              const int target_start = binfo.sum_s_q + actual_seqlen_q - actual_seqlen_t
+                  + target_block * kBlockN;
+              const int rows_valid = std::max(0, std::min(kBlockN, actual_seqlen_t - target_block * kBlockN));
+              const bool use_target_tma =
+                  (rows_valid == kBlockN) && (target_start % kBlockN == 0);
+              if (use_target_tma) {
+                const int nb_abs = target_start / kBlockN;
+                const int sf_abs = (params.total_pages * params.page_size + target_start) / kBlockN;
+                if (tidx == kNMathThreads + 64) {
+                  arrive_expect_tx_mbar(v_ready_mbar_ptr, kSmemVtSFVBytes);
+                  if (stage == 0) {
+                    cute::copy(params.tma_vt.with(*v_ready_mbar_ptr),
+                               tVtgVt_tma(_, _, _, nb_abs), tVtsVt_d_0);
+                    cute::copy(params.tma_sfv.with(*v_ready_mbar_ptr),
+                               tSFVgSFV_tma(_, _, _, sf_abs), tSFVsSFV_d_0);
+                  } else {
+                    cute::copy(params.tma_vt.with(*v_ready_mbar_ptr),
+                               tVtgVt_tma(_, _, _, nb_abs), tVtsVt_d_1);
+                    cute::copy(params.tma_sfv.with(*v_ready_mbar_ptr),
+                               tSFVgSFV_tma(_, _, _, sf_abs), tSFVsSFV_d_1);
+                  }
+                }
+              } else {
+                copy_paged_or_target_v(nb, stage);
+                if (tidx == kNMathThreads + 64) {
+                  arrive_mbar(v_ready_mbar_ptr);
                 }
               }
             } else {
@@ -772,7 +847,9 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
             if (is_jump && masking_step_load == n_masking_steps - 1)
               n_valid = std::min(n_valid, n_block_history);
 
-            kv_load_stage ^= 1;
+            if constexpr (!Kernel_traits::kUseSingleKVStage) {
+              kv_load_stage ^= 1;
+            }
           }
         } else {
           for (int n_valid = n_block_max - 1, masking_step_load = 0; n_valid >= n_block_min;
@@ -800,12 +877,15 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
             if (is_jump && masking_step_load == n_masking_steps - 1)
               n_valid = std::min(n_valid, n_block_history);
 
-            kv_load_stage ^= 1;
+            if constexpr (!Kernel_traits::kUseSingleKVStage) {
+              kv_load_stage ^= 1;
+            }
           }
         }
       }
 
       if (is_o_store_warp) {
+        if constexpr (Kernel_traits::kUseIndependentOBuffer) {
         // Math warps own compute/softmax and write O to independent SMEM; O-store waits
         // for o_ready[0], then releases o_empty[0] after the TMA store completes.
         wait_mbar_parity(o_ready_mbar_ptr0, (uint32_t)o_ready_wait_parity0);
@@ -833,6 +913,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
           cute::tma_store_arrive();
           cute::tma_store_wait<0>();
           arrive_mbar(o_empty_mbar_ptr0);
+        }
         }
       }
     };
@@ -1122,7 +1203,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       //
       // K_SW128 swizzle (Swizzle<3,4,3>): physical_k = K_start ^ ((M_abs & 7) << 4).
       // M_abs & 7 == mat_row since warp_m*16 and (mat_num&1)*8 are multiples of 8.
-      auto load_a_z_pattern = [&](auto&& sA_pi, auto& tCrA, int k_block_base, int k_block_count) {
+      auto load_a_z_pattern = [&](auto&& sA_pi, auto& tCrA, int k_block_base, int k_block_count, int row_stride) {
         const int lane    = tidx_math & 31;
         const int warp_m  = tidx_math / 32;
         const int mat_num = lane >> 3;    // matrix index (0..3) this lane provides addr for
@@ -1131,7 +1212,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         const int K_half  = mat_num >> 1; // 0 = K low 16, 1 = K high 16
         const uint32_t smem_base =
             static_cast<uint32_t>(__cvta_generic_to_shared(&sA_pi(0, 0)));
-        const uint32_t row_base = smem_base + static_cast<uint32_t>(M_abs * 128);
+        const uint32_t row_base = smem_base + static_cast<uint32_t>(M_abs * row_stride);
         auto tXrA = recast<uint32_t>(tCrA);
         CUTE_UNROLL
         for (int kb = 0; kb < k_block_count; ++kb) {
@@ -1158,7 +1239,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       //   frag_base = 32*kb + 2*g
       //   r0→frag_base+K_half+0, r1→+8, r2→+16, r3→+24
       // K_SW128 swizzle: physical_k = K_start ^ ((N_addr&7)<<4) = K_start ^ (mat_row<<4).
-      auto load_b_z_pattern = [&](auto&& sB_pi, auto& tCrB, int k_block_base, int k_block_count) {
+      auto load_b_z_pattern = [&](auto&& sB_pi, auto& tCrB, int k_block_base, int k_block_count, int row_stride) {
         const int lane    = tidx_math & 31;
         const int mat_num = lane >> 3;
         const int mat_row = lane & 7;
@@ -1175,7 +1256,74 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
             for (int K_half = 0; K_half < 2; ++K_half) {
               const int K_start  = (k_block_base + kb) * 32 + K_half * 16;
               const uint32_t addr =
-                  smem_base + N_row * 128 + static_cast<uint32_t>(K_start ^ (mat_row << 4));
+                  smem_base + N_row * row_stride + static_cast<uint32_t>(K_start ^ (mat_row << 4));
+              if constexpr (kBlockN == 64) {
+                const int frag_base64 = 16 * kb + 8 * g;
+                asm volatile(
+                    "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3},[%4];\n"
+                    : "=r"(tXrB(frag_base64 + K_half + 0)),
+                      "=r"(tXrB(frag_base64 + K_half + 2)),
+                      "=r"(tXrB(frag_base64 + K_half + 4)),
+                      "=r"(tXrB(frag_base64 + K_half + 6))
+                    : "r"(addr));
+              } else {
+                const int frag_base = 32 * kb + 2 * g;
+                asm volatile(
+                    "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3},[%4];\n"
+                    : "=r"(tXrB(frag_base + K_half +  0)),
+                      "=r"(tXrB(frag_base + K_half +  8)),
+                      "=r"(tXrB(frag_base + K_half + 16)),
+                      "=r"(tXrB(frag_base + K_half + 24))
+                    : "r"(addr));
+              }
+            }
+          }
+        }
+      };
+
+      auto load_a_z_pattern_layout = [&](FP8Elem* smem_ptr, auto layout, auto& tCrA,
+                                         int k_block_base, int k_block_count) {
+        const int lane    = tidx_math & 31;
+        const int warp_m  = tidx_math / 32;
+        const int mat_num = lane >> 3;
+        const int mat_row = lane & 7;
+        const int M_abs   = warp_m * 16 + ((mat_num & 1) << 3) + mat_row;
+        const int K_half  = mat_num >> 1;
+        const uint32_t smem_base =
+            static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+        auto tXrA = recast<uint32_t>(tCrA);
+        CUTE_UNROLL
+        for (int kb = 0; kb < k_block_count; ++kb) {
+          const int K_start = (k_block_base + kb) * 32 + (K_half << 4);
+          const uint32_t addr =
+              smem_base + (uint32_t)layout(M_abs, K_start);
+          asm volatile(
+              "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3},[%4];\n"
+              : "=r"(tXrA(4*kb+0)), "=r"(tXrA(4*kb+1)),
+                "=r"(tXrA(4*kb+2)), "=r"(tXrA(4*kb+3))
+              : "r"(addr));
+        }
+      };
+
+      auto load_b_z_pattern_layout = [&](FP8Elem* smem_ptr, auto layout, auto& tCrB,
+                                         int k_block_base, int k_block_count) {
+        const int lane    = tidx_math & 31;
+        const int mat_num = lane >> 3;
+        const int mat_row = lane & 7;
+        const uint32_t smem_base =
+            static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+        auto tXrB = recast<uint32_t>(tCrB);
+        constexpr int kNGroups = kBlockN / 32;
+        CUTE_UNROLL
+        for (int kb = 0; kb < k_block_count; ++kb) {
+          CUTE_UNROLL
+          for (int g = 0; g < kNGroups; ++g) {
+            const uint32_t N_row = static_cast<uint32_t>(g * 32 + mat_num * 8 + mat_row);
+            CUTE_UNROLL
+            for (int K_half = 0; K_half < 2; ++K_half) {
+              const int K_start = (k_block_base + kb) * 32 + K_half * 16;
+              const uint32_t addr =
+                  smem_base + (uint32_t)layout((int)N_row, K_start);
               if constexpr (kBlockN == 64) {
                 const int frag_base64 = 16 * kb + 8 * g;
                 asm volatile(
@@ -1312,18 +1460,20 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       // (not TMA) and requires the long per-tile gap (mbarrier wait + GEMM1, ~500 cycles)
       // to guarantee visibility.  Hoisting would introduce a race with no explicit barrier.
       Tensor tCrSFA = BS1::partition_fragment_SFA(sSFA(_,_,_0{}), thr_mma_g1);
-      {
-        const int warp_m  = tidx_math / 32;
-        const int lane    = tidx_math & 31;
-        const int sfa_row = warp_m * 16 + 8 * (lane & 1) + (lane >> 2);
-        tCrSFA(0, 0, 0)  = smem_sfa_ptr[sfa_row];
-      }
+      const int warp_m  = tidx_math / 32;
+      const int lane    = tidx_math & 31;
+      const int sfa_row = warp_m * 16 + 8 * (lane & 1) + (lane >> 2);
+      tCrSFA(0, 0, 0)  = smem_sfa_ptr[sfa_row];
       auto tCrSFA_frg = BS1::transform_fragment_for_qmma(tCrSFA);
 
       Tensor tCrQ = thr_mma_g1.partition_fragment_A(sQ_persist_pi);
-      load_a_z_pattern(sQ_persist_pi, tCrQ, 0, kHeadDim / 32);
-      if ((tidx_math & 31) == 0) {
-        arrive_mbar(q_empty_mbar_ptr);
+      if constexpr (kHeadDim <= 128) {
+        load_a_z_pattern(sQ_persist_pi, tCrQ, 0, kHeadDim / 32, kHeadDim);
+      }
+      if constexpr (kHeadDim <= 128) {
+        if ((tidx_math & 31) == 0) {
+          arrive_mbar(q_empty_mbar_ptr);
+        }
       }
 
       // Per-tile lambda (Opt C): instantiated with kIsMasking=true (Phase 1, causal diagonal)
@@ -1331,6 +1481,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       // elimination of apply_mask_bs in the hot path.  n_valid_ref is modified in-place by
       // the is_jump adjustment; math_stage persists across tiles and flips after every N tile.
       constexpr bool kStoreOInMainloop =
+          kHeadDim <= 128 &&
           Is_causal && !Is_target && !Is_context && !Is_arbitrary && !Is_local;
       bool o_epilogue_done = false;
       auto store_o_epilogue = [&]() {
@@ -1339,20 +1490,37 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         Tensor rO = make_tensor_like<OutElement>(acc_o);
         flash::convert_type_safe(acc_o, rO);
 
-        static_assert(
-            Kernel_traits::kSmemWsOBytes >= kBlockM * kHeadDim * (int)sizeof(OutElement),
-            "Independent O SMEM buffer is too small.");
-        char* smem_o = reinterpret_cast<char*>(smem_) + Kernel_traits::kSmemWsOOffset;
+        if constexpr (!Kernel_traits::kUseIndependentOBuffer) {
+          Tensor cO_id = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});
+          Tensor tOcO = thr_mma_g2.partition_C(cO_id);
+          OutElement* gO_ptr = reinterpret_cast<OutElement*>(params.o_ptr)
+              + binfo.q_offset(params.o_row_stride)
+              + bidh * params.o_head_stride;
+          const int valid_rows = actual_seqlen_q - m_block * kBlockM;
+          CUTE_UNROLL
+          for (int flat = 0; flat < size(rO); ++flat) {
+            const auto coord = tOcO(flat);
+            const int m_rel = int(get<0>(coord));
+            const int n_pos = int(get<1>(coord));
+            if (m_rel < valid_rows) {
+              gO_ptr[(m_block * kBlockM + m_rel) * params.o_row_stride + n_pos] = rO(flat);
+            }
+          }
+        } else {
+          static_assert(
+              Kernel_traits::kSmemWsOBytes >= kBlockM * kHeadDim * (int)sizeof(OutElement),
+              "Independent O SMEM buffer is too small.");
+          char* smem_o = reinterpret_cast<char*>(smem_) + Kernel_traits::kSmemWsOOffset;
 
-        // Wait until the independent O buffer is no longer owned by the previous TMA store.
-        wait_mbar_parity(
-            smem_base32 + (uint32_t)kSmemMbar0Offset + 96u,
-            (uint32_t)o_empty_wait_parity);
-        o_empty_wait_parity ^= 1;
-        Tensor sO_flat = make_tensor(
-            make_smem_ptr(reinterpret_cast<OutElement*>(smem_o)),
-            Layout<Shape<Int<kBlockM>, Int<kHeadDim>>, Stride<Int<kHeadDim>, _1>>{});
-        {
+          // Wait until the independent O buffer is no longer owned by the previous TMA store.
+          wait_mbar_parity(
+              smem_base32 + (uint32_t)kSmemMbar0Offset + 96u,
+              (uint32_t)o_empty_wait_parity);
+          o_empty_wait_parity ^= 1;
+          Tensor sO_flat = make_tensor(
+              make_smem_ptr(reinterpret_cast<OutElement*>(smem_o)),
+              Layout<Shape<Int<kBlockM>, Int<kHeadDim>>, Stride<Int<kHeadDim>, _1>>{});
+          {
           // stmatrix.sync.aligned.x4.m8n8.shared.b16: 8 warp-cooperative stores replace 32 STS.32.
           //
           // Layout invariants this asm relies on:
@@ -1398,35 +1566,38 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
                   : : "r"(stsm_addr), "r"(rb0), "r"(rb1), "r"(rb2), "r"(rb3) : "memory");
             }
           }
-        }
+          }
 
-        // For partial tiles (last tile of a varlen sequence): zero SMEM rows [valid_rows, kBlockM)
-        // so TMA bulk store does not write garbage to GMEM beyond actual_seqlen_q.
-        const int valid_rows = actual_seqlen_q - m_block * kBlockM;
-        if (valid_rows < kBlockM) {
-          // Ensure all STSM stores are complete before any warp zeros OOB rows.
-          // Full tiles skip this: o_ready is initialized with count=8, so the O-store warp
-          // cannot proceed until each math warp has arrived after its own STSM stores.
-          asm volatile("bar.sync 1, 256;\n" : : : "memory");
-          const int oob_elems = (kBlockM - valid_rows) * kHeadDim;
-          OutElement* sO_raw = reinterpret_cast<OutElement*>(smem_o) + valid_rows * kHeadDim;
-          for (int i = tidx_math; i < oob_elems; i += kNMathThreads)
-            sO_raw[i] = OutElement(0);
-          asm volatile("bar.sync 1, 256;\n" : : : "memory");  // OOB zeros visible before TMA.
-        }
+          // For partial tiles (last tile of a varlen sequence): zero SMEM rows [valid_rows, kBlockM)
+          // so TMA bulk store does not write garbage to GMEM beyond actual_seqlen_q.
+          const int valid_rows = actual_seqlen_q - m_block * kBlockM;
+          if (valid_rows < kBlockM) {
+            // Ensure all STSM stores are complete before any warp zeros OOB rows.
+            // Full tiles skip this: o_ready is initialized with count=8, so the O-store warp
+            // cannot proceed until each math warp has arrived after its own STSM stores.
+            asm volatile("bar.sync 1, 256;\n" : : : "memory");
+            const int oob_elems = (kBlockM - valid_rows) * kHeadDim;
+            OutElement* sO_raw = reinterpret_cast<OutElement*>(smem_o) + valid_rows * kHeadDim;
+            for (int i = tidx_math; i < oob_elems; i += kNMathThreads)
+              sO_raw[i] = OutElement(0);
+            asm volatile("bar.sync 1, 256;\n" : : : "memory");  // OOB zeros visible before TMA.
+          }
 
-        // Produce o_ready[0]. O-store warp owns the TMA store and releases
-        // o_empty[0] after the store completes.
-        if ((tidx_math & 31) == 0) {
-          const uint32_t o_ready_addr =
-              smem_base32 + (uint32_t)kSmemMbar0Offset + 80u;
-          arrive_mbar(o_ready_addr);
+          // Produce o_ready[0]. O-store warp owns the TMA store and releases
+          // o_empty[0] after the store completes.
+          if ((tidx_math & 31) == 0) {
+            const uint32_t o_ready_addr =
+                smem_base32 + (uint32_t)kSmemMbar0Offset + 80u;
+            arrive_mbar(o_ready_addr);
+          }
         }
       };
 
-      auto run_n_tile = [&](int nb, int& n_valid_ref, int masking_step, bool store_o_after,
-                            auto kIsMasking_c) {
-        constexpr bool kIsMasking = decltype(kIsMasking_c)::value;
+      auto run_n_tile = [&](int nb, int n_valid_ref, int masking_step, bool do_mask_runtime,
+                            bool store_o_after, auto kMaskMode_c) {
+        constexpr int kMaskMode = decltype(kMaskMode_c)::value;
+        constexpr bool kIsMasking = kMaskMode == 1;
+        constexpr bool kRuntimeMasking = kMaskMode == 2;
 
         // Stage-dependent SMEM pointers — pure pointer arithmetic, no TMA dependency.
         int32_t* smem_sfb_cur = smem_sfa_ptr + 2 * kBlockM + math_stage * kBlockN;
@@ -1453,9 +1624,6 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         Tensor acc_s = partition_fragment_C(tiled_mma_g1, Shape<Int<kBlockM>, Int<kBlockN>>{});
         clear(acc_s);
 
-        auto sK_cur_pi = as_position_independent_swizzle_tensor(
-            make_tensor(make_smem_ptr(sK_cur), SmemLayoutK_SW128{}));
-
         Tensor tCrSFB = BS1::partition_fragment_SFB(sSFB(_,_,_0{}), thr_mma_g1);
         {
           // get_layoutSFB_TV degenerates under <_8,_1,_1>: ThrN=1 causes all threads to map
@@ -1472,27 +1640,122 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
             tCrSFB(0, nr, 0) = smem_sfb_cur[N_base + n_row_sfb];
           }
         }
-        auto tCrSFB_frg = BS1::transform_fragment_for_qmma(tCrSFB);
+        if constexpr (kHeadDim <= 128) {
+          auto sK_cur_pi = as_position_independent_swizzle_tensor(
+              make_tensor(make_smem_ptr(sK_cur), SmemLayoutK_SW128{}));
+          auto tCrSFB_frg = BS1::transform_fragment_for_qmma(tCrSFB);
+          Tensor tCrK = thr_mma_g1.partition_fragment_B(sK_cur_pi);
+          // GEMM1: tCrQ and tCrSFA_frg are N-loop invariants hoisted above the loop.
+          if constexpr (kBlockN == 64) {
+            auto tXsK = s2r_thr_B_g1.partition_S(sK_cur_pi);
+            auto tXrK = s2r_thr_B_g1.retile_D(tCrK);
+            cute::copy(s2r_copy_B_g1, tXsK, tXrK);
+          } else {
+            load_b_z_pattern(sK_cur_pi, tCrK, 0, kHeadDim / 32, kHeadDim);
+          }
+          if ((tidx_math & 31) == 0) {
+            uint32_t k_empty_addr =
+                smem_base32 + (uint32_t)kSmemMbar0Offset + 32u + (uint32_t)(math_stage * 8);
+            arrive_mbar(k_empty_addr);
+          }
+          cute::gemm(tiled_mma_g1,
+              make_zip_tensor(tCrQ, tCrSFA_frg(_,_,_,_0{})),
+              make_zip_tensor(tCrK, tCrSFB_frg(_,_,_,_0{})),
+              acc_s);
+        } else if constexpr (kHeadDim == 256) {
+          auto replicate_e8m0_lane = [](int32_t packed, int lane) {
+            const uint32_t byte = (static_cast<uint32_t>(packed) >> (8 * lane)) & 0xffu;
+            return static_cast<int32_t>(
+                byte | (byte << 8) | (byte << 16) | (byte << 24));
+          };
 
-        // GEMM1: tCrQ and tCrSFA_frg are N-loop invariants hoisted above the loop.
-        Tensor tCrK = thr_mma_g1.partition_fragment_B(sK_cur_pi);
-        if constexpr (kBlockN == 64) {
-          auto tXsK = s2r_thr_B_g1.partition_S(sK_cur_pi);
-          auto tXrK = s2r_thr_B_g1.retile_D(tCrK);
-          cute::copy(s2r_copy_B_g1, tXsK, tXrK);
-        } else {
-          load_b_z_pattern(sK_cur_pi, tCrK, 0, kHeadDim / 32);
-        }
-        if ((tidx_math & 31) == 0) {
-          uint32_t k_empty_addr =
-              smem_base32 + (uint32_t)kSmemMbar0Offset + 32u + (uint32_t)(math_stage * 8);
-          arrive_mbar(k_empty_addr);
-        }
-        cute::gemm(tiled_mma_g1,
-            make_zip_tensor(tCrQ, tCrSFA_frg(_,_,_,_0{})),
-            make_zip_tensor(tCrK, tCrSFB_frg(_,_,_,_0{})),
-            acc_s);
+          using SmemLayoutQChunk_SW128 = decltype(tile_to_shape(
+              GMMA::Layout_K_SW128_Atom<FP8Elem>{},
+              Shape<Int<kBlockM>, Int<128>>{}));
+          using SmemLayoutKChunk_SW128 = decltype(tile_to_shape(
+              GMMA::Layout_K_SW128_Atom<FP8Elem>{},
+              Shape<Int<kBlockN>, Int<128>>{}));
+          FP8Elem* q_persist_base = reinterpret_cast<FP8Elem*>(
+              reinterpret_cast<char*>(smem_) + Kernel_traits::kSmemWsQPersistOffset);
 
+          {
+            Tensor tCrSFA0 = make_tensor_like<int32_t>(tCrSFA);
+            Tensor tCrSFB0 = make_tensor_like<int32_t>(tCrSFB);
+            CUTE_UNROLL
+            for (int i = 0; i < size(tCrSFA); ++i) {
+              tCrSFA0(i) = replicate_e8m0_lane(tCrSFA(i), 0);
+            }
+            CUTE_UNROLL
+            for (int i = 0; i < size(tCrSFB); ++i) {
+              tCrSFB0(i) = replicate_e8m0_lane(tCrSFB(i), 0);
+            }
+            auto tCrSFA0_frg = BS1::transform_fragment_for_qmma(tCrSFA0);
+            auto tCrSFB0_frg = BS1::transform_fragment_for_qmma(tCrSFB0);
+
+            Tensor sQ_chunk0 = make_tensor(
+                make_smem_ptr(q_persist_base),
+                SmemLayoutQChunk_SW128{});
+            auto sQ_chunk0_pi = as_position_independent_swizzle_tensor(sQ_chunk0);
+            Tensor tCrQ0 = thr_mma_g1.partition_fragment_A(sQ_chunk0_pi);
+            clear(tCrQ0);
+            load_a_z_pattern_layout(q_persist_base, SmemLayoutQ_SW128{}, tCrQ0, 0, 4);
+
+            Tensor sK_chunk0 = make_tensor(
+                make_smem_ptr(sK_cur),
+                SmemLayoutKChunk_SW128{});
+            auto sK_chunk0_pi = as_position_independent_swizzle_tensor(sK_chunk0);
+            Tensor tCrK0 = thr_mma_g1.partition_fragment_B(sK_chunk0_pi);
+            clear(tCrK0);
+            load_b_z_pattern_layout(sK_cur, SmemLayoutK_SW128{}, tCrK0, 0, 4);
+
+            cute::gemm(tiled_mma_g1,
+                make_zip_tensor(tCrQ0, tCrSFA0_frg(_,_,_,_0{})),
+                make_zip_tensor(tCrK0, tCrSFB0_frg(_,_,_,_0{})),
+                acc_s);
+          }
+
+          {
+            Tensor tCrSFA1 = make_tensor_like<int32_t>(tCrSFA);
+            Tensor tCrSFB1 = make_tensor_like<int32_t>(tCrSFB);
+            CUTE_UNROLL
+            for (int i = 0; i < size(tCrSFA); ++i) {
+              tCrSFA1(i) = replicate_e8m0_lane(tCrSFA(i), 1);
+            }
+            CUTE_UNROLL
+            for (int i = 0; i < size(tCrSFB); ++i) {
+              tCrSFB1(i) = replicate_e8m0_lane(tCrSFB(i), 1);
+            }
+            auto tCrSFA1_frg = BS1::transform_fragment_for_qmma(tCrSFA1);
+            auto tCrSFB1_frg = BS1::transform_fragment_for_qmma(tCrSFB1);
+
+            Tensor sQ_chunk1 = make_tensor(
+                make_smem_ptr(q_persist_base),
+                SmemLayoutQChunk_SW128{});
+            auto sQ_chunk1_pi = as_position_independent_swizzle_tensor(sQ_chunk1);
+            Tensor tCrQ1 = thr_mma_g1.partition_fragment_A(sQ_chunk1_pi);
+            clear(tCrQ1);
+            load_a_z_pattern_layout(q_persist_base, SmemLayoutQ_SW128{}, tCrQ1, 4, 4);
+
+            Tensor sK_chunk1 = make_tensor(
+                make_smem_ptr(sK_cur),
+                SmemLayoutKChunk_SW128{});
+            auto sK_chunk1_pi = as_position_independent_swizzle_tensor(sK_chunk1);
+            Tensor tCrK1 = thr_mma_g1.partition_fragment_B(sK_chunk1_pi);
+            clear(tCrK1);
+            load_b_z_pattern_layout(sK_cur, SmemLayoutK_SW128{}, tCrK1, 4, 4);
+
+            cute::gemm(tiled_mma_g1,
+                make_zip_tensor(tCrQ1, tCrSFA1_frg(_,_,_,_0{})),
+                make_zip_tensor(tCrK1, tCrSFB1_frg(_,_,_,_0{})),
+                acc_s);
+          }
+
+          if ((tidx_math & 31) == 0) {
+            uint32_t k_empty_addr =
+                smem_base32 + (uint32_t)kSmemMbar0Offset + 32u + (uint32_t)(math_stage * 8);
+            arrive_mbar(k_empty_addr);
+          }
+        }
         if (params.debug_gemm1_only) {
           for (int i = 0; i < size(acc_s); ++i) acc_o(i) += acc_s(i);
           {
@@ -1510,8 +1773,10 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
           }
           if (is_jump && masking_step == n_masking_steps - 1)
             n_valid_ref = std::min(n_valid_ref, n_block_history);
-          math_stage ^= 1;
-          return;
+          if constexpr (!Kernel_traits::kUseSingleKVStage) {
+            math_stage ^= 1;
+          }
+          return n_valid_ref;
         }
 
         // Masking (Opt C: compile-time specialized).
@@ -1519,6 +1784,12 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         // kIsMasking=false (Phase 2): steady-state; skip diagonal masking; varlen-end check only.
         if constexpr (Is_arbitrary || Is_local || kIsMasking) {
           apply_mask_bs(acc_s, nb);
+        } else if constexpr (kRuntimeMasking) {
+          if (do_mask_runtime) {
+            apply_mask_bs(acc_s, nb);
+          } else {
+            if ((nb + 1) * kBlockN > actual_seqlen_h) apply_mask_bs(acc_s, nb);
+          }
         } else {
           if ((nb + 1) * kBlockN > actual_seqlen_h) apply_mask_bs(acc_s, nb);
         }
@@ -1628,6 +1899,12 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
                 tXrP(4 * kb + 2 * c + 1) = __byte_perm(a, b, 0x7632u);
               }
             }
+            if constexpr (kHeadDim == 256) {
+              CUTE_UNROLL
+              for (int i = 8; i < size(tXrP); ++i) {
+                tXrP(i) = tXrP(i & 7);
+              }
+            }
           } else {
             // kLut{0,1}[kb][c]: compile-time acc_s_packed indices for K-half h=0 and h=1.
             //   kLut0[kb][c] = kb + 4*(2*c + 0) = kb + 8*c
@@ -1706,25 +1983,29 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
           {
             auto tXrV = recast<uint32_t>(tCrV);
             const uint32_t v_smem_base = static_cast<uint32_t>(__cvta_generic_to_shared(sVt_cur));
+            typename Kernel_traits::SmemLayoutVt_TMA smem_layout_vt;
             const int lane  = tidx_math & 31;
             const int n_off = lane & 15;          // row within 16-row n_k group
             const int d_mat = (lane >> 4) << 4;  // 0 for lanes 0-15, 16 for lanes 16-31
             CUTE_UNROLL
-            for (int dg = 0; dg < kHeadDim / 32; ++dg) {   // 4 d-groups of 32 d-values each
-              const int d_start = dg * 32 + d_mat;
+            for (int dg = 0; dg < kHeadDim / 32; ++dg) {   // 4 d-groups per 128-D slab
               CUTE_UNROLL
-              for (int ni = 0; ni < kBlockN / 16; ++ni) {   // 8 n_k tiles of 16 rows each
+              for (int ni = 0; ni < kBlockN / 16; ++ni) {
                 const int n_k_row     = ni * 16 + n_off;
-                const int swizzle_xor = (n_k_row & 7) << 4;
-                const uint32_t addr   = v_smem_base + (uint32_t)(n_k_row * kHeadDim + (d_start ^ swizzle_xor));
                 // r0..r3 cover 4 n_k-groups (4 rows each) at d = dg*32+lane, placed into
                 // N-atoms {dg, dg+4, dg+8, dg+12} × K-half {ni&1} of K-block {ni>>1}.
-                const int base = 32 * (ni >> 1) + 2 * dg + (ni & 1);
+                const int d_start = dg * 32 + d_mat;
+                const uint32_t addr_slab =
+                    v_smem_base + (uint32_t)smem_layout_vt(n_k_row, d_start);
+                const int dg_slab = dg >> 2;
+                const int dg_in_slab = dg & 3;
+                const int base =
+                    (kHeadDim / 4) * (ni >> 1) + 32 * dg_slab + 2 * dg_in_slab + (ni & 1);
                 asm volatile(
                     "ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0,%1,%2,%3},[%4];\n"
                     : "=r"(tXrV(base + 0)), "=r"(tXrV(base + 8)),
                       "=r"(tXrV(base + 16)), "=r"(tXrV(base + 24))
-                    : "r"(addr));
+                    : "r"(addr_slab));
               }
             }
           }
@@ -1776,41 +2057,66 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         // End-of-tile cleanup: is_jump adjustment and double-buffer flip.
         if (is_jump && masking_step == n_masking_steps - 1)
           n_valid_ref = std::min(n_valid_ref, n_block_history);
-        math_stage ^= 1;
+        if constexpr (!Kernel_traits::kUseSingleKVStage) {
+          math_stage ^= 1;
+        }
         if constexpr (kStoreOInMainloop) {
           if (store_o_after) {
             store_o_epilogue();
             o_epilogue_done = true;
           }
         }
+        return n_valid_ref;
       };  // end run_n_tile lambda
 
       // N-loop (Opt C): for causal (not arbitrary, not local), split into masked Phase 1
       // (n_masking_steps tiles) and unmasked Phase 2 (steady-state) to allow compile-time
       // dead-code elimination of apply_mask_bs in the hot path.
       if constexpr (Is_causal && !Is_arbitrary && !Is_local) {
-        int n_valid    = n_block_max - 1;
-        int masking_step = 0;
-        // Phase 1: causal diagonal tiles — apply_mask_bs compiled in (kIsMasking=true).
-        for (; n_valid >= n_block_min && masking_step < n_masking_steps; ++masking_step, --n_valid)
-          run_n_tile(n_valid, n_valid, masking_step,
-              (!Is_target && !Is_context && n_valid == n_block_min), std::true_type{});
-        // Phase 2: steady-state tiles — apply_mask_bs compile-time eliminated (kIsMasking=false).
-        for (; n_valid >= n_block_min; ++masking_step, --n_valid)
-          run_n_tile(n_valid, n_valid, masking_step,
-              (!Is_target && !Is_context && n_valid == n_block_min), std::false_type{});
+        if constexpr (kHeadDim == 256 && !Is_target && !Is_context) {
+          for (int n_valid = n_block_max - 1, masking_step = 0; n_valid >= n_block_min;
+               ++masking_step, --n_valid) {
+            n_valid = run_n_tile(n_valid, n_valid, masking_step,
+                masking_step < n_masking_steps,
+                false,
+                std::integral_constant<int, 2>{});
+          }
+        } else {
+          int n_valid    = n_block_max - 1;
+          int masking_step = 0;
+          // Phase 1: causal diagonal tiles — apply_mask_bs compiled in (kIsMasking=true).
+          for (; n_valid >= n_block_min && masking_step < n_masking_steps; ++masking_step, --n_valid)
+            n_valid = run_n_tile(n_valid, n_valid, masking_step,
+                false,
+                (!Is_target && !Is_context && n_valid == n_block_min),
+                std::integral_constant<int, 1>{});
+          // Phase 2: steady-state tiles — apply_mask_bs compile-time eliminated (kIsMasking=false).
+          for (; n_valid >= n_block_min; ++masking_step, --n_valid)
+            n_valid = run_n_tile(n_valid, n_valid, masking_step,
+                false,
+                (!Is_target && !Is_context && n_valid == n_block_min),
+                std::integral_constant<int, 0>{});
+        }
       } else if constexpr (Is_arbitrary || Is_local) {
         // Every tile needs masking: pass true_type so apply_mask_bs is always compiled in.
         for (int n_valid = n_block_max - 1, masking_step = 0; n_valid >= n_block_min;
              ++masking_step, --n_valid) {
           const int nb = Is_arbitrary ? int(sValidBlockIds[n_valid]) : n_valid;
-          run_n_tile(nb, n_valid, masking_step, false, std::true_type{});
+          n_valid = run_n_tile(nb, n_valid, masking_step,
+              false, false, std::integral_constant<int, 1>{});
         }
       } else {
         // Full attention (!Is_causal, !Is_arbitrary, !Is_local): varlen-end check only.
         for (int n_valid = n_block_max - 1, masking_step = 0; n_valid >= n_block_min;
              ++masking_step, --n_valid)
-          run_n_tile(n_valid, n_valid, masking_step, false, std::false_type{});
+          n_valid = run_n_tile(n_valid, n_valid, masking_step,
+              false, false, std::integral_constant<int, 0>{});
+      }
+
+      if constexpr (kHeadDim > 128) {
+        if ((tidx_math & 31) == 0) {
+          arrive_mbar(q_empty_mbar_ptr);
+        }
       }
 
       // Complex/full paths and debug_gemm1_only keep the old post-loop epilogue fallback.
@@ -1876,7 +2182,8 @@ hstu_fwd_kernel_sm120_fp8_ws_tma(
       !Kernel_traits::Is_context &&
       !Kernel_traits::Is_local &&
       !Kernel_traits::Is_arbitrary &&
-      (!Kernel_traits::Is_target || Kernel_traits::Paged_KV);
+      (!Kernel_traits::Is_target || Kernel_traits::Paged_KV) &&
+      (Kernel_traits::kHeadDim <= 128 || Kernel_traits::Paged_KV);
   constexpr bool Use_persistent = Use_full_persistent || Use_paired_persistent;
 
   if constexpr (!Use_persistent) {

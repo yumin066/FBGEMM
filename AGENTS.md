@@ -20,11 +20,18 @@
 
 - FP8 dtype：`cute::float_e4m3_t`，PyTorch 对应 `torch.float8_e4m3fn`。
 - FP8 block-scale 量化模式：`quant_mode=2`；BF16 为 `quant_mode=-1`。
-- headDim 主要为 128；`kBlockN` 必须整除 128。
-- Q/K 用于 GEMM1，K 方向为 headDim=128；V 用于 GEMM2，K 方向为 `kBlockN=128`。
-- scale factor 为 e8m0，每 128 个 K 元素对应 1 个 scale；4 个连续块打包为 1 个 `int32`。
+- 当前稳定主路径为 headDim128；Phase 25 目标是 SM120 forward headDim256。
+- `kBlockN` 必须整除 128；当前 FP8 paged KV 第一约束仍是 `page_size == kBlockN`。
+- Q/K 用于 GEMM1，scale 沿 headDim 每 128 个元素 1 个 e8m0 scale；headDim128 有 1 个 D chunk，headDim256 有 2 个 D chunk。
+- V 用于 GEMM2，scale 沿 N block 维度组织；4 个连续 scale block 打包为 1 个 `int32`。
 
-当前 FP8 WS Phase 23 状态：
+当前工作焦点：
+
+- Phase 25：支持 SM120 headDim256 forward；FP8 hdim256 correctness 路径已接入，pure non-paged causal residual register spill 已清理。
+- FP8 hdim256 验收必须覆盖当前 hdim128 已支持的所有 FP8 配置组合；hdim128 paged guard 已明确 unsupported 的 RAB/DRAB/local paged mirror 仍按 `PASS-UNSUPPORTED` 处理。
+- BF16 hdim256 作为 correctness/dispatch 基线；backward 不进第一阶段。
+
+FP8 WS Phase 23 稳定基线：
 
 - FP8 WS pure full no-RAB 路径当前使用 branch-local grid-stride persistent kernel：host 端 `grid.x = min(total_tiles, SM_count)`，device 端 load/math 分支各自以 `gridDim.x` 为 stride 遍历 tile。
 - FP8 WS pure causal no-RAB 路径当前使用 branch-local paired persistent kernel：host 端 `grid.x = min(total_tile_pairs, SM_count)`，device 端 load/math 分支各自以 `gridDim.x` 为 stride 遍历 tile-pair。
@@ -37,9 +44,9 @@
 - 不保留 dynamic persistent work queue：correctness 可过，但 tile 间需要 CTA sync/atomic，性能收益小且波动。
 - 当前 K/V stage persistent 版本已通过 correctness，full/causal SASS 均为 `REG:168 STACK:0 LOCAL:0` 且无 `LDL/STL`；当前 O-stage N-tile parity 公式版 benchmark `156` 为 full/causal `643.7/1194.6 TFLOPS`。前一版逐 tile 翻转 O-store stage 的 benchmark `155` 为 `642.2/1204.1 TFLOPS`。full 仍低于 benchmark `148` 的 `646.5 TFLOPS` 和 pre-hoist `140` 的 `649.5 TFLOPS`。`q_consumed_mbar + bar.sync 4,96` 实验 correctness 可过，但 benchmark `146` 回退到 `621.6/1155.0 TFLOPS`，不保留。
 
-当前 FP8 paged KV Phase 24 状态：
+FP8 paged KV Phase 24 稳定基线：
 
-- SM120 FP8 paged KV 当前支持范围：`quant_mode=2`、no-RAB、full 或 causal/target、headDim128、`page_size=64`、forward；BF16 paged KV 在 SM120 当前路径仍未接入。
+- SM120 FP8 paged KV 当前支持范围：`quant_mode=2`、headDim128、`page_size=64`、forward；full、causal、context+causal、target+causal、arbitrary paged mirror 已通过，RAB/DRAB/local paged 由 guard 明确不支持；BF16 paged KV 在 SM120 当前路径仍未接入。
 - paged full 使用 full persistent scheduler，host grid 使用 `min(total_tiles, SM_count)`；paged causal/target 使用 paired persistent scheduler，host grid 使用 `min(total_tile_pairs, SM_count)`。
 - paged history K/V 已有 page-cache TMA 版本：host 端为 physical `kv_cache` 建 `[page_size, d, h_k, total_pages]` TMA descriptor，load warp 读取 runtime `page_id` 后把它作为 TMA 坐标直接搬 `[64,128]` tile 到 WS SW128 SMEM。
 - 当前保留性能启发式：`n_block_paged >= 16` 时 history K/V/SFB/SFV 走 paged TMA；更小 history 仍走 warp 内 `cp.async.cg.shared.global` 16B copy，避免小 seq 被 TMA 固定开销拖慢。paged target tail 也仍走 guarded cp.async copy，因为 target 起点可能不按 page/tile 对齐。
@@ -51,6 +58,18 @@
 - `run_hstu8_examples.sh` 已把原 14 个 non-paged example 逐个镜像到 paged KV：causal、context+causal、target+causal、arbitrary 可运行并通过；RAB/DRAB/local 当前由 SM120 FP8 paged guard 明确报不支持，脚本标为 `PASS-UNSUPPORTED`。最新日志 `1test_results/456_phase24_paged_mirror_examples_final.log` 为 `31/31 passed`。`sweep_accuracy.py` 的 `paged_f_*` 列镜像每个 non-paged full sweep 行，`455_phase24_paged_mirror_sweep.log` 通过，same-input full/causal 仍为 `max_err=0`。
 - paged causal TMA SASS：`4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_paged_causal_tma_sf_tma.sass` 含 `UTMALDG.4D`，资源为 `REG:168 STACK:0 LOCAL:0`，无 `LDL/STL` 命中；`UTMALDG` 计数为 `10`，包含 paged K/V 和 SFB/SFV TMA。
 - 剩余差距主要来自 page-id/descriptor 额外控制流、paged target tail guarded copy，以及小 seq 下 page TMA descriptor 固定开销。
+
+FP8 headDim256 Phase 25 当前状态：
+
+- SM120 编译、dispatch、runtime guard 已支持 hdim256；Phase 25 构建应使用 `HSTU_DISABLE_HDIM256=FALSE`。
+- FP8 WS hdim256 使用 `{kBlockM=128,kBlockN=64,kHeadDim=256,kNWarps=8}`；Q/K e8m0 scale 按每 token 一个 int32 打包连续 128-D chunk，hdim128 scale layout 保持兼容。
+- hdim256 GEMM1 分两个 128-D chunk 执行并累加到同一 `acc_s`；K stage 的 `k_empty` release 必须在两个 chunk 的 K 都从 SMEM 消费完成之后，不能沿用 hdim128 的“load K 后立即 release”位置。
+- hdim256 paged KV history K/V/SFB/SFV 走 page-cache TMA；aligned full-block target tail 可走 contiguous TMA，非满或不对齐 target tail 仍用 guarded copy fallback。
+- hdim256 arbitrary 为了满足 SM120 dynamic SMEM opt-in limit，使用 single K/V stage；stage1 指针 alias stage0，load/math stage 不翻转。
+- `run_hstu8_examples.sh` 当前覆盖 D=128/D=256 的 14 个 non-paged example、paged mirror、paged edge 和 paged full。最新 spill-fix 后日志 `1test_results/553_phase25_hdim256_spill_final_examples.log` 为 `62/62 passed`。
+- `sweep_accuracy.py` 当前覆盖 D=128/D=256 主表，并追加 same-input paged vs non-paged 对照；最新 spill-fix 后日志 `1test_results/553_phase25_hdim256_spill_final_sweep.log` 通过，D=256 full/causal same-input `max_err=0`。
+- BF16 hdim256 定向 full/causal correctness 日志 `1test_results/542_phase25_bf16_hdim256_directed.log` 通过；`hstu_test.py` 的 SM120 guard 已允许 `attn_dim=256`。
+- hdim256 SASS 代表实例：`I256_full`、`I256_causal`、`I256_paged_full`、`I256_paged_causal` 均为 `REG:168 STACK:0 LOCAL:0`，且 `LDL=0/STL=0`。pure non-paged causal 的修复方式是 hdim256 不再走 paired persistent scheduler，改用 runtime mask 单体 N-loop，并关闭 hdim256 in-mainloop O-store；hdim128 causal 和 hdim256 paged causal 仍保留 persistent。
 
 ## 核心路径
 
@@ -90,8 +109,10 @@ cd /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/fbgemm_gpu/experimental/hs
 ```
 
 ```bash
-PYTHONUSERBASE=/home/scratch.minyu_gpu/project/.cache/pip-user HSTU_ARCH_LIST="12.0" HSTU_DISABLE_BACKWARD=TRUE HSTU_DISABLE_DETERMINISTIC=FALSE HSTU_DISABLE_HDIM32=TRUE HSTU_DISABLE_HDIM64=TRUE HSTU_DISABLE_HDIM256=TRUE MAX_JOBS=32 pip install --no-build-isolation --config-settings editable_mode=compat -e .
+PYTHONUSERBASE=/home/scratch.minyu_gpu/project/.cache/pip-user HSTU_ARCH_LIST="12.0" HSTU_DISABLE_BACKWARD=TRUE HSTU_DISABLE_DETERMINISTIC=FALSE HSTU_DISABLE_HDIM32=TRUE HSTU_DISABLE_HDIM64=TRUE HSTU_DISABLE_HDIM256=FALSE MAX_JOBS=32 pip install --no-build-isolation --config-settings editable_mode=compat -e .
 ```
+
+Phase 25 headDim256 开发需要去掉 `HSTU_DISABLE_HDIM256=TRUE`，当前应使用 `HSTU_DISABLE_HDIM256=FALSE` 并在测试入口显式覆盖 hdim256。
 
 编译失败时先读上下文和完整错误，再改代码。需要截取错误时可使用：
 
@@ -136,7 +157,7 @@ example cases：
 bash /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/run_hstu8_examples.sh
 ```
 
-该脚本覆盖 HSTU8/FP8 block-scale 示例，判定标准：`14/14 passed`；它不替代 BF16 的 `HSTU16Test`。
+该脚本覆盖原 14 个 HSTU8/FP8 block-scale non-paged 示例，并追加 paged KV mirror/full/edge。Phase 25 后同一套语义同时覆盖 D=128 和 D=256；当前判定标准为全脚本通过，最新 spill-fix 后日志 `1test_results/553_phase25_hdim256_spill_final_examples.log` 为 `62/62 passed`。RAB/DRAB/local 的 paged mirror 属于当前 SM120 FP8 paged guard 明确不支持范围，脚本应标为 `PASS-UNSUPPORTED`。该脚本不替代 BF16 的 `HSTU16Test`。
 
 benchmark：
 
@@ -166,38 +187,7 @@ cd /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu
 
 SASS 中重点搜索 `LDL`/`STL` 以定位 register spill。
 
-Phase 23 FP8 WS SASS 参考：
-
-- 当前 K/V stage persistent 版本：
-  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full_kv_stage_persist.sass`：full 实例 `REG:168 STACK:0 LOCAL:0`，无 `LDL/STL`。
-  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_causal_kv_stage_persist.sass`：causal 实例 `REG:168 STACK:0 LOCAL:0`，无 `LDL/STL`。
-  - benchmark `156` 为 full/causal `643.7/1194.6 TFLOPS`；benchmark `155` 的逐 tile 翻转版本为 `642.2/1204.1 TFLOPS`。
-- mbar producer/consumer four-load-warp 参考版本：
-  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full_mbar_cnt_sync_oempty_real.sass`：full 实例 `REG:168 STACK:0 LOCAL:0`，无 `LDL/STL`。
-  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_causal_mbar_cnt_sync_oempty_real.sass`：causal 实例 `REG:168 STACK:0 LOCAL:0`，无 `LDL/STL`。
-  - benchmark `148` 为 full/causal `646.5/1177.6 TFLOPS`。
-- 当前 S1-hoist split persistent 版本：
-  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full_persistent_hoist_s1.sass`：full 实例无 `LDL/STL`。
-  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_causal_persistent_hoist_s1.sass`：causal 实例无 `LDL/STL`。
-  - benchmark `142` 为 full/causal `643.6/1160.4 TFLOPS`。
-- Four-load-warp 实验版：
-  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full_four_load_warp.sass`：full 实例无 `LDL/STL`。
-  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_causal_four_load_warp.sass`：causal 实例无 `LDL/STL`。
-  - benchmark `143` 为 full/causal `625.2/1166.0 TFLOPS`。
-- Pre-hoist split persistent 参考：
-  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full_split_static_decode.sass`：full 实例 `REG:168 STACK:0 LOCAL:0`，`LDL/STL=0`。
-  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_causal_split_static_decode.sass`：causal 实例 `REG:168 STACK:0 LOCAL:0`，`LDL/STL=0`。
-  - benchmark `140` 为 full/causal `649.5/1162.5 TFLOPS`。
-- 旧 full+causal wrapper persistent 版本：
-  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full_full_causal_persistent_unroll1.sass`：full 实例 `REG:168 STACK:48 LOCAL:0`，`LDL=22`、`STL=16`。
-  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_causal_full_causal_persistent_unroll1.sass`：causal 实例 `REG:168 STACK:56 LOCAL:0`，`LDL=45`、`STL=27`。
-  - 外层 persistent wrapper loop 的 `#pragma unroll 1` 没有减少 spill；benchmark `139` 为 full/causal `627.5/1097.6 TFLOPS`。
-- 旧 pure causal persistent 参考：
-  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full_paired_persistent.sass`：full 实例未走 persistent，`REG:168 STACK:0 LOCAL:0`，`LDL/STL=0`。
-  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_causal_paired_persistent.sass`：causal 实例 `REG:168 STACK:56 LOCAL:0`，`LDL=45`、`STL=27`。
-- 旧 static launch pair 参考：
-  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full_static_launch_pair.sass`：full 实例 `REG:168 STACK:0 LOCAL:0`，`LDL/STL=0`。
-  - `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_causal_static_launch_pair.sass`：causal 实例 `REG:168 STACK:0 LOCAL:0`，`LDL/STL=0`。
+Phase 23 FP8 WS SASS 参考保留在 `PLANS.md` 的 Phase 23 验证记录中。当前仍以 `REG:168 STACK:0 LOCAL:0`、无 `LDL/STL` 作为 FP8 WS 稳定基线；任何新 specialization，尤其是 Phase 25 hdim256，都必须重新 dump SASS 检查 spill。当前 hdim256 full、causal、paged full、paged causal 代表实例已达到无 spill。
 
 ## 性能分析重点
 
@@ -210,7 +200,7 @@ Phase 23 FP8 WS SASS 参考：
 - SM 利用率
 - SMEM bank conflict
 - Block Limit SMEM；当前 FP8 WS 路径受约 85KB SMEM/CTA 限制，通常为 1 CTA/SM。
-- FP8 WS pure full 和 pure causal 当前都是 K/V stage persistent 的 mbar producer/consumer four-load-warp persistent kernel；下一步应跑 NCU，重点确认 No Eligible、Long Scoreboard、mbarrier wait、O-store 与下一 tile Q/SFA/K/V TMA overlap、TMA pipe 竞争，以及 tail-wave 的占比。
+- FP8 WS pure full 和 pure causal 当前都是 K/V stage persistent 的 mbar producer/consumer four-load-warp persistent kernel；若回到 hdim128 FP8 WS 性能优化，应跑 NCU 确认 No Eligible、Long Scoreboard、mbarrier wait、O-store 与下一 tile Q/SFA/K/V TMA overlap、TMA pipe 竞争，以及 tail-wave 的占比。
 - 旧 static launch pair 仍可作为同频对照：当前 split persistent causal 已超过旧 static pair 记录，full 略低于旧 static pair 最好记录。
 
 跑性能数据前可锁频：

@@ -113,6 +113,17 @@ labels = [
     'seq=256 arbitrary',
 ]
 
+base_cases = cases
+base_labels = labels
+cases = []
+labels = []
+for dim in (128, 256):
+    for kw, label in zip(base_cases, base_labels):
+        kw_dim = dict(kw)
+        kw_dim['attn_hidden_dims'] = (dim, dim)
+        cases.append(kw_dim)
+        labels.append(f'D={dim} {label}')
+
 def metric_report(a, b):
     diff = (a.float() - b.float()).abs()
     cos = float(torch.nn.functional.cosine_similarity(
@@ -299,13 +310,13 @@ def run_paged_mirror_case(kw):
     return 'PASS', None, None, (cos, max_err, mean_err, last_page_lens.detach().cpu().tolist())
 
 
-def run_paged_kv_case(batch_size, heads, new_history_len, prev_history_len, target_len):
-    D = 128
+def run_paged_kv_case(batch_size, heads, new_history_len, prev_history_len, target_len, dim=128):
+    D = dim
     page_size = 64
     alpha = 1.0
-    torch.manual_seed(SEED + batch_size * 100 + heads * 10 + new_history_len + prev_history_len + target_len)
+    torch.manual_seed(SEED + batch_size * 100 + heads * 10 + new_history_len + prev_history_len + target_len + dim)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(SEED + batch_size * 100 + heads * 10 + new_history_len + prev_history_len + target_len)
+        torch.cuda.manual_seed_all(SEED + batch_size * 100 + heads * 10 + new_history_len + prev_history_len + target_len + dim)
 
     (
         _,
@@ -387,8 +398,8 @@ def run_paged_kv_case(batch_size, heads, new_history_len, prev_history_len, targ
     return cos, max_err, mean_err, last_page_lens.detach().cpu().tolist()
 
 
-def make_full_paged_kv_input(batch_size, heads, seq_len):
-    D = 128
+def make_full_paged_kv_input(batch_size, heads, seq_len, dim=128):
+    D = dim
     page_size = 64
     pages_per_batch = (seq_len + page_size - 1) // page_size
     total_pages = batch_size * pages_per_batch
@@ -445,14 +456,14 @@ def full_paged_ground_truth(q, kv_cache, cu, page_offsets, page_ids, last_page_l
     return out
 
 
-def run_full_paged_kv_case(batch_size, heads, seq_len):
+def run_full_paged_kv_case(batch_size, heads, seq_len, dim=128):
     alpha = 1.0
-    torch.manual_seed(SEED + 7000 + batch_size * 100 + heads * 10 + seq_len)
+    torch.manual_seed(SEED + 7000 + batch_size * 100 + heads * 10 + seq_len + dim)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(SEED + 7000 + batch_size * 100 + heads * 10 + seq_len)
+        torch.cuda.manual_seed_all(SEED + 7000 + batch_size * 100 + heads * 10 + seq_len + dim)
 
     q, k, v, kv_cache, cu, page_offsets, page_ids, last_page_lens = (
-        make_full_paged_kv_input(batch_size, heads, seq_len)
+        make_full_paged_kv_input(batch_size, heads, seq_len, dim=dim)
     )
     ref = full_paged_ground_truth(
         q, kv_cache, cu, page_offsets, page_ids, last_page_lens, alpha, seq_len)
@@ -492,14 +503,16 @@ PAGED_CASES = [
     (f'paged kv mirror {label}', kw)
     for kw, label in zip(cases, labels)
 ] + [
-    ('paged kv edge partial-last-page',
-     dict(batch_size=1, heads=2, new_history_len=64, prev_history_len=32, target_len=64)),
+    (f'paged kv edge D={dim} partial-last-page',
+     dict(batch_size=1, heads=2, new_history_len=64, prev_history_len=32, target_len=64, dim=dim))
+    for dim in (128, 256)
 ]
 
 PAGED_FULL_CASES = [
-    (f'paged kv full seq={seq_len}', dict(batch_size=batch_size, heads=heads, seq_len=seq_len))
-    for batch_size, heads, seq_len in sorted({
-        (kw['batch_size'], kw['heads'], kw['seq_len_params'][1])
+    (f'paged kv full D={dim} seq={seq_len}',
+     dict(batch_size=batch_size, heads=heads, seq_len=seq_len, dim=dim))
+    for batch_size, heads, seq_len, dim in sorted({
+        (kw['batch_size'], kw['heads'], kw['seq_len_params'][1], kw['attn_hidden_dims'][0])
         for kw in cases
     })
 ]

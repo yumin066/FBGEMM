@@ -1,31 +1,32 @@
-# HSTU SM120 FP8 当前计划
+# HSTU SM120 当前计划
 
-来源：`CLAUDE.md`、`PLAN.md`、`memory.md`。仓库中没有找到小写 `plan.md`，实际存在的是 `PLAN.md`。`PLAN.md` 最后更新到 Phase 19 候选方向，`CLAUDE.md` 中包含更新的 Phase 20/21 状态，因此本文件以 `CLAUDE.md` 的 Phase 21 记录为最新状态。
+来源：`CLAUDE.md`、`PLAN.md`、`memory.md` 和后续 Codex 协作记录。本文件只保留当前目标、阶段状态、验证方法和仍有价值的历史结论；长期协作规则放在 `AGENTS.md`。
 
 ## 当前状态
 
-项目当前位于 SM120 FP8 WS kernel 优化后续阶段。Phase 21 已完成并验证，最新基线为 benchmark 056。Phase 22 已完成第一轮 BF16 迁移评估：当前提交只保留默认 BF16 路径的 `kBlockN=128` 性能改动；WS/TMA 实验因性能回退不进入待提交 diff。Phase 23 当前实现为 FP8 WS pure full 和 pure causal split persistent kernel；其他 mask 仍保持原始 3D grid。
-下一阶段目标定为 Phase 24：支持 SM120 FP8 paged KV cache。
+当前主线处于 Phase 25：支持 SM120 forward headDim256。FP8 hdim256 correctness 路径已打通，pure non-paged causal 的 residual register spill 已清理；验收覆盖当前 hdim128 已支持的 FP8 non-paged 配置组合，以及当前 hdim128 paged KV 已支持的 full、causal、context+causal、target+causal、arbitrary 组合。
+
+Phase 24 的 SM120 FP8 hdim128 paged KV cache 已完成第一阶段支持：`quant_mode=2`、`page_size=64`、forward；full、causal、context+causal、target+causal、arbitrary paged mirror 已通过。RAB/DRAB/local paged mirror 当前由 guard 明确不支持。
 
 最新有效基线：
 
-- Phase 21：Opt A + Opt C，完成于 2026-04-24。
+- Phase 21：Opt A + Opt C，benchmark 056 为历史 hdim128 FP8 non-paged 基线。
+- Phase 22：BF16 默认 hdim128 路径保留 `kBlockN=128`，WS/TMA 实验因性能回退不进入默认路径。
 - Phase 23：FP8 WS pure full 使用 branch-local grid-stride persistent loop，launch CTA 数为 `min(total_tiles, SM_count)`；pure causal 使用 branch-local paired persistent loop，launch CTA 数为 `min(total_tile_pairs, SM_count)`；其他 mask 保持原始 3D grid。
 - Phase 23 split persistent 把 TMA/load persistent loop、math/softmax persistent loop 和 epilogue/O-store 所属路径拆开；O TMA store 由 active load warp 负责，math warps 通过 O ready/empty mbarrier handoff。
 - 当前工作树在 split persistent 基础上已把 Q/K/V/O producer/consumer mbarrier 初始化和 CTA S1 提到 persistent loop 外，跨 tile 维护 mbarrier parity 和 K/V stage；`S_arb` 仍只属于 arbitrary/non-persistent 路径。
-- 当前 S1-hoist 版本 bs=8 seq=4096 h=16 causal：FP8 1160.4 TFLOPS，BF16 653.3 TFLOPS，FP8 比 BF16 快 77.6%。
-- 当前 S1-hoist 版本 bs=8 seq=4096 h=16 full：FP8 643.6 TFLOPS，BF16 375.9 TFLOPS，FP8 比 BF16 快 71.2%。
 - 当前 K/V stage persistent four-load-warp O-stage N-tile parity 公式版 bs=8 seq=4096 h=16 causal：FP8 1194.6 TFLOPS，BF16 677.8 TFLOPS，FP8 比 BF16 快 76.2%。
 - 当前 K/V stage persistent four-load-warp O-stage N-tile parity 公式版 bs=8 seq=4096 h=16 full：FP8 643.7 TFLOPS，BF16 369.2 TFLOPS，FP8 比 BF16 快 74.4%。
-- 2407MHz locked full benchmark `157` 中，当前 persistent bs=8 seq=4096 h=16 full/causal 为 `627.8/1168.8 TFLOPS`；同环境临时关闭 persistent scheduler 的 current-code non-persistent benchmark `158` 为 `4.8/9.0 TFLOPS`，说明当前 four-load-warp/mbar 实现强依赖 persistent scheduler。历史 phase21 non-persistent 参考 `056` 为 `640.0/1131.8 TFLOPS`，不是同源码对照。
 - Pre-hoist split persistent 最好记录仍是 benchmark `140`：full/causal `649.5/1162.5 TFLOPS`。S1-hoist correctness 通过且无 spill，但未形成性能提升。
 - SASS：当前 K/V stage persistent four-load-warp full/causal 目标 kernel 均为 `REG:168 STACK:0 LOCAL:0`，无 `LDL/STL`。
-- 准确性：`sweep_accuracy.py` 全部 `fp8_gt_cos >= 0.9996`。
-- examples：`run_hstu8_examples.sh` 为 14/14 PASS。
+- Phase 24：full paged hdim128 相对 non-paged FP8，benchmark `182` 全部 36 个 full case 平均 `-3.0%`，`seq>=1024` 平均 `-0.1%`，`seq>=4096` 平均 `+1.5%`；causal paged 平均约 `-8.2%`。
+- Phase 24：paged same-input 对照 `1test_results/451_phase24_paged_same_input_sweep.log` 显示 full/causal aligned cases 输出 `max_err=0`。
+- Phase 24：`run_hstu8_examples.sh` 的 paged mirror 最新日志 `1test_results/456_phase24_paged_mirror_examples_final.log` 为 `31/31 passed`；`sweep_accuracy.py` paged mirror 最新日志 `1test_results/455_phase24_paged_mirror_sweep.log` 通过。
+- Phase 25 hdim256 已接入：SM120 编译/dispatch/runtime guard 支持 hdim256，FP8 WS 使用 `{kBlockM=128,kBlockN=64,kHeadDim=256}`；correctness 和 SASS 日志见 Phase 25 记录。下一步重点是 hdim256 大 seq normalized TFLOPS 回退分析。
 
 ## Phase 24：SM120 FP8 paged KV cache
 
-目标：让 SM120 FP8 forward 支持 paged KV cache，并先在 `quant_mode=2` block-scale FP8 路径上打通 correctness，再评估性能。
+状态：SM120 FP8 hdim128 forward paged KV cache 已完成第一阶段支持，并已纳入 examples、sweep、benchmark 和 profile。
 
 当前结论：
 
@@ -34,7 +35,7 @@
 - `set_params_fprop_sm120` 已设置 `kv_cache` stride、page metadata 和 `is_paged_kv`。
 - SM120 FP8 traits 已支持 `Paged_KV` template bool；BF16 traits 仍固定 `Paged_KV=false`。
 - Python wrapper 已能在 SM120 `quant_mode=2` 下量化 paged `kv_cache`，并传入 combined cache+contiguous scale table。
-- 当前实现覆盖 no-RAB、full 和 causal/target、headDim128、`page_size=64`、forward。
+- 当前实现覆盖 headDim128、`page_size=64`、forward；full、causal、context+causal、target+causal、arbitrary paged mirror 已通过，RAB/DRAB/local paged mirror 由 guard 明确不支持。
 - 定向验证已通过：`B=1,H=1` paged KV cos `0.99875`；`B=2,H=4` paged KV cos `0.99876`；partial last page cos `0.99881`；target length 0 cos `0.99886`；非 paged `sweep_accuracy.py` 仍全部 `fp8_gt_cos >= 0.9996`。
 - profile 已支持 paged KV：`ncu_hstu_attn.py --target paged`，`run_profile.sh NNN desc paged` 或 `fp8,paged`。
 - paged causal/target 已接入 paired persistent scheduler；host grid 从 per-tile `(num_m_block,h,b)` 改为 `min(total_tile_pairs, SM_count)`。
@@ -52,16 +53,16 @@
 - benchmark `182`：full paged 相对 non-paged FP8，全部 36 个 full case 平均 `-3.0%`，`seq>=1024` 平均 `-0.1%`，`seq>=4096` 平均 `+1.5%`；causal paged 平均约 `-8.2%`，`seq>=4096` 平均约 `-8.3%`。
 - SASS：paged causal TMA 实例含 `UTMALDG.4D`，当前 SF TMA 版资源 `REG:168 STACK:0 LOCAL:0`，无 `LDL/STL` 命中；`UTMALDG` 计数为 `10`。
 
-第一阶段范围：
+当前支持范围：
 
 - forward only。
 - SM120 FP8 `quant_mode=2`。
-- no-RAB、full 和 causal/target paged KV 优先。
-- headDim128 优先。
+- full、causal、context+causal、target+causal、arbitrary paged KV 已通过；RAB/DRAB/local paged KV 明确 unsupported。
+- headDim128。
 - 初始只支持 `page_size == kBlockN`，优先匹配当前 BN64 路径；不先支持跨 page 的单个 N tile。
 - 先不做 backward、RAB、arbitrary mask、local window 的完整支持。
 
-实施计划：
+已实施路径：
 
 1. API 和参数接线
    - 给 `hstu_varlen_fwd_120` 增加 `kv_cache/page_offsets/page_ids/last_page_lens` optional 参数。
@@ -124,6 +125,70 @@
 - 新 specialization 可能增加 register pressure；persistent+cp.async profile 当前显示 local spilling requests 为 0，但每个保留版本仍必须检查 SASS/profile。
 - persistent scheduler 当前按 logical tile decode；paged KV 需要保证 load/math 两边 page-id decode 完全一致。
 - 当前 full paged 大 seq 已与 non-paged FP8 基本持平；causal paged 大 seq 仍约落后 non-paged FP8 `8%`。主要剩余差距来自 page-id/descriptor 控制流、target tail 手工 copy，以及 page TMA descriptor 固定开销。若要小 seq 和大 seq 都最优，下一步应考虑拆成独立 cp.async-paged 与 TMA-paged dispatch specialization，避免小 seq 也携带 TMA descriptor。
+
+## Phase 25：SM120 headDim256 支持
+
+目标：让 SM120 forward 支持 headDim256，并把 FP8 `quant_mode=2` 当前 hdim128 已支持的所有配置组合都纳入验收范围。
+
+当前状态：
+
+- 已打开 SM120 hdim256 编译、dispatch 和 runtime guard；当前构建使用 `HSTU_DISABLE_HDIM256=FALSE`。
+- FP8 WS hdim256 采用 `{kBlockM=128,kBlockN=64,kHeadDim=256,kNWarps=8}`；Q/K 的 e8m0 scale 改为每 token 一个 int32，按 lane 打包连续 128-D chunk，hdim128 layout 保持兼容。
+- FP8 hdim256 GEMM1 按两个 128-D chunk 分段执行并累加到同一个 `acc_s`；`k_empty` release 延后到两个 chunk 的 K 从 SMEM 消费完成之后，避免 paged/non-paged 多 N tile 时 K stage 被 load warp 提前覆盖。
+- FP8 hdim256 paged KV 支持 full、causal、context+causal、target+causal、arbitrary；RAB/DRAB/local paged mirror 继续按 hdim128 guard 显式 `PASS-UNSUPPORTED`。
+- paged hdim256 history K/V/SFB/SFV 已走 page-cache TMA；aligned full-block target tail 也走 contiguous TMA，非满或不对齐 target tail 保留 guarded copy fallback。
+- hdim256 arbitrary 为了控制 dynamic SMEM，使用 single K/V stage；否则 hdim256 WS buffer 加 `ValidBlockIds` 会超过 SM120 opt-in shared-memory limit。
+- `run_hstu8_examples.sh` 已把原 14 个 non-paged example 扩展为 D=128/D=256，并为 paged mirror/full/edge 同步覆盖 D=128/D=256。最新 spill-fix 后日志 `1test_results/553_phase25_hdim256_spill_final_examples.log` 为 `62/62 passed`。
+- `sweep_accuracy.py` 已扩展 D=128/D=256 主表和 same-input paged vs non-paged 对照。最新 spill-fix 后日志 `1test_results/553_phase25_hdim256_spill_final_sweep.log` 通过；D=256 各项 `fp8_gt_cos >= 0.9996`，paged full/causal same-input 均为 `max_err=0`。
+- hdim256 锁频全量 kernel benchmark 日志 `2benchmark_results/537_c9985651_gpu2407MHz_phase25_hdim128_vs_256_full_kernel.log` 已覆盖 D=128/D=256、full/causal、BF16/FP8/paged；逐 case 对比表在 `2benchmark_results/537_c9985651_gpu2407MHz_phase25_hdim128_vs_256_compare.md`。D=256 vs D=128 geomean：全部 cases FP8 TFLOPS `+4.3%`、paged TFLOPS `+9.2%`；`seq>=1024` FP8 TFLOPS `-11.8%`、paged TFLOPS `-6.4%`。注意 hdim256 flops 翻倍，latency geomean 分别约为 FP8 `1.91x`、paged `1.84x`。
+- BF16 hdim256 定向 full/causal correctness 日志 `1test_results/542_phase25_bf16_hdim256_directed.log` 通过；`hstu_test.py` 的 SM120 attn_dim guard 已扩展到 `64/128/256`。
+- hdim256 spill fix：pure non-paged causal 不再使用 paired persistent scheduler，改回普通 3D grid；该实例使用 runtime mask 单体 N-loop，避免同时实例化 masked/unmasked 两套 hdim256 causal body。hdim256 也不再启用 in-mainloop O-store。
+- SASS 检查：`4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I256_full.sass`、`I256_causal.sass`、`I256_paged_full.sass`、`I256_paged_causal.sass` 均为 `REG:168 STACK:0 LOCAL:0`，且 `LDL=0/STL=0`。spill-fix 重编日志为 `1test_results/553_phase25_hdim256_spill_final_rebuild.log`。
+- 锁频 causal kernel-only 子集日志 `2benchmark_results/553_gpu2407MHz_phase25_hdim256_spill_final_causal_kernel_subset.log`：D=256 non-paged causal FP8 TFLOPS 与前一版 nonpersistent 结果一致；相对 persistent+spill 版 geomean 约 `+13%`，大多数 case 提升，`bs=1/4,seq=2048,h=16` 两个高并发中等 seq case 略低。
+
+范围：
+
+- 先做 forward；backward 不进第一阶段。
+- BF16 headDim256 先作为 correctness 基线，用于验证 tile/SMEM/dispatch 基础能力。
+- FP8 headDim256 必须覆盖当前 hdim128 FP8 non-paged 已支持的全部配置组合；最小集合是 `run_hstu8_examples.sh` 原 14 个 non-paged example 的同语义 hdim256 版本。
+- FP8 headDim256 paged KV 必须覆盖当前 hdim128 paged KV 已支持的全部配置组合；hdim128 paged guard 明确不支持的 RAB/DRAB/local 不作为 hdim256 强制支持项，但必须保持明确报错，不允许静默漏测。
+- paged KV 继续以 `page_size == kBlockN` 为第一约束，避免单个 N tile 跨物理 page。
+
+实施计划：
+
+1. 打开 SM120 hdim256 编译和 dispatch
+   - 构建去掉 `HSTU_DISABLE_HDIM256=TRUE`。
+   - `hstu_varlen_fwd_120` runtime guard 从 `64/128` 扩展到 `64/128/256`，但 paged KV guard 单独控制支持范围。
+   - `run_hstu_fwd_headdim_sm120` 增加 hdim256 specialization。
+   - 测试入口允许 SM120 `attn_dim=256`，但只打开 Phase 25 支持范围内的 cases。
+
+2. 先打通 BF16 headDim256
+   - 修 `get_tile_size_fwd_sm120` 中 BF16 hdim256 的 tile/warp 配置，确保满足 `16*kNWarps <= kBlockM`。
+   - 优先选择较保守的 `{kBlockM=64,kBlockN=64,kNWarps=4}` 或等价配置，先保证 correctness。
+   - 跑 BF16 full/causal correctness，并 dump SASS 查 `LDL/STL`、`STACK`、`LOCAL`。
+
+3. 打通 FP8 non-paged headDim256 全配置组合
+   - 泛化 Q/K block-scale：headDim256 下每个 token/head 有 2 个 128-D scale chunk。
+   - kernel GEMM1 必须按 D chunk 读取对应 Q/K e8m0 scale，不能沿用 hdim128 的单 scale 假设。
+   - 修 FP8 WS 中 hard-coded 128 stride、O epilogue 128 列覆盖、SFA/SFB SMEM 大小和 `kHeadDim/32` 相关手写寻址。
+   - 先用 correctness 证明 full/causal、context/target、arbitrary、RAB/DRAB/local 等当前 hdim128 non-paged 已支持组合可用，再决定是否进入性能优化。
+
+4. 打通 FP8 headDim256 paged KV cache 全支持组合
+   - paged `kv_cache` shape 扩展到 `[total_pages, 2, page_size, heads, 256]`。
+   - paged K cache scale-factor 需要按 physical page id 和 D chunk 可寻址；V cache scale 仍按 page/N block 维度可寻址。
+   - page-cache TMA descriptor 从 `[page_size, 128, h, pages]` 泛化到 `[page_size, 256, h, pages]`。
+   - `copy_fp8_tile_rowmajor_to_sw128` 等 paged fallback helper 不能再 hard-code `kHeadDim=128`，必须模板化。
+   - paged mirror 要按 hdim128 当前可运行语义覆盖 full、causal、context+causal、target+causal、arbitrary 和 partial/edge；hdim128 guard 不支持的 paged RAB/DRAB/local 仍应显式 `PASS-UNSUPPORTED`。
+   - same-input paged vs non-paged 对照要用同一份 raw Q/K/V，并保证 V block-scale 粒度一致。
+
+验收标准：
+
+- BF16 hdim256 non-paged full/causal correctness 通过。
+- FP8 hdim256 non-paged correctness 覆盖当前 hdim128 已支持的全部 non-paged 配置组合，`fp8_gt_cos >= 0.995`，理想 `>= 0.999`。
+- FP8 hdim256 paged KV cache correctness 覆盖当前 hdim128 已支持的全部 paged 配置组合；hdim128 paged guard 不支持的组合必须保持明确 unsupported，不能成为 hdim256-only failure 或静默跳过。
+- FP8 hdim256 same-input 对照通过：non-paged 与 paged 在 hdim128 已支持且语义对齐的 paged cases 下输出应 bitwise 一致或误差可解释。
+- SASS 需要持续查 `LDL/STL`、`STACK`、`LOCAL`；当前 hdim256 full、causal、paged full、paged causal 代表实例均已达到 `STACK:0 LOCAL:0 LDL=0 STL=0`。
+- benchmark 单独输出 hdim256 表，并覆盖当前 hdim128 benchmark 中 FP8 non-paged 与 paged KV 已支持的配置组合。
 
 ## Phase 22：BF16 默认路径优化
 
@@ -313,11 +378,12 @@ Phase 20 的 `kBlockM=256` 路线暂时搁置。
 
 优先级建议：
 
-1. Phase 24：支持 SM120 FP8 paged KV cache。先打通 API/参数/schema，再实现 paged K/V TMA load、paged scale-factor layout、causal/target mask，最后做 correctness 和 benchmark。
-2. 对 Phase 23 当前 FP8 WS 版本做 NCU，确认 No Eligible、Long Scoreboard、SMEM、register、occupancy、mbarrier wait、TMA pipe 竞争和 tail-wave 分布。
-3. 若继续性能优化，评估 `kBlockN=256` 的 SMEM 可行性和寄存器压力，重点检查是否超过 85KB 预算以及是否恶化 1 CTA/SM 限制。
-4. 评估能否把 SMEM 降到约 50KB，以解除 1 CTA/SM 限制；这是高难度方向，但可能直接改善 No Eligible。
-5. Phase 22 BF16：停止通过降低 BF16 causal tile 或单纯提高 launch bound 追求 occupancy；已测方案没有超过默认 `{128,128,8}`。后续若继续 BF16，应优先寻找减少指令/同步/冗余工作且不缩小主 tile 的方案，或做 runtime 多 kernel dispatch 但必须证明目标 shape 有稳定收益。
+1. Phase 25 性能：继续分析 hdim256 大 seq normalized TFLOPS 回退，尤其 `seq>=1024` causal。锁频全量 benchmark `537` 显示 D=256 vs D=128 的 FP8 geomean TFLOPS 在大 seq 为 `-11.8%`。
+2. Phase 25 补充验证：如要提交，可按最终 commit 跑完整 BF16 Hypothesis 子集；当前 spill-fix 已重新记录 SASS/resource summary、examples、sweep 和 causal benchmark 子集。
+3. Phase 25 后续：评估是否给 hdim256 non-paged causal 重新设计不会 spill 的 load/math persistent 版本；当前为消除 spill，只有 hdim256 non-paged causal 回到普通 3D grid，hdim128 causal 和 hdim256 paged causal 仍保留 persistent。
+4. Phase 24 后续性能优化：若回到 hdim128 paged KV，优先分析 causal paged 相对 non-paged 约 `8%` 差距，重点看 page-id/descriptor 控制流、target tail copy 和小 seq TMA 固定开销。
+5. Phase 23 后续性能分析：如继续 FP8 WS hdim128 优化，再跑 NCU 确认 No Eligible、Long Scoreboard、SMEM、register、occupancy、mbarrier wait、TMA pipe 竞争和 tail-wave 分布。
+6. Phase 22 BF16：停止通过降低 BF16 causal tile 或单纯提高 launch bound 追求 occupancy；已测方案没有超过默认 `{128,128,8}`。后续若继续 BF16，应优先寻找减少指令/同步/冗余工作且不缩小主 tile 的方案，或做 runtime 多 kernel dispatch 但必须证明目标 shape 有稳定收益。
 
 不建议立即继续：
 
@@ -331,8 +397,9 @@ Phase 20 的 `kBlockM=256` 路线暂时搁置。
 - 重新编译 HSTU extension。
 - `HSTU_SWEEP_FP8_QUANT_MODE=2 python sweep_accuracy.py`，要求 `fp8_gt_cos >= 0.995`，理想值 `>= 0.9996`。
 - BF16 相关改动运行 `hstu_test.py` 的 `HSTU16Test` 定向用例，至少覆盖 aligned WS 场景和不对齐 fallback 场景。
-- FP8 相关改动运行 `bash run_hstu8_examples.sh`，要求 14/14 PASS。
-- paged KV 相关改动运行 SM120 FP8 paged KV 定向测试，至少覆盖 `page_size == kBlockN`、last page 非满、target length 为 0 和非 0。
+- FP8 相关改动运行 `bash run_hstu8_examples.sh`，要求全脚本通过；当前 paged mirror 口径为 `31/31 passed`，其中 RAB/DRAB/local paged mirror 应为明确的 `PASS-UNSUPPORTED`。
+- paged KV 相关改动运行 SM120 FP8 paged KV 定向测试，至少覆盖 `page_size == kBlockN`、full、causal、last page 非满、target length 为 0 和非 0。
+- Phase 25 hdim256 相关改动必须额外覆盖 BF16 hdim256 full/causal、FP8 hdim256 当前 hdim128 已支持的全部 non-paged/paged 配置组合，以及 same-input paged vs non-paged 对照。
 
 性能相关改动还需要：
 

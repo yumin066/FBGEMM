@@ -356,7 +356,7 @@ def generate_kernels_blackwell(install_dir: str):
     Generate HSTU forward kernels for Blackwell architecture (SM120).
     SM120 uses per-warp mma.sync (same model as Ampere), not WGMMA.
     Supports BF16 and FP8 (e4m3) forward pass only (no backward in Phase 1).
-    Head dims: 64 and 128 only (32 and 256 are not supported on SM120 HSTU).
+    Head dims: 64, 128, and 256 on SM120 HSTU.
     """
 
     # SM120 supports BF16 and FP8; FP16 is low priority (same tiles as BF16)
@@ -365,6 +365,7 @@ def generate_kernels_blackwell(install_dir: str):
         []
         + ([64] if not DISABLE_HDIM64 else [])
         + ([128] if not DISABLE_HDIM128 else [])
+        + ([256] if not DISABLE_HDIM256 else [])
     )
     RAB = [""] + (["_rab"] if not DISABLE_RAB else [])
     MASK = [""]

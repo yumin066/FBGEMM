@@ -74,7 +74,7 @@ constexpr std::tuple<int, int, int> get_tile_size_fwd_sm120() {
         // assert(16 * kNWarps <= kBlockM): 16*8=128 <= 128 ✓
         return {128, 128, 8};
       } else {
-        return {64, 128, 8};
+        return {128, 64, 8};
       }
     } else {
       if constexpr (Headdim <= 64) {
@@ -82,7 +82,7 @@ constexpr std::tuple<int, int, int> get_tile_size_fwd_sm120() {
       } else if constexpr (Headdim == 128) {
         return {128, 64, 8};
       } else {
-        return {64, 128, 8};
+        return {128, 64, 8};
       }
     }
   } else {
@@ -102,7 +102,7 @@ constexpr std::tuple<int, int, int> get_tile_size_fwd_sm120() {
       } else if constexpr (Headdim == 128) {
         return {128, 128, 8};
       } else {
-        return {64, 64, 8};
+        return {64, 64, 4};
       }
     }
   }

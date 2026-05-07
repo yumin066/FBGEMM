@@ -708,26 +708,33 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
     // Uses SM120 QMMA (SM120_16x8x32_TN_VS block-scaled FP8 MMA).
     using BS1 = hstu::SM120QmmaBuilder<kBlockM, kBlockN, 4>;
     using BS2 = hstu::SM120QmmaBuilder<kBlockM, kHeadDim, 4>;
+    using FP8Elem = ElementSmem;
 
-    // SW128 SMEM layouts (required by SM120 block-scaled ldmatrix).
+    // SMEM layouts for SM120 block-scaled ldmatrix. hdim64 needs SW64;
+    // hdim128/256 keep SW128 on the head-dim fast axis.
+    using SmemLayoutAtomQKV = std::conditional_t<
+        (kHeadDim == 64),
+        GMMA::Layout_K_SW64_Atom<FP8Elem>,
+        typename BS1::SmemLayoutAtomA>;
     using SmemLayoutQ_SW128 = decltype(tile_to_shape(
-        typename BS1::SmemLayoutAtomA{},
+        SmemLayoutAtomQKV{},
         Shape<Int<kBlockM>, Int<kHeadDim>>{}));
     using SmemLayoutK_SW128 = decltype(tile_to_shape(
-        typename BS1::SmemLayoutAtomB{},
+        SmemLayoutAtomQKV{},
         Shape<Int<kBlockN>, Int<kHeadDim>>{}));
     using SmemLayoutV_SW128 = decltype(tile_to_shape(
-        typename BS2::SmemLayoutAtomB{},
+        SmemLayoutAtomQKV{},
         Shape<Int<kBlockN>, Int<kHeadDim>>{}));
     // V^T for GEMM2 B operand: GEMM2 needs B in [N=kHeadDim, K=kBlockN] form.
     // SmemLayoutVt_SW128 is a fresh tile_to_shape with swapped dims [kHeadDim, kBlockN],
     // compatible with ldmatrix (SmemCopyAtomB expects SW128 with K=kBlockN as inner dim).
+    using SmemLayoutAtomVt = std::conditional_t<
+        (kBlockN == 64),
+        GMMA::Layout_K_SW64_Atom<FP8Elem>,
+        typename BS2::SmemLayoutAtomB>;
     using SmemLayoutVt_SW128 = decltype(tile_to_shape(
-        typename BS2::SmemLayoutAtomB{},
+        SmemLayoutAtomVt{},
         Shape<Int<kHeadDim>, Int<kBlockN>>{}));
-
-    // In the FP8 path, ElementSmem == Element == cutlass::float_e4m3_t.
-    using FP8Elem = ElementSmem;
 
     // Q and K share SMEM (Share_Q_K_smem=true): both at smem_q base.
     // V is at smem_q + size(SmemLayoutK_SW128) elements.
@@ -811,7 +818,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
 
     // A-operand loader using ldmatrix.sync.aligned.m8n8.x4.shared.b16.
     // See hstu_fwd_kernel_fp8_ws.h for full derivation; uses tidx instead of tidx_math.
-    auto load_a_z_pattern = [&](auto&& sA_pi, auto& tCrA, int k_block_base, int k_block_count) {
+    auto load_a_z_pattern = [&](auto&& sA_pi, auto& tCrA, int k_block_base, int k_block_count, int row_stride) {
       const int lane    = tidx & 31;
       const int warp_m  = tidx / 32;
       const int mat_num = lane >> 3;
@@ -820,7 +827,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
       const int K_half  = mat_num >> 1;
       const uint32_t smem_base =
           static_cast<uint32_t>(__cvta_generic_to_shared(&sA_pi(0, 0)));
-      const uint32_t row_base = smem_base + static_cast<uint32_t>(M_abs * 128);
+      const uint32_t row_base = smem_base + static_cast<uint32_t>(M_abs * row_stride);
       auto tXrA = recast<uint32_t>(tCrA);
       CUTE_UNROLL
       for (int kb = 0; kb < k_block_count; ++kb) {
@@ -837,32 +844,41 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
 
     // B-operand loader using ldmatrix.sync.aligned.m8n8.x4.shared.b16.
     // See hstu_fwd_kernel_fp8_ws.h for full derivation; uses tidx instead of tidx_math.
-    auto load_b_z_pattern = [&](auto&& sB_pi, auto& tCrB, int k_block_base, int k_block_count) {
+    auto load_b_z_pattern = [&](auto&& sB_pi, auto& tCrB, int k_block_base, int k_block_count, int row_stride, int n_groups) {
       const int lane    = tidx & 31;
       const int mat_num = lane >> 3;
       const int mat_row = lane & 7;
       const uint32_t smem_base =
           static_cast<uint32_t>(__cvta_generic_to_shared(&sB_pi(0, 0)));
       auto tXrB = recast<uint32_t>(tCrB);
-      constexpr int kNGroups = kBlockN / 32;  // 4
       CUTE_UNROLL
       for (int kb = 0; kb < k_block_count; ++kb) {
-        CUTE_UNROLL
-        for (int g = 0; g < kNGroups; ++g) {
+        for (int g = 0; g < n_groups; ++g) {
           const uint32_t N_row  = static_cast<uint32_t>(g * 32 + mat_num * 8 + mat_row);
-          const int frag_base   = 32 * kb + 2 * g;
           CUTE_UNROLL
           for (int K_half = 0; K_half < 2; ++K_half) {
             const int K_start  = (k_block_base + kb) * 32 + K_half * 16;
             const uint32_t addr =
-                smem_base + N_row * 128 + static_cast<uint32_t>(K_start ^ (mat_row << 4));
-            asm volatile(
-                "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3},[%4];\n"
-                : "=r"(tXrB(frag_base + K_half +  0)),
-                  "=r"(tXrB(frag_base + K_half +  8)),
-                  "=r"(tXrB(frag_base + K_half + 16)),
-                  "=r"(tXrB(frag_base + K_half + 24))
-                : "r"(addr));
+                smem_base + N_row * row_stride + static_cast<uint32_t>(K_start ^ (mat_row << 4));
+            if constexpr (kBlockN == 64) {
+              const int frag_base64 = 16 * kb + 8 * g;
+              asm volatile(
+                  "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3},[%4];\n"
+                  : "=r"(tXrB(frag_base64 + K_half + 0)),
+                    "=r"(tXrB(frag_base64 + K_half + 2)),
+                    "=r"(tXrB(frag_base64 + K_half + 4)),
+                    "=r"(tXrB(frag_base64 + K_half + 6))
+                  : "r"(addr));
+            } else {
+              const int frag_base = 32 * kb + 2 * g;
+              asm volatile(
+                  "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3},[%4];\n"
+                  : "=r"(tXrB(frag_base + K_half +  0)),
+                    "=r"(tXrB(frag_base + K_half +  8)),
+                    "=r"(tXrB(frag_base + K_half + 16)),
+                    "=r"(tXrB(frag_base + K_half + 24))
+                  : "r"(addr));
+            }
           }
         }
       }
@@ -904,16 +920,23 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
 
     auto sQ_pi = as_position_independent_swizzle_tensor(sQ_sw128);
     Tensor tCrQ = thr_mma_g1.partition_fragment_A(sQ_pi);
-    load_a_z_pattern(sQ_pi, tCrQ, 0, kHeadDim / 32);
+    if constexpr (kHeadDim <= 128) {
+      load_a_z_pattern(sQ_pi, tCrQ, 0, kHeadDim / 32, kHeadDim);
+    }
 
     // Load SFA once (unit scale stays constant throughout).
     Tensor tCrSFA = BS1::partition_fragment_SFA(sSFA(_,_,_0{}), thr_mma_g1);
-    {
-      auto tXsSFA = s2r_thr_copy_SFA.partition_S(sSFA);
-      auto tXrSFA = s2r_thr_copy_SFA.retile_D(tCrSFA);
-      cute::copy(s2r_copy_SFA, tXsSFA(_,_,_,_0{}), tXrSFA);
-    }
+    const int sfa_warp_m = tidx / 32;
+    const int sfa_lane = tidx & 31;
+    const int sfa_row = sfa_warp_m * 16 + 8 * (sfa_lane & 1) + (sfa_lane >> 2);
+    tCrSFA(0, 0, 0) = smem_sfa_ptr[sfa_row];
     auto tCrSFA_frg = BS1::transform_fragment_for_qmma(tCrSFA);
+
+    auto replicate_e8m0_lane = [](int32_t packed, int lane) {
+      const uint32_t byte = (static_cast<uint32_t>(packed) >> (8 * lane)) & 0xffu;
+      return static_cast<int32_t>(
+          byte | (byte << 8) | (byte << 16) | (byte << 24));
+    };
 
     // mask lambdas (identical logic to BF16 path).
     auto col_limit_right = [&](int row) {
@@ -1026,14 +1049,21 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
       __syncthreads();
       auto sK_pi = as_position_independent_swizzle_tensor(sK_sw128);
       Tensor tCrK = thr_mma_g1.partition_fragment_B(sK_pi);
-      load_b_z_pattern(sK_pi, tCrK, 0, kHeadDim / 32);
+      if constexpr (kHeadDim <= 128) {
+        load_b_z_pattern(sK_pi, tCrK, 0, kHeadDim / 32, kHeadDim, kBlockN / 32);
+      }
 
-      // Load SFB (unit scale).
+      // Load SFB. For kBlockN=64 the CUTE TV layout degenerates under
+      // AtomLayout <_8,_1,_1>, so use the same explicit row mapping as WS.
       Tensor tCrSFB = BS1::partition_fragment_SFB(sSFB(_,_,_0{}), thr_mma_g1);
       {
-        auto tXsSFB = s2r_thr_copy_SFB.partition_S(sSFB);
-        auto tXrSFB = s2r_thr_copy_SFB.retile_D(tCrSFB);
-        cute::copy(s2r_copy_SFB, tXsSFB(_,_,_,_0{}), tXrSFB);
+        const int n_row_sfb = (tidx & 31) >> 2;
+        constexpr int kNAtomsSFB = kBlockN / 8;
+        CUTE_UNROLL
+        for (int nr = 0; nr < kNAtomsSFB; ++nr) {
+          const int N_base = nr * 8;
+          tCrSFB(0, nr, 0) = smem_sfb_ptr[N_base + n_row_sfb];
+        }
       }
       auto tCrSFB_frg = BS1::transform_fragment_for_qmma(tCrSFB);
 
@@ -1044,10 +1074,64 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
       // using stage 0 is correct for the full MMA_K=4 iteration in cute::gemm.
       Tensor acc_s = partition_fragment_C(tiled_mma_g1, Shape<Int<kBlockM>, Int<kBlockN>>{});
       clear(acc_s);
-      cute::gemm(tiled_mma_g1,
-          make_zip_tensor(tCrQ, tCrSFA_frg(_,_,_,_0{})),
-          make_zip_tensor(tCrK, tCrSFB_frg(_,_,_,_0{})),
-          acc_s);
+      if constexpr (kHeadDim == 256) {
+        Tensor tCrSFA0 = make_tensor_like<int32_t>(tCrSFA);
+        Tensor tCrSFA1 = make_tensor_like<int32_t>(tCrSFA);
+        Tensor tCrSFB0 = make_tensor_like<int32_t>(tCrSFB);
+        Tensor tCrSFB1 = make_tensor_like<int32_t>(tCrSFB);
+        CUTE_UNROLL
+        for (int i = 0; i < size(tCrSFA); ++i) {
+          tCrSFA0(i) = replicate_e8m0_lane(tCrSFA(i), 0);
+          tCrSFA1(i) = replicate_e8m0_lane(tCrSFA(i), 1);
+        }
+        CUTE_UNROLL
+        for (int i = 0; i < size(tCrSFB); ++i) {
+          tCrSFB0(i) = replicate_e8m0_lane(tCrSFB(i), 0);
+          tCrSFB1(i) = replicate_e8m0_lane(tCrSFB(i), 1);
+        }
+        auto tCrSFA0_frg = BS1::transform_fragment_for_qmma(tCrSFA0);
+        auto tCrSFA1_frg = BS1::transform_fragment_for_qmma(tCrSFA1);
+        auto tCrSFB0_frg = BS1::transform_fragment_for_qmma(tCrSFB0);
+        auto tCrSFB1_frg = BS1::transform_fragment_for_qmma(tCrSFB1);
+
+        using SmemLayoutQChunk_SW128 = decltype(tile_to_shape(
+            GMMA::Layout_K_SW128_Atom<FP8Elem>{},
+            Shape<Int<kBlockM>, Int<128>>{}));
+        using SmemLayoutKChunk_SW128 = decltype(tile_to_shape(
+            GMMA::Layout_K_SW128_Atom<FP8Elem>{},
+            Shape<Int<kBlockN>, Int<128>>{}));
+        Tensor sQ_chunk = make_tensor(sQ_sw128.data(), SmemLayoutQChunk_SW128{});
+        Tensor sK_chunk = make_tensor(sK_sw128.data(), SmemLayoutKChunk_SW128{});
+        auto sQ_chunk_pi = as_position_independent_swizzle_tensor(sQ_chunk);
+        auto sK_chunk_pi = as_position_independent_swizzle_tensor(sK_chunk);
+
+        Tensor tCrQ0 = thr_mma_g1.partition_fragment_A(sQ_chunk_pi);
+        Tensor tCrK0 = thr_mma_g1.partition_fragment_B(sK_chunk_pi);
+        clear(tCrQ0);
+        clear(tCrK0);
+        load_a_z_pattern(sQ_pi, tCrQ0, 0, 4, kHeadDim);
+        load_b_z_pattern(sK_pi, tCrK0, 0, 4, kHeadDim, kBlockN / 32);
+        cute::gemm(tiled_mma_g1,
+            make_zip_tensor(tCrQ0, tCrSFA0_frg(_,_,_,_0{})),
+            make_zip_tensor(tCrK0, tCrSFB0_frg(_,_,_,_0{})),
+            acc_s);
+
+        Tensor tCrQ1 = thr_mma_g1.partition_fragment_A(sQ_chunk_pi);
+        Tensor tCrK1 = thr_mma_g1.partition_fragment_B(sK_chunk_pi);
+        clear(tCrQ1);
+        clear(tCrK1);
+        load_a_z_pattern(sQ_pi, tCrQ1, 4, 4, kHeadDim);
+        load_b_z_pattern(sK_pi, tCrK1, 4, 4, kHeadDim, kBlockN / 32);
+        cute::gemm(tiled_mma_g1,
+            make_zip_tensor(tCrQ1, tCrSFA1_frg(_,_,_,_0{})),
+            make_zip_tensor(tCrK1, tCrSFB1_frg(_,_,_,_0{})),
+            acc_s);
+      } else {
+        cute::gemm(tiled_mma_g1,
+            make_zip_tensor(tCrQ, tCrSFA_frg(_,_,_,_0{})),
+            make_zip_tensor(tCrK, tCrSFB_frg(_,_,_,_0{})),
+            acc_s);
+      }
 
       // Apply RAB (relative attention bias) to acc_s after GEMM1.
       // sRab[kBlockM, kBlockN, 1] was preloaded from GMEM (BF16) in the preamble
@@ -1113,8 +1197,21 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
       // (m,k) to the correct physical SMEM address for ldmatrix reads.
       __syncthreads();
 
-      Tensor sPbuf = make_tensor(sQ_sw128.data(), SmemLayoutQ_SW128{});
-      auto sPbuf_pi = as_position_independent_swizzle_tensor(sPbuf);
+      auto sPbuf_pi = [&]() {
+        if constexpr (kBlockN == 64) {
+          using SmemLayoutP_SW64 = decltype(tile_to_shape(
+              GMMA::Layout_K_SW64_Atom<FP8Elem>{},
+              Shape<Int<kBlockM>, Int<kBlockN>>{}));
+          Tensor sPbuf = make_tensor(sQ_sw128.data(), SmemLayoutP_SW64{});
+          return as_position_independent_swizzle_tensor(sPbuf);
+        } else {
+          using SmemLayoutP_SW128 = decltype(tile_to_shape(
+              typename BS2::SmemLayoutAtomA{},
+              Shape<Int<kBlockM>, Int<kBlockN>>{}));
+          Tensor sPbuf = make_tensor(sQ_sw128.data(), SmemLayoutP_SW128{});
+          return as_position_independent_swizzle_tensor(sPbuf);
+        }
+      }();
       {
         Tensor cP_id = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
         Tensor tPcP  = thr_mma_g1.partition_C(cP_id);
@@ -1130,21 +1227,29 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
 
       // s2r load P (A-operand for GEMM2) via Z-pattern uint32 loads.
       Tensor tCrP = thr_mma_g2.partition_fragment_A(sPbuf_pi);
-      load_a_z_pattern(sPbuf_pi, tCrP, 0, kBlockN / 32);
+      load_a_z_pattern(sPbuf_pi, tCrP, 0, kBlockN / 32, kBlockN);
+      if constexpr (kBlockN == 64 && kHeadDim == 256) {
+        auto tXrP = recast<uint32_t>(tCrP);
+        CUTE_UNROLL
+        for (int i = 8; i < size(tXrP); ++i) {
+          tXrP(i) = tXrP(i & 7);
+        }
+      }
 
       // Fill SFP (P scale, always unit) and load SFV (V scale).
       // These writes to end-of-SMEM (smem_sfa/sfb_ptr) happen before V DMA, no conflict.
       for (int i = tidx; i < kBlockM; i += Kernel_traits::kNThreads)
         smem_sfa_ptr[i] = 0x7f7f7f7f;  // SFP = unit (P not explicitly quantized)
+      int32_t sfv_word = 0x7f7f7f7f;
       if (params.sf_v_packed_ptr != nullptr && params.cu_seqlens_v_block_descale != nullptr) {
         // V SF: scalar broadcast — V is quantized along N (1 scale per 128-token tile).
         // v_block_descale_head_stride = SEQ/128 (from descale_v.stride(0)).
         // cu_seqlens_v_block_descale[bidb] = cumulative block offset for V (in blocks).
         const int64_t v_sf_idx = static_cast<int64_t>(bidh) * params.v_block_descale_head_stride
             + params.cu_seqlens_v_block_descale[bidb] + nb;
-        const int32_t vsf_val = params.sf_v_packed_ptr[v_sf_idx];
+        sfv_word = params.sf_v_packed_ptr[v_sf_idx];
         for (int i = tidx; i < kBlockN; i += Kernel_traits::kNThreads)
-          smem_sfb_ptr[i] = vsf_val;
+          smem_sfb_ptr[i] = sfv_word;
       } else {
         for (int i = tidx; i < kBlockN; i += Kernel_traits::kNThreads)
           smem_sfb_ptr[i] = 0x7f7f7f7f;
@@ -1157,13 +1262,13 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
           make_smem_ptr(reinterpret_cast<FP8Elem*>(smem_q)),
           SmemLayoutVt_SW128{});
       {
-          FP8Elem* sV_curr_ptr = reinterpret_cast<FP8Elem*>(smem_q) + size(SmemLayoutK_SW128{});
-          Tensor sV_curr = make_tensor(make_smem_ptr(sV_curr_ptr), SmemLayoutV_SW128{});
-          for (int idx = tidx; idx < kBlockN * kHeadDim; idx += Kernel_traits::kNThreads) {
-              int k = idx / kHeadDim;
-              int d = idx % kHeadDim;
-              sVt_buf(d, k) = sV_curr(k, d);
-          }
+        FP8Elem* sV_curr_ptr = reinterpret_cast<FP8Elem*>(smem_q) + size(SmemLayoutK_SW128{});
+        Tensor sV_curr = make_tensor(make_smem_ptr(sV_curr_ptr), SmemLayoutV_SW128{});
+        for (int idx = tidx; idx < kBlockN * kHeadDim; idx += Kernel_traits::kNThreads) {
+          int k = idx / kHeadDim;
+          int d = idx % kHeadDim;
+          sVt_buf(d, k) = sV_curr(k, d);
+        }
       }
       __syncthreads();
 
@@ -1174,46 +1279,90 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
       Tensor sVt_read = make_tensor(make_smem_ptr(sVt_read_ptr), SmemLayoutVt_SW128{});
       auto sVt_pi = as_position_independent_swizzle_tensor(sVt_read);
       Tensor tCrV = thr_mma_g2.partition_fragment_B(sVt_pi);
-      load_b_z_pattern(sVt_pi, tCrV, 0, kBlockN / 32);
+      if constexpr (kHeadDim == 256 && kBlockN == 64) {
+        const int lane = tidx & 31;
+        const int mat_num = lane >> 3;
+        const int mat_row = lane & 7;
+        const uint32_t smem_base =
+            static_cast<uint32_t>(__cvta_generic_to_shared(&sVt_pi(0, 0)));
+        auto tXrV = recast<uint32_t>(tCrV);
+        CUTE_UNROLL
+        for (int kb = 0; kb < 2; ++kb) {
+          CUTE_UNROLL
+          for (int g = 0; g < kHeadDim / 32; ++g) {
+            const uint32_t N_row = static_cast<uint32_t>(g * 32 + mat_num * 8 + mat_row);
+            CUTE_UNROLL
+            for (int K_half = 0; K_half < 2; ++K_half) {
+              const int K_start = kb * 32 + K_half * 16;
+              const uint32_t addr =
+                  smem_base + N_row * kBlockN + static_cast<uint32_t>(K_start ^ (mat_row << 4));
+              const int base = (kHeadDim / 4) * kb + 32 * (g >> 2) + 2 * (g & 3) + K_half;
+              asm volatile(
+                  "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3},[%4];\n"
+                  : "=r"(tXrV(base + 0)), "=r"(tXrV(base + 8)),
+                    "=r"(tXrV(base + 16)), "=r"(tXrV(base + 24))
+                  : "r"(addr));
+            }
+          }
+        }
+      } else {
+        load_b_z_pattern(sVt_pi, tCrV, 0, kBlockN / 32, kBlockN, kHeadDim / 32);
+      }
 
       // Prefetch K[nb_next] + V[nb_next] for next iteration.
       if (nb_next >= 0) {
-          flash::copy<false, true>(gmem_tiled_copy_sw128,
-              tKgK(_,_,_, nb_next), tKsK, tKVcKV,
-              actual_seqlen_k - nb_next * kBlockN);
-          flash::copy<false, true>(gmem_tiled_copy_sw128,
-              tVgV(_,_,_, nb_next), tVsV, tKVcKV,
-              actual_seqlen_k - nb_next * kBlockN);
-          if constexpr (Has_rab) {
-              copy_g2s_rab(nb_next, 0);
-          }
-          cute::cp_async_fence();
+        flash::copy<false, true>(gmem_tiled_copy_sw128,
+            tKgK(_,_,_, nb_next), tKsK, tKVcKV,
+            actual_seqlen_k - nb_next * kBlockN);
+        flash::copy<false, true>(gmem_tiled_copy_sw128,
+            tVgV(_,_,_, nb_next), tVsV, tKVcKV,
+            actual_seqlen_k - nb_next * kBlockN);
+        if constexpr (Has_rab) {
+          copy_g2s_rab(nb_next, 0);
+        }
+        cute::cp_async_fence();
       }
 
       // Load SFP (P scale) and SFV (V scale): both unit, reuse sSFA/sSFB.
       Tensor tCrSFP = BS2::partition_fragment_SFA(sSFA(_,_,_0{}), thr_mma_g2);
-      {
+      if constexpr (kHeadDim == 256) {
+        CUTE_UNROLL
+        for (int i = 0; i < size(tCrSFP); ++i) {
+          tCrSFP(i) = 0x7f7f7f7f;
+        }
+      } else {
         auto tXsSFP = s2r_thr_copy_SFP.partition_S(sSFA);
         auto tXrSFP = s2r_thr_copy_SFP.retile_D(tCrSFP);
         cute::copy(s2r_copy_SFP, tXsSFP(_,_,_,_0{}), tXrSFP);
       }
       auto tCrSFP_frg = BS2::transform_fragment_for_qmma(tCrSFP);
 
-      Tensor tCrSFV = BS2::partition_fragment_SFB(sSFB(_,_,_0{}), thr_mma_g2);
-      {
-        auto tXsSFV = s2r_thr_copy_SFV.partition_S(sSFB);
-        auto tXrSFV = s2r_thr_copy_SFV.retile_D(tCrSFV);
-        cute::copy(s2r_copy_SFV, tXsSFV(_,_,_,_0{}), tXrSFV);
+      if constexpr (kHeadDim == 256) {
+        using SmemLayoutSFV = typename BS2::SmemLayoutSFB;
+        Tensor sSFV_dummy_ = make_tensor(make_smem_ptr(smem_sfb_ptr), SmemLayoutSFV{});
+        Tensor tCrSFV = BS2::partition_fragment_SFB(sSFV_dummy_(_,_,_0{}), thr_mma_g2);
+        CUTE_UNROLL
+        for (int i = 0; i < size(tCrSFV); ++i) {
+          tCrSFV(i) = sfv_word;
+        }
+        auto tCrSFV_frg = BS2::transform_fragment_for_qmma(tCrSFV);
+        cute::gemm(tiled_mma_g2,
+            make_zip_tensor(tCrP, tCrSFP_frg(_,_,_,_0{})),
+            make_zip_tensor(tCrV, tCrSFV_frg(_,_,_,_0{})),
+            acc_o);
+      } else {
+        Tensor tCrSFV = BS2::partition_fragment_SFB(sSFB(_,_,_0{}), thr_mma_g2);
+        {
+          auto tXsSFV = s2r_thr_copy_SFV.partition_S(sSFB);
+          auto tXrSFV = s2r_thr_copy_SFV.retile_D(tCrSFV);
+          cute::copy(s2r_copy_SFV, tXsSFV(_,_,_,_0{}), tXrSFV);
+        }
+        auto tCrSFV_frg = BS2::transform_fragment_for_qmma(tCrSFV);
+        cute::gemm(tiled_mma_g2,
+            make_zip_tensor(tCrP, tCrSFP_frg(_,_,_,_0{})),
+            make_zip_tensor(tCrV, tCrSFV_frg(_,_,_,_0{})),
+            acc_o);
       }
-      auto tCrSFV_frg = BS2::transform_fragment_for_qmma(tCrSFV);
-
-      // GEMM2: acc_o += P × V (block-scaled).
-      // Same rank-3 slice pattern as GEMM1.
-      cute::gemm(tiled_mma_g2,
-          make_zip_tensor(tCrP, tCrSFP_frg(_,_,_,_0{})),
-          make_zip_tensor(tCrV, tCrSFV_frg(_,_,_,_0{})),
-          acc_o);
-
     };
 
     // Main loop over n_blocks (descending order, same as BF16 path).
@@ -1518,7 +1667,8 @@ void run_hstu_fwd_sm120_fp8_ws_tma_impl(Hstu_fwd_params& params, cudaStream_t st
       !Is_causal && !Is_target && !Is_context && !Is_local && !Is_arbitrary;
   static constexpr bool Use_paired_persistent =
       Is_causal && !Is_context && !Is_local && !Is_arbitrary &&
-      (!Is_target || Paged_KV);
+      (!Is_target || Paged_KV) &&
+      (kHeadDim <= 128 || Paged_KV);
   static constexpr bool Use_persistent = Use_full_persistent || Use_paired_persistent;
   const int persistent_work_units = Use_paired_persistent ? total_tile_pairs : total_tiles;
   int sm_count = 0;
@@ -1645,11 +1795,11 @@ void run_hstu_fwd_sm120(Hstu_fwd_params& params, cudaStream_t stream) {
     BOOL_SWITCH(params.is_paged_kv, Paged_KV, [&] {
       if constexpr (Paged_KV) {
         TORCH_CHECK(!Has_rab, "SM120 FP8 paged KV initial path does not support RAB");
-        TORCH_CHECK(kHeadDim == 128 && kBlockN == 64,
-            "SM120 FP8 paged KV initial path requires headDim=128 and kBlockN=64");
+        TORCH_CHECK(kHeadDim % 128 == 0 && kBlockN == 64,
+            "SM120 FP8 paged KV path requires headDim divisible by 128 and kBlockN=64");
       }
       if constexpr (!Has_rab) {
-        if constexpr ((kHeadDim == 128 && kBlockN == 64) || (kBlockN % 128) == 0) {
+        if constexpr ((kHeadDim % 128 == 0 && kBlockN == 64) || (kBlockN % 128) == 0) {
           // WS TMA kernel: non-paged K/V use contiguous TMA; paged history K/V
           // uses page-cache TMA indexed by runtime page_id. Paged target tail
           // remains a guarded load-warp copy.
@@ -1660,11 +1810,11 @@ void run_hstu_fwd_sm120(Hstu_fwd_params& params, cudaStream_t stream) {
         } else {
           TORCH_CHECK(
               false,
-              "SM120 FP8 WS blockscaled path currently requires headDim128+kBlockN64 or kBlockN divisible by 128, got kBlockN=",
-              kBlockN);
+              "SM120 FP8 WS blockscaled path currently requires headDim divisible by 128 with kBlockN64 or kBlockN divisible by 128, got headDim=",
+              kHeadDim, ", kBlockN=", kBlockN);
         }
       } else {
-        if constexpr ((kBlockN % 128) == 0) {
+        if constexpr ((kBlockN % 64) == 0) {
           // cp.async fallback for Has_rab=true (WS kernel does not support RAB).
           using Kernel_traits = Hstu_fwd_kernel_traits_sm120_fp8<
               kHeadDim, kBlockM, kBlockN, kNWarps,
@@ -1676,7 +1826,7 @@ void run_hstu_fwd_sm120(Hstu_fwd_params& params, cudaStream_t stream) {
           // Compile-time gate: do not instantiate FP8 blockscaled fallback for unsupported N tiles.
           TORCH_CHECK(
               false,
-              "SM120 FP8 blockscaled fallback currently requires kBlockN divisible by 128, got kBlockN=",
+              "SM120 FP8 blockscaled fallback currently requires kBlockN divisible by 64, got kBlockN=",
               kBlockN);
         }
       }

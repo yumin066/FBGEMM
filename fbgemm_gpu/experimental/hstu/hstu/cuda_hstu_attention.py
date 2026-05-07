@@ -128,12 +128,14 @@ def quantize_for_block_scale_qk_along_d(x, seq_offsets, fp8_type=torch.float8_e4
             cur_quant = (cur / cur_scale.unsqueeze(-1)).to(fp8_type).view(actual_len, head, dim)
             x_quantized[start:end] = cur_quant
 
-            # Layout for kernel side: [head, total_scale_rows], with one scale-row per (token, d_chunk)
-            cur_scale_flat = cur_scale.permute(0, 2, 1).reshape(actual_len * d_chunks, head)  # [N*Dblk, H]
-            x_descale_list.append(cur_scale_flat)
-            cu_seqlens_x_descale[i + 1] = cu_seqlens_x_descale[i] + actual_len * d_chunks
+            # Kernel-side SF layout is one int32 per token.  The int32 packs up to
+            # four e8m0 scales for consecutive 128-D chunks.
+            x_descale_list.append(cur_scale)  # [N, H, D/128]
+            cu_seqlens_x_descale[i + 1] = cu_seqlens_x_descale[i] + actual_len
 
-    x_descale = torch.cat(x_descale_list, dim=0).transpose(1, 0).contiguous()  # [H, total]
+    x_descale = torch.cat(x_descale_list, dim=0).permute(1, 0, 2).contiguous()  # [H, total, D/128]
+    if d_chunks == 1:
+        x_descale = x_descale.squeeze(-1).contiguous()  # preserve hdim128 layout: [H, total]
     return x_quantized, x_descale, cu_seqlens_x_descale
 
 
@@ -184,9 +186,28 @@ def quantize_for_block_scale_v_along_n(x, seq_offsets, block_size=128, fp8_type=
 
 def pack_descale_to_e8m0x4_int32(descale: torch.Tensor) -> torch.Tensor:
     # Convert float descale tensor (already e8m0-rounded in this path) into int32 packed e8m0x4.
+    # Supported layouts:
+    #   [H, N]             -> replicate one scale into all 4 e8m0 lanes (hdim128 / V)
+    #   [H, N, D/128<=4]   -> pack consecutive D-chunk scales into e8m0 lanes (Q/K hdim256)
     s = torch.clamp(descale.to(torch.float32), min=1e-10)
     exp_unbiased = torch.ceil(torch.log2(s))
     exp_biased = torch.clamp(exp_unbiased + 127.0, 0.0, 255.0).to(torch.uint8)
+    if exp_biased.dim() == 3:
+        if exp_biased.size(-1) > 4:
+            raise ValueError(f"e8m0x4 packing supports at most 4 D chunks, got {exp_biased.size(-1)}")
+        padded = torch.zeros(
+            (*exp_biased.shape[:-1], 4),
+            dtype=torch.uint8,
+            device=exp_biased.device,
+        )
+        padded[..., :exp_biased.size(-1)] = exp_biased
+        word = padded.to(torch.int32)
+        return (
+            word[..., 0]
+            | (word[..., 1] << 8)
+            | (word[..., 2] << 16)
+            | (word[..., 3] << 24)
+        ).contiguous()
     word = exp_biased.to(torch.int32)
     return (word | (word << 8) | (word << 16) | (word << 24)).contiguous()
 
@@ -215,8 +236,10 @@ def quantize_paged_kv_cache_for_block_scale(
         k_scale = torch.amax(k_view.abs(), dim=3).to(torch.float32) / fp8_max
         k_scale = _round_descale_to_e8m0(k_scale)
         k_fp8 = (k_view / k_scale.unsqueeze(-1)).to(fp8_type).view(pages, page_size, heads, dim)
-        k_scale_flat = k_scale.permute(0, 2, 1).reshape(pages * page_size * (dim // 128), heads)
-        sf_k_cache = pack_descale_to_e8m0x4_int32(k_scale_flat.transpose(1, 0).contiguous())
+        k_scale_by_head = k_scale.permute(1, 0, 2).contiguous()  # [H, pages*page_size, D/128]
+        if dim // 128 == 1:
+            k_scale_by_head = k_scale_by_head.squeeze(-1).contiguous()
+        sf_k_cache = pack_descale_to_e8m0x4_int32(k_scale_by_head)
 
         v_scale = torch.amax(v_cache.abs(), dim=(1, 3)).to(torch.float32) / fp8_max
         v_scale = _round_descale_to_e8m0(v_scale)  # [pages, heads]
@@ -247,7 +270,7 @@ def get_bm_and_bn_block_size_fwd(rab, dim):
         elif dim == 128:
             return 128, 128  # kBlockM=128, kBlockN=128 (utils.h: {128, 128, 8} for FP8+rab+hdim128)
         else:
-            return 128, 128  # kBlockM=64, kBlockN=128 (utils.h: {64, 128, 8} for FP8+rab+hdim>128)
+            return 128, 64   # kBlockM=128, kBlockN=64 (utils.h: {128, 64, 8} for FP8+rab+hdim>128)
     else:
         if dim == 64:
             return 128, 128
@@ -378,8 +401,8 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
                 if is_paged_kv:
                     if rab is not None:
                         raise ValueError("SM120 FP8 paged KV initial path does not support RAB")
-                    if dim != 128 or bn != 64:
-                        raise ValueError("SM120 FP8 paged KV initial path requires headDim=128 and kBlockN=64")
+                    if dim % 128 != 0 or bn != 64:
+                        raise ValueError("SM120 FP8 paged KV path requires headDim divisible by 128 and kBlockN=64")
                     if kv_cache.shape[2] != bn:
                         raise ValueError(f"SM120 FP8 paged KV requires page_size={bn}")
                 q_raw, k_raw, v_raw = q, k, v

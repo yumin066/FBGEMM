@@ -740,7 +740,7 @@ class HSTU16Test(unittest.TestCase):
 
         # SM120 supports all configurations except backward.
         if torch.cuda.get_device_capability()[0] >= 12:
-            if attn_dim not in (64, 128):
+            if attn_dim not in (64, 128, 256):
                 logger.info(f"Skipping test for SM120: unsupported attn_dim={attn_dim}")
                 return
 

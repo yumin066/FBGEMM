@@ -130,8 +130,8 @@ def make_paged_kv_raw_inputs(batch_size, seqlen, nheads, headdim, window_size):
     """
     if window_size not in {(-1, 0), (-1, -1)}:
         raise ValueError("paged KV benchmark supports only causal (-1,0) and full (-1,-1)")
-    if headdim != 128:
-        raise ValueError("SM120 FP8 paged KV benchmark requires headDim=128")
+    if headdim % 128 != 0:
+        raise ValueError("SM120 FP8 paged KV benchmark requires headDim divisible by 128")
 
     page_size = fp8_block_n(headdim)
     if page_size != 64:
@@ -781,7 +781,7 @@ def parse_args():
         metavar="H",
     )
     parser.add_argument(
-        "--headdims", type=int, nargs="+", default=[128],
+        "--headdims", type=int, nargs="+", default=[128, 256],
         metavar="D",
     )
     parser.add_argument(

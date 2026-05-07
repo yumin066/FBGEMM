@@ -290,19 +290,21 @@ struct Hstu_fwd_kernel_traits_sm120_fp8 {
   using SmemLayoutVtransposedNoSwizzle =
       decltype(get_nonswizzle_portion(SmemLayoutVtransposed{}));
 
-  // Phase 5 TMA layouts: SW128 swizzle (= SM120BlockScaledBuilder::SmemLayoutAtomA/B).
+  // Phase 5 TMA layouts: SW128 for 128B+ contiguous K tiles, SW64 for hdim64.
   // Used for make_tma_copy in run_hstu_fwd_sm120_impl (host-side) and for the
-  // Phase 5 compute function (device-side).  These match the local SW128 types
-  // defined inside hstu_compute_attn_1rowblock_sm120 via BS1/BS2::SmemLayoutAtomA/B.
-  using SmemLayoutAtomSW128 = GMMA::Layout_K_SW128_Atom<Element>;  // 8-row × 128-FP8 atom
-  using SmemLayoutQ_TMA  = decltype(tile_to_shape(SmemLayoutAtomSW128{}, Shape<Int<kBlockM>, Int<kHeadDim>>{}));
-  using SmemLayoutK_TMA  = decltype(tile_to_shape(SmemLayoutAtomSW128{}, Shape<Int<kBlockN>, Int<kHeadDim>>{}));
+  // Phase 5 compute function (device-side).
+  using SmemLayoutAtomTMA = std::conditional_t<
+      (kHeadDim == 64),
+      GMMA::Layout_K_SW64_Atom<Element>,
+      GMMA::Layout_K_SW128_Atom<Element>>;
+  using SmemLayoutQ_TMA  = decltype(tile_to_shape(SmemLayoutAtomTMA{}, Shape<Int<kBlockM>, Int<kHeadDim>>{}));
+  using SmemLayoutK_TMA  = decltype(tile_to_shape(SmemLayoutAtomTMA{}, Shape<Int<kBlockN>, Int<kHeadDim>>{}));
   // V row-major [kBlockN, kHeadDim] in SMEM, loaded via TMA from row-major V (d stride-1).
   // K_SW128_Atom: dim1 = kHeadDim (d axis) is the SMEM fast axis; dim0 = kBlockN (n_k, token).
   // Physical byte: physical(n_k, d) = n_k * kHeadDim + (d ^ ((n_k & 7) << 4)).
   // LDSM_T address for n_k row, d-group: addr = v_base + n_k * kHeadDim + (d_start ^ ((n_k & 7) << 4)). ✓
   using SmemLayoutVt_TMA = decltype(tile_to_shape(
-      SmemLayoutAtomSW128{},
+      SmemLayoutAtomTMA{},
       Shape<Int<kBlockN>, Int<kHeadDim>>{}));
 
   // Output layout: BF16 written to sO (reuses smem_ base), then copied to GMEM.
@@ -482,11 +484,15 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
   // Each K or Vt tile is kBlockN * kHeadDim FP8 bytes (1 byte each).
   static constexpr int kSmemKVBytes =
       Base::kBlockN * Base::kHeadDim * (int)sizeof(typename Base::Element);
-  // 2 stages × (K + Vt) = 4 × kSmemKVBytes (e.g. 4 × 16384 = 65536 for kBlockN=kHeadDim=128)
-  static constexpr int kSmemWsKVTotalBytes = 4 * kSmemKVBytes;
+  // hdim256 arbitrary needs ValidBlockIds SMEM; two KV stages would exceed SM120's
+  // 101376B opt-in limit.  Keep arbitrary hdim256 correct with one KV stage.
+  static constexpr bool kUseSingleKVStage = Is_arbitrary_ && kHeadDim_ > 128;
+  static constexpr int kSmemWsKVStages = kUseSingleKVStage ? 1 : 2;
+  // kSmemWsKVStages × (K + Vt).
+  static constexpr int kSmemWsKVTotalBytes = 2 * kSmemWsKVStages * kSmemKVBytes;
 
   // WS SMEM region offsets (double-buffer layout):
-  //   [0 .. kSmemWsKVTotalBytes)          : K[0], Vt[0], K[1], Vt[1]
+  //   [0 .. kSmemWsKVTotalBytes)          : K/Vt stages (one stage for hdim256 arbitrary, otherwise two)
   //   [kSmemWsKVTotalBytes .. +ValidBl)   : ValidBlockIds (Is_arbitrary only)
   //   [.. + func region)                  : func arrays (Is_arbitrary only)
   //   [padded to 8B)                      : SFA(512B) + SFB(512B) = 1024B
@@ -506,9 +512,12 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
   static constexpr int kSmemWsQPersistOffset = ((kSmemWsFuncEnd + 2047) / 2048) * 2048;
   static constexpr int kSmemWsAfterQPersist = kSmemWsQPersistOffset + kSmemQPersistBytes;
   static constexpr int kSmemWsAfterQPersistPadded = ((kSmemWsAfterQPersist + 127) / 128) * 128;
+  static constexpr bool kUseIndependentOBuffer = kHeadDim_ <= 128;
   static constexpr int kSmemWsOOffset = kSmemWsAfterQPersistPadded;
   static constexpr int kSmemWsOBytes =
-      kBlockM_ * kHeadDim_ * (int)sizeof(out_type);
+      kUseIndependentOBuffer
+          ? kBlockM_ * kHeadDim_ * (int)sizeof(out_type)
+          : 0;
   static constexpr int kSmemWsAfterO = kSmemWsOOffset + kSmemWsOBytes;
   // WS data region padded to 128B; SF (TMA targets) starts at this offset from smem_.
   static constexpr int kSmemWsDataSizePadded = ((kSmemWsAfterO + 127) / 128) * 128;
