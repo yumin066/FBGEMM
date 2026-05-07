@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Run 14 explicit @example cases for HSTU8Test plus paged KV mirrors/full cases.
+# Run explicit HSTU8Test @example cases plus non-paged/paged RAB mirrors.
 # Covers causal / +rab / +drab / local / context / target / arbitrary at seq=128 and seq=256.
+# Extra RAB/DRAB coverage mirrors full/local/context/target/arbitrary for paged KV and non-paged KV.
 #
 # Usage:
 #   bash run_hstu8_examples.sh [log_file]
@@ -203,10 +204,10 @@ def make_paged_cache_from_varlen_kv(k, v, cu_seqlens_k, num_targets, page_size):
 
 def expected_paged_unsupported_reason(kw):
     max_target_len, window_size, _, is_arbitrary = kw['target_params']
-    if window_size != (-1, -1) and not (window_size[0] < 0 and window_size[1] == 0):
-        return f'window={window_size}'
     if window_size == (-1, -1) and max_target_len > 0 and not is_arbitrary:
         return 'full+target'
+    if max_target_len > 0 and not (window_size[0] < 0 and window_size[1] == 0):
+        return f'target+window={window_size}'
     return None
 
 
@@ -530,6 +531,9 @@ def run_full_paged_kv_case(batch_size, heads, seq_len, dim=128):
 PAGED_CASES = [
     (f'paged kv mirror {label}', kw)
     for kw, label in zip(cases, labels)
+] + [
+    (f'paged kv mirror extra {label}', kw)
+    for label, kw in NONPAGED_EXTRA_CASES
 ] + [
     (f'paged kv edge D={dim} partial-last-page',
      dict(batch_size=1, heads=2, new_history_len=64, prev_history_len=32, target_len=64, dim=dim))

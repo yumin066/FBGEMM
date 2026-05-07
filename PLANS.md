@@ -4,9 +4,11 @@
 
 ## 当前状态
 
-当前主线处于 Phase 27：逐步将 SM120 FP8 non-paged RAB/DRAB 切到 WS。当前已完成 `headDim=128/256 + non-paged + RAB/DRAB` 全配置：full、pure causal、context+causal、target+causal、local、arbitrary 默认走 FP8 WS TMA；D=128 RAB 已从旧 BN128 fallback 切到 BN64 WS。
+当前主线处于 Phase 28：补齐 SM120 FP8 paged KV + RAB/DRAB 在 complex masks/local 上的覆盖。当前已完成 `headDim=128/256 + paged KV + RAB/DRAB` 全配置：full、pure causal、context+causal、target+causal、local、arbitrary 真实运行通过。
 
-Phase 25 的 SM120 forward headDim256 已完成第一阶段支持。FP8 hdim256 correctness 路径已打通，pure non-paged causal 的 residual register spill 已清理；验收覆盖当前 hdim128 已支持的 FP8 non-paged 配置组合，以及当前 hdim128 paged KV 已支持的 full、causal、context+causal、target+causal、arbitrary 组合。
+Phase 27 已完成 `headDim=128/256 + non-paged + RAB/DRAB` 全配置：full、pure causal、context+causal、target+causal、local、arbitrary 默认走 FP8 WS TMA；D=128 RAB 已从旧 BN128 fallback 切到 BN64 WS。
+
+Phase 25 的 SM120 forward headDim256 已完成第一阶段支持。FP8 hdim256 correctness 路径已打通，pure non-paged causal 的 residual register spill 已清理；验收覆盖当前 hdim128 已支持的 FP8 non-paged 配置组合，以及当前 hdim128 paged KV 已支持的 full、causal、context+causal、target+causal、local、arbitrary 组合。
 
 最新有效基线：
 
@@ -23,8 +25,31 @@ Phase 25 的 SM120 forward headDim256 已完成第一阶段支持。FP8 hdim256 
 - Phase 24：paged same-input 对照 `1test_results/451_phase24_paged_same_input_sweep.log` 显示 full/causal aligned cases 输出 `max_err=0`。
 - Phase 24：`run_hstu8_examples.sh` 的 paged mirror 最新日志 `1test_results/456_phase24_paged_mirror_examples_final.log` 为 `31/31 passed`；`sweep_accuracy.py` paged mirror 最新日志 `1test_results/455_phase24_paged_mirror_sweep.log` 通过。
 - Phase 25 hdim256 已接入：SM120 编译/dispatch/runtime guard 支持 hdim256，FP8 WS 使用 `{kBlockM=128,kBlockN=64,kHeadDim=256}`；correctness 和 SASS 日志见 Phase 25 记录。
-- Phase 26 paged RAB/DRAB 已接入：paged causal+RAB/DRAB examples 对 D=128/D=256、seq=128/256 全部通过；RAB bias 在 WS math fragment 中从 global RAB tensor 直接加到 `acc_s`，不新增 RAB SMEM tile。D=128 paged causal+RAB SASS 为 `REG:168 STACK:0 LOCAL:0` 且无 `LDL/STL`；D=256 paged causal+RAB 为 `REG:168 STACK:8 LOCAL:0`，有 1 个 `STL` 和 1 个 `LDL`，作为残余风险记录。
+- Phase 28 paged RAB/DRAB complex coverage 已接入：D=128/D=256 的 full、pure causal、context+causal、target+causal、local、arbitrary + paged KV + RAB/DRAB examples 全部真实通过。RAB bias 仍在 WS math fragment 中从 global RAB tensor 直接加到 `acc_s`，不新增 RAB SMEM tile。D=128 paged causal+RAB SASS 为 `REG:168 STACK:0 LOCAL:0` 且无 `LDL/STL`；D=256 paged causal+RAB 为 `REG:168 STACK:8 LOCAL:0`，有 1 个 `STL` 和 1 个 `LDL`，作为残余风险记录。
 - Phase 27 non-paged RAB/DRAB WS 当前版已接入：D=128/D=256 full、pure causal、context+causal、target+causal、local、arbitrary non-paged RAB/DRAB 走 WS TMA，correctness 通过。`bs=2,seq=1024,h=4,d=256` kernel-only latency 相比 fallback：full `0.0693ms vs 0.1111ms`，local `0.0583ms vs 0.0825ms`，context `0.1264ms vs 0.2118ms`，target `0.0798ms vs 0.1246ms`；arbitrary WS 与 fallback 基本持平，用于统一路径。
+
+## Phase 28：paged KV + RAB/DRAB complex coverage
+
+目标：补齐 SM120 FP8 `quant_mode=2` paged KV cache 与 RAB/DRAB 在 context、target、arbitrary、local 上的 coverage，同时不破坏 Phase 24/26/27 已有路径。
+
+当前状态：
+
+- 已完成 D=128/D=256 的 full、pure causal、context+causal、target+causal、local、arbitrary + paged KV + RAB/DRAB correctness 覆盖。
+- `hstu_varlen_fwd_120` 的 paged KV host guard 已从“no-target full only”放宽为 no-target full/local/arbitrary/context window；带 `num_targets` 的 paged KV 仍限制为 causal/target 语义，即 `window_size_left < 0 && window_size_right == 0`。
+- local paged 不再在 `run_hstu8_examples.sh` 中标为 `PASS-UNSUPPORTED`。当前支持的是 no-target local window；target + local-window 仍不属于当前支持范围。
+- `run_hstu8_examples.sh` 已把 D=128/D=256 non-paged RAB/DRAB extra cases 逐个镜像到 paged KV，新增覆盖 full/local/context+causal/target+causal/arbitrary + RAB/DRAB。
+- Scheduler 口径：paged full RAB/DRAB 走 full persistent；D=128 paged pure causal/target+causal RAB/DRAB 走 paired persistent；D=256 paged RAB/DRAB 和 context/local/arbitrary 走 3D grid。
+
+验证记录：
+
+- build：`1test_results/591_phase28_paged_rab_complex_build.log`。
+- examples：`1test_results/591_phase28_paged_rab_complex_examples.log`，`142/142 passed`。
+- sweep：`1test_results/591_phase28_paged_rab_complex_sweep.log` 通过；no-RAB paged/non-paged same-input full/causal 继续 `max_err=0`。
+
+剩余风险：
+
+- 本阶段没有重新 dump 新的 SASS 资源日志；因为 kernel body/template 已在 Phase 26/27 接入，本次主要是 host guard 和测试覆盖放开。提交前若要把资源状态写死，应补 paged local/context/arbitrary RAB 代表实例的 `LDL/STL` scan。
+- block-scale irregular length、`page_size=32` 和 backward 仍不在本阶段范围。
 
 ## Phase 27：non-paged RAB/DRAB 逐步切到 WS
 
@@ -61,7 +86,7 @@ Phase 25 的 SM120 forward headDim256 已完成第一阶段支持。FP8 hdim256 
 
 ## Phase 26：SM120 FP8 paged KV + RAB/DRAB
 
-目标：让 SM120 FP8 `quant_mode=2` paged KV cache 支持 RAB/DRAB 配置，优先覆盖当前 examples 中的 causal+RAB/DRAB 组合。
+目标：让 SM120 FP8 `quant_mode=2` paged KV cache 支持 RAB/DRAB 配置。Phase 26 先覆盖 causal+RAB/DRAB；Phase 28 已扩展到 full、context、target、arbitrary、local。
 
 当前状态：
 
@@ -70,7 +95,7 @@ Phase 25 的 SM120 forward headDim256 已完成第一阶段支持。FP8 hdim256 
 - hdim128 RAB 需要强制使用 `kBlockN=64`，不能沿用旧 non-paged hdim128 RAB fallback 的 `kBlockN=128`。Python block-scale wrapper 对 `rab is not None && dim == 128` 返回 BN64；paged KV 下继续以 `kv_cache.shape[2]` 作为 BN。
 - WS math 路径新增 `add_rab_bs`：GEMM1 后、mask/activation 前，用 fragment identity 坐标把 BF16 RAB bias 直接从 global tensor 加到 `acc_s`。该方案不占用额外 SMEM，避免 hdim256 paged 路径超过 SM120 dynamic SMEM limit。
 - hdim256 paged+RAB/DRAB 不走 paired persistent scheduler，保持 3D-grid WS，避免 persistent wrapper 进一步扩大 live range；host 和 device 两侧 `Use_paired_persistent` 条件必须保持一致。
-- `run_hstu8_examples.sh` 不再把 paged RAB/DRAB 标记为 unsupported；local paged 仍为 `PASS-UNSUPPORTED`。
+- `run_hstu8_examples.sh` 不再把 paged RAB/DRAB 标记为 unsupported；Phase 28 后 local paged 也必须真实运行通过。
 
 验证记录：
 
@@ -82,7 +107,7 @@ Phase 25 的 SM120 forward headDim256 已完成第一阶段支持。FP8 hdim256 
 剩余风险：
 
 - hdim256 paged+RAB 的 8B stack/local load-store 还没有完全消除。尝试把 hdim256 RAB-add loop 改成 `#pragma unroll 1` 会恶化到 `STACK:128`，已回退。
-- 当前 examples 覆盖 causal+RAB/DRAB；target+RAB、context+RAB、arbitrary+RAB 没有新增专门测试。local paged 仍由 window guard 明确不支持。
+- Phase 28 已补齐 target/context/arbitrary/local + RAB/DRAB paged examples。残余风险转为资源检查而不是 correctness coverage。
 
 ## Phase 24：SM120 FP8 paged KV cache
 
@@ -95,7 +120,7 @@ Phase 25 的 SM120 forward headDim256 已完成第一阶段支持。FP8 hdim256 
 - `set_params_fprop_sm120` 已设置 `kv_cache` stride、page metadata 和 `is_paged_kv`。
 - SM120 FP8 traits 已支持 `Paged_KV` template bool；BF16 traits 仍固定 `Paged_KV=false`。
 - Python wrapper 已能在 SM120 `quant_mode=2` 下量化 paged `kv_cache`，并传入 combined cache+contiguous scale table。
-- Phase 24 初始实现覆盖 headDim128、`page_size=64`、forward；full、causal、context+causal、target+causal、arbitrary paged mirror 已通过。Phase 26 后 causal+RAB/DRAB paged mirror 也已真实运行通过；local paged mirror 仍由 guard 明确不支持。
+- Phase 24 初始实现覆盖 headDim128、`page_size=64`、forward；full、causal、context+causal、target+causal、arbitrary paged mirror 已通过。Phase 26 后 causal+RAB/DRAB paged mirror 真实运行通过；Phase 28 后 full、context+causal、target+causal、local、arbitrary + RAB/DRAB paged mirror 也已通过。
 - 定向验证已通过：`B=1,H=1` paged KV cos `0.99875`；`B=2,H=4` paged KV cos `0.99876`；partial last page cos `0.99881`；target length 0 cos `0.99886`；非 paged `sweep_accuracy.py` 仍全部 `fp8_gt_cos >= 0.9996`。
 - profile 已支持 paged KV：`ncu_hstu_attn.py --target paged`，`run_profile.sh NNN desc paged` 或 `fp8,paged`。
 - paged causal/target 已接入 paired persistent scheduler；host grid 从 per-tile `(num_m_block,h,b)` 改为 `min(total_tile_pairs, SM_count)`。
@@ -109,7 +134,7 @@ Phase 25 的 SM120 forward headDim256 已完成第一阶段支持。FP8 hdim256 
 - full paged KV 已接入：`hstu_varlen_fwd_120` 允许 `num_targets=None` 且 `window_size=(-1,-1)` 的 paged KV full path，device 端复用同一 paged TMA history K/V/SFB/SFV load 逻辑。correctness 日志：build `1test_results/446_phase24_paged_full_guard_build.log`；sweep `1test_results/447_phase24_paged_full_guard_sweep.log`；examples `1test_results/448_phase24_paged_full_guard_examples.log`，其中 examples 为 `31/31 passed`。
 - paged KV 公平误差对比已改为 dequantized FP8/e8m0 reference：先手动量化 Q/K/V/kv_cache，再用同一批 FP8 tensor 和 e8m0 scale 重建 Python reference。`1test_results/449_phase24_paged_fair_ref_sweep.log` 中 paged causal/full `cos=0.9996~0.9997`；`1test_results/450_phase24_paged_fair_ref_edges.log` 中 partial page/target/full edge `cos>=0.99962`。
 - paged vs non-paged same-input 对照已加入 `sweep_accuracy.py`：同一份 raw Q/K/V 生成 contiguous K/V 和 paged cache，两边都用 `block_size=64` 量化以保证 V scale 粒度一致。`1test_results/451_phase24_paged_same_input_sweep.log` 显示 full/causal、H=1/4、SEQ=128/256/512 全部 `max_err=0`，说明 aligned case 下 paged 与 non-paged 输出 bitwise 一致。
-- examples 已按原 14 个 non-paged HSTU8 example 逐个生成 paged mirror。Phase 26 后 causal+RAB/DRAB 已从 unsupported 改为真实运行并通过；local 仍属于当前 SM120 FP8 paged guard 的不支持范围，脚本标记为 `PASS-UNSUPPORTED` 并验证会触发明确错误。
+- examples 已按原 14 个 non-paged HSTU8 example 逐个生成 paged mirror。Phase 28 后 D=128/D=256 RAB/DRAB extra cases 也逐个生成 paged mirror，local paged 由 unsupported 改为真实运行并通过。
 - benchmark `182`：full paged 相对 non-paged FP8，全部 36 个 full case 平均 `-3.0%`，`seq>=1024` 平均 `-0.1%`，`seq>=4096` 平均 `+1.5%`；causal paged 平均约 `-8.2%`，`seq>=4096` 平均约 `-8.3%`。
 - SASS：paged causal TMA 实例含 `UTMALDG.4D`，当前 SF TMA 版资源 `REG:168 STACK:0 LOCAL:0`，无 `LDL/STL` 命中；`UTMALDG` 计数为 `10`。
 
@@ -117,10 +142,10 @@ Phase 25 的 SM120 forward headDim256 已完成第一阶段支持。FP8 hdim256 
 
 - forward only。
 - SM120 FP8 `quant_mode=2`。
-- full、causal、context+causal、target+causal、arbitrary paged KV 已通过；causal+RAB/DRAB paged KV 已通过；local paged KV 明确 unsupported。
-- Phase 24 初始范围为 headDim128；Phase 25/26 已扩展到 headDim256 paged no-RAB 与 causal+RAB/DRAB。
+- full、causal、context+causal、target+causal、local、arbitrary paged KV 已通过；RAB/DRAB 对这些语义也已通过。
+- Phase 24 初始范围为 headDim128；Phase 25/26/28 已扩展到 headDim256 paged no-RAB 与 RAB/DRAB full、causal、context、target、local、arbitrary。
 - 初始只支持 `page_size == kBlockN`，优先匹配当前 BN64 路径；不先支持跨 page 的单个 N tile。
-- 先不做 backward 和 local window 的完整支持；RAB/DRAB 当前已覆盖 causal examples。
+- 先不做 backward、block-scale irregular length 和 `page_size=32`；target + local-window 组合仍不在当前 paged KV 支持范围。
 
 已实施路径：
 
@@ -195,7 +220,7 @@ Phase 25 的 SM120 forward headDim256 已完成第一阶段支持。FP8 hdim256 
 - 已打开 SM120 hdim256 编译、dispatch 和 runtime guard；当前构建使用 `HSTU_DISABLE_HDIM256=FALSE`。
 - FP8 WS hdim256 采用 `{kBlockM=128,kBlockN=64,kHeadDim=256,kNWarps=8}`；Q/K 的 e8m0 scale 改为每 token 一个 int32，按 lane 打包连续 128-D chunk，hdim128 layout 保持兼容。
 - FP8 hdim256 GEMM1 按两个 128-D chunk 分段执行并累加到同一个 `acc_s`；`k_empty` release 延后到两个 chunk 的 K 从 SMEM 消费完成之后，避免 paged/non-paged 多 N tile 时 K stage 被 load warp 提前覆盖。
-- FP8 hdim256 paged KV 支持 full、causal、context+causal、target+causal、arbitrary；Phase 26 后 causal+RAB/DRAB paged mirror 也真实运行并通过，local paged mirror 继续显式 `PASS-UNSUPPORTED`。
+- FP8 hdim256 paged KV 支持 full、causal、context+causal、target+causal、local、arbitrary；Phase 28 后 RAB/DRAB 的这些 paged mirror 也真实运行并通过。
 - paged hdim256 history K/V/SFB/SFV 已走 page-cache TMA；aligned full-block target tail 也走 contiguous TMA，非满或不对齐 target tail 保留 guarded copy fallback。
 - hdim256 arbitrary 为了控制 dynamic SMEM，使用 single K/V stage；否则 hdim256 WS buffer 加 `ValidBlockIds` 会超过 SM120 opt-in shared-memory limit。
 - `run_hstu8_examples.sh` 已把原 14 个 non-paged example 扩展为 D=128/D=256，并为 paged mirror/full/edge 同步覆盖 D=128/D=256。最新 spill-fix 后日志 `1test_results/553_phase25_hdim256_spill_final_examples.log` 为 `62/62 passed`。
@@ -211,7 +236,7 @@ Phase 25 的 SM120 forward headDim256 已完成第一阶段支持。FP8 hdim256 
 - 先做 forward；backward 不进第一阶段。
 - BF16 headDim256 先作为 correctness 基线，用于验证 tile/SMEM/dispatch 基础能力。
 - FP8 headDim256 必须覆盖当前 hdim128 FP8 non-paged 已支持的全部配置组合；最小集合是 `run_hstu8_examples.sh` 原 14 个 non-paged example 的同语义 hdim256 版本。
-- FP8 headDim256 paged KV 必须覆盖当前 hdim128 paged KV 已支持的全部配置组合；Phase 26 后 causal+RAB/DRAB 也属于强制支持项，local 仍必须保持明确报错，不允许静默漏测。
+- FP8 headDim256 paged KV 必须覆盖当前 hdim128 paged KV 已支持的全部配置组合；Phase 28 后 full、causal、context、target、local、arbitrary + RAB/DRAB 都属于强制支持项，不允许静默漏测。
 - paged KV 继续以 `page_size == kBlockN` 为第一约束，避免单个 N tile 跨物理 page。
 
 实施计划：
@@ -238,14 +263,14 @@ Phase 25 的 SM120 forward headDim256 已完成第一阶段支持。FP8 hdim256 
    - paged K cache scale-factor 需要按 physical page id 和 D chunk 可寻址；V cache scale 仍按 page/N block 维度可寻址。
    - page-cache TMA descriptor 从 `[page_size, 128, h, pages]` 泛化到 `[page_size, 256, h, pages]`。
    - `copy_fp8_tile_rowmajor_to_sw128` 等 paged fallback helper 不能再 hard-code `kHeadDim=128`，必须模板化。
-   - paged mirror 要按 hdim128 当前可运行语义覆盖 full、causal、context+causal、target+causal、arbitrary、causal+RAB/DRAB 和 partial/edge；local 仍应显式 `PASS-UNSUPPORTED`。
+   - paged mirror 要按 hdim128 当前可运行语义覆盖 full、causal、context+causal、target+causal、local、arbitrary、RAB/DRAB 和 partial/edge。
    - same-input paged vs non-paged 对照要用同一份 raw Q/K/V，并保证 V block-scale 粒度一致。
 
 验收标准：
 
 - BF16 hdim256 non-paged full/causal correctness 通过。
 - FP8 hdim256 non-paged correctness 覆盖当前 hdim128 已支持的全部 non-paged 配置组合，`fp8_gt_cos >= 0.995`，理想 `>= 0.999`。
-- FP8 hdim256 paged KV cache correctness 覆盖当前 hdim128 已支持的全部 paged 配置组合；causal+RAB/DRAB 必须真实通过，local 必须保持明确 unsupported，不能成为 hdim256-only failure 或静默跳过。
+- FP8 hdim256 paged KV cache correctness 覆盖当前 hdim128 已支持的全部 paged 配置组合；RAB/DRAB full、causal、context、target、local、arbitrary 必须真实通过，不能成为 hdim256-only failure 或静默跳过。
 - FP8 hdim256 same-input 对照通过：non-paged 与 paged 在 hdim128 已支持且语义对齐的 paged cases 下输出应 bitwise 一致或误差可解释。
 - SASS 需要持续查 `LDL/STL`、`STACK`、`LOCAL`；当前 hdim256 full、causal、paged full、paged causal 代表实例均已达到 `STACK:0 LOCAL:0 LDL=0 STL=0`。
 - benchmark 单独输出 hdim256 表，并覆盖当前 hdim128 benchmark 中 FP8 non-paged 与 paged KV 已支持的配置组合。
@@ -457,7 +482,7 @@ Phase 20 的 `kBlockM=256` 路线暂时搁置。
 - 重新编译 HSTU extension。
 - `HSTU_SWEEP_FP8_QUANT_MODE=2 python sweep_accuracy.py`，要求 `fp8_gt_cos >= 0.995`，理想值 `>= 0.9996`。
 - BF16 相关改动运行 `hstu_test.py` 的 `HSTU16Test` 定向用例，至少覆盖 aligned WS 场景和不对齐 fallback 场景。
-- FP8 相关改动运行 `bash run_hstu8_examples.sh`，要求全脚本通过；Phase 27 当前口径为 `102/102 passed`，其中 D=128/D=256 non-paged RAB/DRAB extra cases 必须通过，paged causal+RAB/DRAB 必须真实运行通过，local paged mirror 应为明确的 `PASS-UNSUPPORTED`。
+- FP8 相关改动运行 `bash run_hstu8_examples.sh`，要求全脚本通过；Phase 28 当前口径为 `142/142 passed`，其中 D=128/D=256 non-paged 与 paged RAB/DRAB extra cases 必须通过，local paged mirror 必须真实运行通过。
 - paged KV 相关改动运行 SM120 FP8 paged KV 定向测试，至少覆盖 `page_size == kBlockN`、full、causal、last page 非满、target length 为 0 和非 0。
 - Phase 25 hdim256 相关改动必须额外覆盖 BF16 hdim256 full/causal、FP8 hdim256 当前 hdim128 已支持的全部 non-paged/paged 配置组合，以及 same-input paged vs non-paged 对照。
 

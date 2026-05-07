@@ -16,7 +16,7 @@
 - full paged KV 不需要新 device load path：host 端允许 `num_targets=None` 且 `window_size=(-1,-1)`，device 端 `Is_target=false` 时 `actual_seqlen_h=actual_seqlen_k`，所有 K/V tile 都落在 paged history 分支并复用 page-cache TMA。全量 benchmark `182` 中，full paged 相对 non-paged FP8 全部 36 个 full case 平均 `-3.0%`，`seq>=1024` 平均 `-0.1%`，`seq>=4096` 平均 `+1.5%`；causal paged 仍平均约 `-8.2%`。
 - paged KV 的公平 correctness 口径必须和 non-paged 一样，比较 kernel 输出与 dequantized FP8/e8m0 reference。原先 paged reference 用 raw fp16 cache，会把量化误差算进 kernel 误差。改成公平口径后，`449/450` 日志显示 paged causal/full/edge cases 的 cosine 回到 `0.9996+`。
 - 如果要证明 paged 和 non-paged 逻辑等价，需要同一份 raw Q/K/V，同时让 V block-scale 粒度一致。`451_phase24_paged_same_input_sweep.log` 使用同一批随机 Q/K/V 构造 contiguous K/V 和 paged cache，并统一 `block_size=64`；full/causal、H=1/4、SEQ=128/256/512 均为 `max_err=0`，说明 aligned case 下两条路径输出 bitwise 一致。
-- `run_hstu8_examples.sh` 现在把原 14 个 HSTU8 non-paged example 逐个生成 paged mirror。Phase 26 后当前可运行语义为 causal、causal+RAB、causal+DRAB、context+causal、target+causal、arbitrary；local 会触发 SM120 FP8 paged guard 并在脚本中标为 `PASS-UNSUPPORTED`。最新 examples 日志 `578` 为 `62/62 passed`；`sweep_accuracy.py` 的 `paged_f_*` 列覆盖每个 non-paged full sweep 行，日志 `578` 通过。
+- `run_hstu8_examples.sh` 现在把原 14 个 HSTU8 non-paged example 逐个生成 paged mirror。Phase 28 后 D=128/D=256 的 RAB/DRAB extra cases 也逐个生成 paged mirror，覆盖 full、causal、context+causal、target+causal、local、arbitrary；local paged 不再是 `PASS-UNSUPPORTED`。最新 examples 日志 `591` 为 `142/142 passed`；`sweep_accuracy.py` 的 `paged_f_*` 列覆盖每个 non-paged full sweep 行，日志 `591` 通过。
 - 当前 Python `quant_mode=2` wrapper 对 full paged 仍继承 V block-scale 的 N 对齐限制：例如 `seq=160` 会在量化阶段报 `quant_mode=2 requires N divisible by 128`，不会进入 SM120 kernel。causal/target paged 的 partial last page 仍已有 examples 覆盖。
 - paged causal TMA SASS 含 `UTMALDG.4D`，当前 SF TMA 版资源为 `REG:168 STACK:0 LOCAL:0`，无 `LDL/STL` 命中；`UTMALDG` 计数为 `10`。后续若要小 seq 也不回退，应拆 cp.async-paged 和 TMA-paged 为两个 dispatch specialization，避免短序列也携带 page TMA descriptor 固定开销。
 
@@ -27,6 +27,13 @@
 - paged RAB 坐标应按 logical K 坐标索引：`q_idx = m_block*kBlockM + block_row`，`col = nb*kBlockN + block_col`；paged target 区域需要和 mask 逻辑一致，对 target rows 减去 `last_page_offset`。RAB base offset 继续沿用 non-WS 公式：`bidb * rab_seqlen_qk_stride + bidh_rab * rab_seqlen_q_stride + seqlen_k_rounded * actual_seqlen_offset`。
 - hdim256 paged+RAB/DRAB 不走 paired persistent scheduler，保持 3D-grid WS。host launcher 和 device kernel 中的 `Use_paired_persistent` 条件必须同步，否则会出现 grid 语义不一致；examples 可能仍偶然通过，但调度是错误的。
 - SASS 状态：D=128 paged causal+RAB 为 `REG:168 STACK:0 LOCAL:0` 且无 `LDL/STL`；D=256 paged causal+RAB 为 `REG:168 STACK:8 LOCAL:0`，当前仍有 1 个 `STL` 和 1 个 `LDL`。尝试把 hdim256 RAB-add loop 改成 `#pragma unroll 1` 会恶化到 `STACK:128`，不要保留。
+
+## Phase 28 FP8 paged RAB/DRAB complex coverage 结论
+
+- `hstu_varlen_fwd_120` 的 paged KV guard 可以放宽到 no-target full/local/arbitrary/context window；kernel 侧已有对应 paged K/V load、mask 和 direct RAB add 逻辑。带 `num_targets` 的 paged KV 仍限制在 `window_size_left < 0 && window_size_right == 0`，即 target + local-window 仍不支持。
+- D=128/D=256 的 full、pure causal、context+causal、target+causal、local、arbitrary + paged KV + RAB/DRAB 已全部通过 examples。验证日志：build `1test_results/591_phase28_paged_rab_complex_build.log`，examples `1test_results/591_phase28_paged_rab_complex_examples.log` 为 `142/142 passed`，sweep `1test_results/591_phase28_paged_rab_complex_sweep.log` 通过。
+- Scheduler 口径保持不变：paged full RAB/DRAB 走 full persistent；D=128 paged pure causal/target+causal RAB/DRAB 走 paired persistent；D=256 paged RAB/DRAB 以及 context/local/arbitrary 走 3D grid。
+- 本阶段没有改变 math body 或 RAB add 算法，主要是放开 host guard 并补测试覆盖；如需最终资源结论，应补 paged local/context/arbitrary RAB 代表实例的 SASS `LDL/STL` scan。
 
 ## Phase 27 FP8 non-paged RAB/DRAB WS 实现结论
 
