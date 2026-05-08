@@ -200,6 +200,8 @@ bash /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/run_hstu8_examples.sh
 
 benchmark：
 
+benchmark 和性能对比必须先锁频，默认使用 `sudo nvidia-smi -lgc 2407`。如果当前环境无法锁频，日志文件名和结论必须明确标注 `unlocked`，且不能作为严格性能回归/提升结论。
+
 ```bash
 PYTHONUSERBASE=/home/scratch.minyu_gpu/project/.cache/pip-user python /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/fbgemm_gpu/experimental/hstu/benchmark/bench_hstu_attn_sm120.py 2>&1 | tee /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu/2benchmark_results/NNN_xxx.log
 ```
@@ -244,7 +246,7 @@ Phase 23 FP8 WS SASS 参考保留在 `PLANS.md` 的 Phase 23 验证记录中。�
 - FP8 WS pure full 和 pure causal 当前都是 K/V stage persistent 的 mbar producer/consumer four-load-warp persistent kernel；若回到 hdim128 FP8 WS 性能优化，应跑 NCU 确认 No Eligible、Long Scoreboard、mbarrier wait、O-store 与下一 tile Q/SFA/K/V TMA overlap、TMA pipe 竞争，以及 tail-wave 的占比。
 - 旧 static launch pair 仍可作为同频对照：当前 split persistent causal 已超过旧 static pair 记录，full 略低于旧 static pair 最好记录。
 
-跑性能数据前可锁频：
+跑 benchmark、profile 或任何性能数据前必须锁频：
 
 ```bash
 sudo nvidia-smi -lgc 2407

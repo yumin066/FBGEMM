@@ -264,6 +264,10 @@ void run_hstu_fwd_blackwell(Hstu_fwd_params& params, cudaStream_t stream) {
   RAB_SWITCH(params.has_rab, Has_rab, [&] {
     // Dispatch on dtype: FP8 (quant_mode >= 0) or BF16/FP16
     if (params.quant_mode >= 0) {
+      TORCH_CHECK(
+          params.d == 128 || params.d == 256,
+          "SM120 FP8 WS-only path supports headDim128/256, got headDim=",
+          params.d);
       // FP8 mode: use float_e4m3_t as Element type
       using FP8Type = cutlass::float_e4m3_t;
 #ifndef HSTU_DISABLE_ARBITRARY

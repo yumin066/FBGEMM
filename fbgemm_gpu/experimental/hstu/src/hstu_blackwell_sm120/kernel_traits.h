@@ -198,12 +198,9 @@ struct Hstu_fwd_kernel_traits_sm120 : public Base {
       Layout<Shape<_1, _8>>{}));
 };
 
-// SM120 FP8 forward kernel traits.
-// Q, K, V are FP8 (e4m3) in both GMEM and SMEM.
-// WS path (Has_rab=false): SM120 QMMA (SM120_16x8x32_TN_VS via SM120QmmaBuilder).
-// Non-WS path (Has_rab=true): same SM120 QMMA via BS1/BS2 in hstu_compute_attn_1rowblock_sm120.
-// Descale factors applied after GEMM1 (S *= descale_q * descale_k) and epilogue (O *= descale_v).
-// FP8 SMEM halves SMEM usage vs BF16 → allows kNWarps=8 (vs BF16 kNWarps=4).
+// Common SM120 FP8 forward kernel traits.
+// Q, K, V are FP8 (e4m3) in both GMEM and SMEM. The WS TMA kernel consumes
+// these layouts and applies block-scale factors in SM120 QMMA.
 template <
     int kHeadDim_,
     int kBlockM_,
@@ -221,9 +218,10 @@ template <
     bool Share_Q_K_smem_ = false,
     typename out_type = cutlass::bfloat16_t>
 struct Hstu_fwd_kernel_traits_sm120_fp8 {
-  // FP8 input type (Q, K, V in GMEM and SMEM)
+  // Common SM120 FP8 metadata used by the WS TMA kernel.
+  // All SM120 FP8 forward dispatch routes through Hstu_fwd_kernel_traits_sm120_fp8_ws.
+  // The legacy non-WS FP8 launch path has been removed.
   using Element = cutlass::float_e4m3_t;
-  // Phase 2: FP8 stays in SMEM (no BF16 conversion)
   using ElementSmem = cutlass::float_e4m3_t;
   using ElementAccum = float;
   using OutputType = out_type;
@@ -239,10 +237,8 @@ struct Hstu_fwd_kernel_traits_sm120_fp8 {
   static constexpr bool Paged_KV = Paged_KV_;
   static constexpr bool Is_fp8 = true;
 
-  // Note: MMA_Atom_Arch / TiledMma / SmemCopyAtom are intentionally absent from this FP8
-  // traits struct. The FP8 kernel path (both WS and Has_rab non-WS) uses SM120QmmaBuilder
-  // (BS1/BS2) for MMA and s2r copies directly; Kernel_traits::TiledMma is only referenced
-  // in the if constexpr (!Is_fp8) BF16 branch which is discarded at compile time.
+  // Note: MMA_Atom_Arch / TiledMma / SmemCopyAtom are intentionally absent here.
+  // The WS kernel uses SM120QmmaBuilder (BS1/BS2) for MMA and s2r copies directly.
 
   static constexpr bool Share_Q_K_smem = Share_Q_K_smem_;
   static constexpr bool Is_Q_in_regs = Is_Q_in_regs_ || Share_Q_K_smem;
@@ -290,9 +286,7 @@ struct Hstu_fwd_kernel_traits_sm120_fp8 {
   using SmemLayoutVtransposedNoSwizzle =
       decltype(get_nonswizzle_portion(SmemLayoutVtransposed{}));
 
-  // Phase 5 TMA layouts: SW128 for 128B+ contiguous K tiles, SW64 for hdim64.
-  // Used for make_tma_copy in run_hstu_fwd_sm120_impl (host-side) and for the
-  // Phase 5 compute function (device-side).
+  // WS TMA layouts: SW128 for 128B+ contiguous K tiles, SW64 for hdim64.
   using SmemLayoutAtomTMA = std::conditional_t<
       (kHeadDim == 64),
       GMMA::Layout_K_SW64_Atom<Element>,
@@ -351,9 +345,8 @@ struct Hstu_fwd_kernel_traits_sm120_fp8 {
       (Is_arbitrary ? size(SmemLayoutValidBlockIds{}) * sizeof(int) : 0);
   // Extra SMEM for block-scale SF: SFA (kBlockM int32 = 512B) + SFB (kBlockN int32 = 512B)
   static constexpr int kSmemSFSize = 1024;
-  // Extra SMEM for TMA barrier(s).
-  // Phase 5: 1 barrier (load_mbar) = 8 bytes.
-  // Phase 6 WS: 2 barriers (load_mbar + math_mbar) = 16 bytes.
+  // Extra SMEM for TMA barrier(s). The base FP8 layout keeps one barrier slot;
+  // WS traits define their own producer/consumer mbarrier area below.
   static constexpr int kSmemMbarSize = 8;
   static constexpr int kSmemSize = kSmemSizeQKVRabValidBlockIds +
       (Is_arbitrary ? (size(SmemLayoutMaxFunc{}) + size(SmemLayoutMinFunc{}) + 1) * sizeof(int) : 0) +
@@ -418,9 +411,8 @@ struct Hstu_fwd_kernel_traits_sm120_fp8 {
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-// Phase 6 warp-specialized FP8 kernel traits.
-// Extends the Phase 5 FP8 traits by designating warp 0 as a dedicated load warp (TMA-only)
-// and warps 1–8 as math warps (QMMA-only).
+// Warp-specialized FP8 kernel traits.
+// Extends the common FP8 metadata with dedicated load/store warps and 8 math warps.
 // kNThreads = 288 (9 warps × 32), kNMathThreads = 256 (8 math warps × 32).
 // Math warps use tidx_math = tidx - 32 ∈ [0, 255].
 // All GMEM/SMEM layout arithmetic (SmemLayoutQ, GmemTiledCopyQKV, etc.) is inherited from
