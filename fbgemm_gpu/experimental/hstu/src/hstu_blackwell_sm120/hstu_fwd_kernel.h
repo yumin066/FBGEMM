@@ -1024,29 +1024,23 @@ void run_hstu_fwd_sm120(Hstu_fwd_params& params, cudaStream_t stream) {
   static constexpr bool Share_Q_K_smem = kHeadDim <= 128;
 
   if constexpr (Is_fp8_type) {
-    if constexpr (kHeadDim == 64) {
-      TORCH_CHECK(
-          false,
-          "SM120 FP8 hdim64 is not part of the WS-only support matrix; use headDim128/256");
-    } else {
-      static_assert(
-          kBlockN == 64,
-          "SM120 FP8 forward now routes through the WS TMA path, which expects kBlockN=64.");
-      BOOL_SWITCH(params.is_paged_kv, Paged_KV, [&] {
-        if constexpr (Paged_KV) {
-          TORCH_CHECK(
-              params.page_size == kBlockN,
-              "SM120 FP8 paged KV WS path requires page_size == kBlockN, got page_size=",
-              params.page_size,
-              ", kBlockN=",
-              kBlockN);
-        }
-        run_hstu_fwd_sm120_fp8_ws_tma_impl<
-            elem_type, kHeadDim, kBlockM, kBlockN, kNWarps,
-            Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc, Has_rab,
-            Paged_KV, Is_Q_in_regs, Share_Q_K_smem>(params, stream);
-      });
-    }
+    static_assert(
+        kBlockN == 64,
+        "SM120 FP8 forward now routes through the WS TMA path, which expects kBlockN=64.");
+    BOOL_SWITCH(params.is_paged_kv, Paged_KV, [&] {
+      if constexpr (Paged_KV) {
+        TORCH_CHECK(
+            params.page_size == kBlockN,
+            "SM120 FP8 paged KV WS path requires page_size == kBlockN, got page_size=",
+            params.page_size,
+            ", kBlockN=",
+            kBlockN);
+      }
+      run_hstu_fwd_sm120_fp8_ws_tma_impl<
+          elem_type, kHeadDim, kBlockM, kBlockN, kNWarps,
+          Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc, Has_rab,
+          Paged_KV, Is_Q_in_regs, Share_Q_K_smem>(params, stream);
+    });
   } else {
     const int num_m_block = (params.seqlen_q + kBlockM - 1) / kBlockM;
     dim3 grid = dim3(num_m_block, params.h, params.b);

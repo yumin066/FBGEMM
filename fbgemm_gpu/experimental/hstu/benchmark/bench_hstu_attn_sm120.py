@@ -113,6 +113,8 @@ def fp8_block_n(headdim: int, has_rab: bool = False) -> int:
 
 def bf16_unsupported_reason(headdim: int, case: BenchCase) -> str:
     """Return why the BF16 baseline is unavailable for this SM120 benchmark case."""
+    if headdim not in (64, 128, 256):
+        return "current SM120 BF16 benchmark supports headDim 64, 128, or 256"
     if headdim == 256 and case.has_rab:
         return "current SM120 BF16 baseline does not support hdim256 RAB/DRAB"
     if headdim == 256 and case.mask == "arbitrary":
@@ -125,12 +127,12 @@ def column_unsupported_reason(column: str, headdim: int, case: BenchCase) -> str
     if column == "bf16":
         return bf16_unsupported_reason(headdim, case)
     if column == "fp8":
-        if headdim % 128 != 0:
-            return "SM120 FP8 block-scale benchmark requires headDim divisible by 128"
+        if headdim not in (32, 64, 128, 256):
+            return "SM120 FP8 block-scale benchmark supports headDim 32, 64, 128, or 256"
         return ""
     if column == "paged":
-        if headdim not in (128, 256):
-            return "SM120 FP8 paged KV benchmark supports headDim 128 or 256"
+        if headdim not in (32, 64, 128, 256):
+            return "SM120 FP8 paged KV benchmark supports headDim 32, 64, 128, or 256"
         if fp8_block_n(headdim, case.has_rab) != 64:
             return "SM120 FP8 paged KV benchmark requires page_size=kBlockN=64"
         return ""
@@ -875,7 +877,7 @@ def parse_args():
         metavar="H",
     )
     parser.add_argument(
-        "--headdims", type=int, nargs="+", default=[128, 256],
+        "--headdims", type=int, nargs="+", default=[32, 64, 128, 256],
         metavar="D",
     )
     parser.add_argument(

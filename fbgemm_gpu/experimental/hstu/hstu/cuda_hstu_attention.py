@@ -274,9 +274,7 @@ def quantize_for_block_scale_qk_along_d(x, seq_offsets, fp8_type=torch.float8_e4
     B = seq_offsets.size(0) - 1
     head = x.size(1)
     dim = x.size(2)
-    if dim % 128 != 0:
-        raise ValueError(f"AssertError: D must be divisible by 128 for q/k K-dim block scale, got D={dim}")
-    d_chunks = dim // 128
+    d_chunks = (dim + 127) // 128
     fp8_max = 448.0 if fp8_type == torch.float8_e4m3fn else 57344.0
 
     cu_seqlens_x_descale = torch.zeros(B + 1, dtype=torch.int32, device='cuda')
@@ -289,11 +287,16 @@ def quantize_for_block_scale_qk_along_d(x, seq_offsets, fp8_type=torch.float8_e4
             end = int(seq_offsets[i + 1].item())
             actual_len = end - start
 
-            cur = x[start:end].view(actual_len, head, d_chunks, 128)
-            cur_scale = torch.amax(cur.abs(), dim=3, keepdim=False).to(torch.float32) / fp8_max
-            cur_scale = _round_descale_to_e8m0(cur_scale)
-            cur_quant = (cur / cur_scale.unsqueeze(-1)).to(fp8_type).view(actual_len, head, dim)
-            x_quantized[start:end] = cur_quant
+            cur_scale_chunks = []
+            for d_chunk in range(d_chunks):
+                d0 = d_chunk * 128
+                d1 = min(dim, d0 + 128)
+                cur = x[start:end, :, d0:d1]
+                cur_scale = torch.amax(cur.abs(), dim=2).to(torch.float32) / fp8_max
+                cur_scale = _round_descale_to_e8m0(cur_scale)
+                x_quantized[start:end, :, d0:d1] = (cur / cur_scale.unsqueeze(-1)).to(fp8_type)
+                cur_scale_chunks.append(cur_scale)
+            cur_scale = torch.stack(cur_scale_chunks, dim=2)
 
             # Kernel-side SF layout is one int32 per token.  The int32 packs up to
             # four e8m0 scales for consecutive 128-D chunks.
@@ -387,20 +390,28 @@ def quantize_paged_kv_cache_for_block_scale(
     if kv_cache.size(2) != block_size:
         raise ValueError(f"kv_cache page_size must equal block_size={block_size}")
     pages, _, page_size, heads, dim = kv_cache.shape
-    if dim % 128 != 0:
-        raise ValueError(f"D must be divisible by 128 for paged K cache, got D={dim}")
+    d_chunks = (dim + 127) // 128
     fp8_max = 448.0 if fp8_type == torch.float8_e4m3fn else 57344.0
 
     with torch.no_grad():
         k_cache = kv_cache[:, 0].contiguous()
         v_cache = kv_cache[:, 1].contiguous()
 
-        k_view = k_cache.view(pages * page_size, heads, dim // 128, 128)
-        k_scale = torch.amax(k_view.abs(), dim=3).to(torch.float32) / fp8_max
-        k_scale = _round_descale_to_e8m0(k_scale)
-        k_fp8 = (k_view / k_scale.unsqueeze(-1)).to(fp8_type).view(pages, page_size, heads, dim)
+        k_cache_flat = k_cache.view(pages * page_size, heads, dim)
+        k_fp8_flat = torch.empty_like(k_cache_flat, dtype=fp8_type)
+        k_scale_chunks = []
+        for d_chunk in range(d_chunks):
+            d0 = d_chunk * 128
+            d1 = min(dim, d0 + 128)
+            k_chunk = k_cache_flat[:, :, d0:d1]
+            k_scale_chunk = torch.amax(k_chunk.abs(), dim=2).to(torch.float32) / fp8_max
+            k_scale_chunk = _round_descale_to_e8m0(k_scale_chunk)
+            k_fp8_flat[:, :, d0:d1] = (k_chunk / k_scale_chunk.unsqueeze(-1)).to(fp8_type)
+            k_scale_chunks.append(k_scale_chunk)
+        k_scale = torch.stack(k_scale_chunks, dim=2)
+        k_fp8 = k_fp8_flat.view(pages, page_size, heads, dim)
         k_scale_by_head = k_scale.permute(1, 0, 2).contiguous()  # [H, pages*page_size, D/128]
-        if dim // 128 == 1:
+        if d_chunks == 1:
             k_scale_by_head = k_scale_by_head.squeeze(-1).contiguous()
         sf_k_cache = pack_descale_to_e8m0x4_int32(k_scale_by_head)
 
@@ -428,19 +439,9 @@ def get_bm_and_bn_block_size_fwd(rab, dim):
     BN: Block size for the second dimension of the input tensor.
     """
     if rab is not None:
-        if dim == 64:
-            return 128, 64   # kBlockM=128, kBlockN=64 (utils.h: {128, 64, 4} for FP8+rab+hdim64)
-        elif dim == 128:
-            return 128, 64   # kBlockM=128, kBlockN=64 (utils.h: {128, 64, 8} for FP8+rab+hdim128 WS)
-        else:
-            return 128, 64   # kBlockM=128, kBlockN=64 (utils.h: {128, 64, 8} for FP8+rab+hdim>128)
+        return 128, 64
     else:
-        if dim == 64:
-            return 128, 128
-        elif dim == 128:
-            return 128, 64
-        else:
-            return 128, 64
+        return 128, 64
 
 def get_bm_and_bn_block_size_bwd():
     """
@@ -568,8 +569,8 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
                     # but paged WS must keep BN equal to page_size=64.
                     bm, bn = 128, kv_cache.shape[2]
                 if is_paged_kv:
-                    if dim % 128 != 0 or bn != 64:
-                        raise ValueError("SM120 FP8 paged KV path requires headDim divisible by 128 and kBlockN=64")
+                    if dim not in (32, 64, 128, 256) or bn != 64:
+                        raise ValueError("SM120 FP8 paged KV path requires headDim 32/64/128/256 and kBlockN=64")
                     if kv_cache.shape[2] != bn:
                         raise ValueError(f"SM120 FP8 paged KV requires page_size={bn}")
                 q_raw, k_raw, v_raw = q, k, v

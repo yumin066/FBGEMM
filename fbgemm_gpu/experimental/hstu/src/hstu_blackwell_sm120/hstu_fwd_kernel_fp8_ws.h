@@ -76,13 +76,14 @@ __device__ __forceinline__ void cp_async_cg_16B(
       : : "r"(smem_addr), "l"(gmem_addr) : "memory");
 }
 
-template <typename FP8Elem, int kHeadDim>
-__device__ __forceinline__ void copy_fp8_tile_rowmajor_to_sw128(
+template <typename FP8Elem, int kHeadDim, typename SmemLayout>
+__device__ __forceinline__ void copy_fp8_tile_rowmajor_to_smem(
     FP8Elem* __restrict__ dst_smem,
     const FP8Elem* __restrict__ src_gmem,
     int64_t src_row_stride,
     int rows_valid,
-    int lane) {
+    int lane,
+    SmemLayout const& layout) {
   constexpr int kVecElems = 16;
   constexpr int kVecsPerRow = kHeadDim / kVecElems;
   static_assert(sizeof(FP8Elem) == 1, "FP8 paged copy expects 1-byte elements");
@@ -93,9 +94,8 @@ __device__ __forceinline__ void copy_fp8_tile_rowmajor_to_sw128(
   for (int vec = lane; vec < rows_valid * kVecsPerRow; vec += 32) {
     const int row = vec / kVecsPerRow;
     const int d = (vec - row * kVecsPerRow) * kVecElems;
-    const int swizzled_d = d ^ ((row & 7) << 4);
     cp_async_cg_16B(
-        dst_smem + row * kHeadDim + swizzled_d,
+        dst_smem + static_cast<int>(layout(row, d)),
         src_gmem + row * src_row_stride + d);
     if (++issued_in_group == 8) {
       asm volatile("cp.async.commit_group;\n" : : : "memory");
@@ -112,8 +112,7 @@ __device__ __forceinline__ void copy_fp8_tile_rowmajor_to_sw128(
   for (int vec = lane + rows_valid * kVecsPerRow; vec < 64 * kVecsPerRow; vec += 32) {
     const int row = vec / kVecsPerRow;
     const int d = (vec - row * kVecsPerRow) * kVecElems;
-    const int swizzled_d = d ^ ((row & 7) << 4);
-    *reinterpret_cast<Vec*>(dst_smem + row * kHeadDim + swizzled_d) = zero;
+    *reinterpret_cast<Vec*>(dst_smem + static_cast<int>(layout(row, d))) = zero;
   }
 }
 
@@ -218,18 +217,9 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     const Params& params,
     const int bidb_arg,
     const int bidh_arg,
-    int m_block_arg,
-    const int num_m_block_persistent = 0,
-    const int total_tiles_persistent = 0,
-    const int total_tile_pairs_persistent = 0) {
+    int m_block_arg) {
 
   static_assert(Kernel_traits::Is_fp8, "Phase 6 WS: FP8 path only");
-  static_assert(
-      !Kernel_traits::Has_rab ||
-          Kernel_traits::Paged_KV ||
-          Kernel_traits::kHeadDim == 128 ||
-          Kernel_traits::kHeadDim == 256,
-      "FP8 WS non-paged RAB/DRAB is currently only enabled for hdim128/256");
   static_assert(
       !(Use_full_persistent && Use_paired_persistent),
       "Only one FP8 WS persistent scheduler can be enabled");
@@ -237,8 +227,10 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
 
   using BS1 = hstu::SM120QmmaBuilder<
       Kernel_traits::kBlockM, Kernel_traits::kBlockN, 4>;
+  static constexpr int kHeadDimGemm2 =
+      Kernel_traits::kHeadDim < 64 ? 64 : Kernel_traits::kHeadDim;
   using BS2 = hstu::SM120QmmaBuilder<
-      Kernel_traits::kBlockM, Kernel_traits::kHeadDim, 4>;
+      Kernel_traits::kBlockM, kHeadDimGemm2, 4>;
   using FP8Elem = typename Kernel_traits::Element;
 
   extern __shared__ char smem_[];
@@ -435,11 +427,9 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       }
 
       // SMEM layout types for TMA partition_D.
-      using SmemLayoutK_SW128  = decltype(tile_to_shape(typename BS1::SmemLayoutAtomB{},
-          Shape<Int<kBlockN>, Int<kHeadDim>>{}));
+      using SmemLayoutK_SW128  = typename Kernel_traits::SmemLayoutK_TMA;
       using SmemLayoutVt_SW128 = typename Kernel_traits::SmemLayoutVt_TMA;
-      using SmemLayoutQ_SW128  = decltype(tile_to_shape(typename BS1::SmemLayoutAtomA{},
-          Shape<Int<kBlockM>, Int<kHeadDim>>{}));
+      using SmemLayoutQ_SW128  = typename Kernel_traits::SmemLayoutQ_TMA;
 
       constexpr int kSmemKVElems = kBlockN * kHeadDim;
       FP8Elem* const sK_base[2] = {
@@ -585,8 +575,9 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
               const FP8Elem* src = reinterpret_cast<const FP8Elem*>(params.kv_cache_ptr)
                   + (int64_t)page_id * params.kv_cache_kvtensor_stride
                   + (int64_t)bidh_kv * params.kv_cache_row_stride;
-              copy_fp8_tile_rowmajor_to_sw128<FP8Elem, kHeadDim>(
-                  dst, src, params.kv_cache_head_stride, kBlockN, lane);
+              copy_fp8_tile_rowmajor_to_smem<FP8Elem, kHeadDim>(
+                  dst, src, params.kv_cache_head_stride, kBlockN, lane,
+                  SmemLayoutK_SW128{});
               copy_packed_sf_tile(
                   sf_dst, params.sf_k_packed_ptr, params.kv_block_descale_head_stride,
                   bidh_kv, page_id * params.page_size, kBlockN, lane);
@@ -598,8 +589,9 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
               const FP8Elem* src = reinterpret_cast<const FP8Elem*>(params.k_ptr)
                   + (int64_t)target_start * params.k_row_stride
                   + (int64_t)bidh_kv * params.k_head_stride;
-              copy_fp8_tile_rowmajor_to_sw128<FP8Elem, kHeadDim>(
-                  dst, src, params.k_row_stride, rows_valid, lane);
+              copy_fp8_tile_rowmajor_to_smem<FP8Elem, kHeadDim>(
+                  dst, src, params.k_row_stride, rows_valid, lane,
+                  SmemLayoutK_SW128{});
               copy_packed_sf_tile(
                   sf_dst, params.sf_k_packed_ptr, params.kv_block_descale_head_stride,
                   bidh_kv, params.total_pages * params.page_size + target_start,
@@ -743,8 +735,9 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
                   + (int64_t)page_id * params.kv_cache_kvtensor_stride
                   + params.kv_cache_page_stride
                   + (int64_t)bidh_kv * params.kv_cache_row_stride;
-              copy_fp8_tile_rowmajor_to_sw128<FP8Elem, kHeadDim>(
-                  dst, src, params.kv_cache_head_stride, kBlockN, lane);
+              copy_fp8_tile_rowmajor_to_smem<FP8Elem, kHeadDim>(
+                  dst, src, params.kv_cache_head_stride, kBlockN, lane,
+                  SmemLayoutVt_SW128{});
               copy_packed_sf_tile(
                   sf_dst, params.sf_v_packed_ptr, params.v_block_descale_head_stride,
                   bidh_kv, page_id * params.page_size, kBlockN, lane);
@@ -756,8 +749,9 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
               const FP8Elem* src = reinterpret_cast<const FP8Elem*>(params.v_ptr)
                   + (int64_t)target_start * params.v_row_stride
                   + (int64_t)bidh_kv * params.v_head_stride;
-              copy_fp8_tile_rowmajor_to_sw128<FP8Elem, kHeadDim>(
-                  dst, src, params.v_row_stride, rows_valid, lane);
+              copy_fp8_tile_rowmajor_to_smem<FP8Elem, kHeadDim>(
+                  dst, src, params.v_row_stride, rows_valid, lane,
+                  SmemLayoutVt_SW128{});
               copy_packed_sf_tile(
                   sf_dst, params.sf_v_packed_ptr, params.v_block_descale_head_stride,
                   bidh_kv, params.total_pages * params.page_size + target_start,
@@ -923,16 +917,13 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       }
     };
 
-    auto run_load_tile_linear = [&](const int tile) {
-      const HstuWsTileCoord coord =
-          hstu_ws_decode_tile(tile, num_m_block_persistent, params.h);
-      run_load_tile(coord.bidb, coord.bidh, coord.m_block);
-    };
-
     // Static tile-id broadcast: load and math paths run the same deterministic
     // scheduler and decode the same tile ids locally.  There is no dynamic work
     // queue, atomic counter, or shared tile-id sync on this path.
     if constexpr (Use_paired_persistent) {
+      const int num_m_block_persistent = (params.seqlen_q + kBlockM - 1) / kBlockM;
+      const int total_tiles_persistent = num_m_block_persistent * params.h * params.b;
+      const int total_tile_pairs_persistent = (total_tiles_persistent + 1) / 2;
       #pragma unroll 1
       for (int tile_pair = int(blockIdx.x); tile_pair < total_tile_pairs_persistent; tile_pair += int(gridDim.x)) {
         const int paired_tile = total_tiles_persistent - 1 - tile_pair;
@@ -941,13 +932,19 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         #pragma unroll 1
         for (int pair_slot = 0; pair_slot < tiles_this_pair; ++pair_slot) {
           const int tile = pair_slot == 0 ? tile_pair : paired_tile;
-          run_load_tile_linear(tile);
+          const HstuWsTileCoord coord =
+              hstu_ws_decode_tile(tile, num_m_block_persistent, params.h);
+          run_load_tile(coord.bidb, coord.bidh, coord.m_block);
         }
       }
     } else if constexpr (Use_full_persistent) {
+      const int num_m_block_persistent = (params.seqlen_q + kBlockM - 1) / kBlockM;
+      const int total_tiles_persistent = num_m_block_persistent * params.h * params.b;
       #pragma unroll 1
       for (int tile = int(blockIdx.x); tile < total_tiles_persistent; tile += int(gridDim.x)) {
-        run_load_tile_linear(tile);
+        const HstuWsTileCoord coord =
+            hstu_ws_decode_tile(tile, num_m_block_persistent, params.h);
+        run_load_tile(coord.bidb, coord.bidh, coord.m_block);
       }
     } else {
       run_load_tile(bidb_arg, bidh_arg, m_block_arg);
@@ -1145,11 +1142,9 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         return;
       }
 
-      // SW128 SMEM layouts.
-      using SmemLayoutQ_SW128  = decltype(tile_to_shape(typename BS1::SmemLayoutAtomA{},
-          Shape<Int<kBlockM>, Int<kHeadDim>>{}));
-      using SmemLayoutK_SW128  = decltype(tile_to_shape(typename BS1::SmemLayoutAtomB{},
-          Shape<Int<kBlockN>, Int<kHeadDim>>{}));
+      // WS SMEM layouts. Kernel_traits selects SW32/SW64/SW128 by headDim.
+      using SmemLayoutQ_SW128  = typename Kernel_traits::SmemLayoutQ_TMA;
+      using SmemLayoutK_SW128  = typename Kernel_traits::SmemLayoutK_TMA;
 
       constexpr int kSmemKVElems = kBlockN * kHeadDim;
 
@@ -1181,7 +1176,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       typename BS2::TiledMma tiled_mma_g2;
       auto thr_mma_g2 = tiled_mma_g2.get_thread_slice(tidx_math);
 
-      Tensor acc_o = partition_fragment_C(tiled_mma_g2, Shape<Int<kBlockM>, Int<kHeadDim>>{});
+      Tensor acc_o = partition_fragment_C(tiled_mma_g2, Shape<Int<kBlockM>, Int<kHeadDimGemm2>>{});
       clear(acc_o);
 
       // s2r copy atoms — A operands (Q, P) loaded via load_a_z_pattern (inline PTX Z-pattern).
@@ -1359,9 +1354,10 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         __syncthreads();  // S1: tma_mbar0/1 and math_mbar0/1 visible to all warps.
       }
 
+      FP8Elem* q_persist_base = reinterpret_cast<FP8Elem*>(
+          reinterpret_cast<char*>(smem_) + Kernel_traits::kSmemWsQPersistOffset);
       Tensor sQ_persist = make_tensor(
-          make_smem_ptr(reinterpret_cast<FP8Elem*>(
-              reinterpret_cast<char*>(smem_) + Kernel_traits::kSmemWsQPersistOffset)),
+          make_smem_ptr(q_persist_base),
           SmemLayoutQ_SW128{});
       auto sQ_persist_pi = as_position_independent_swizzle_tensor(sQ_persist);
 
@@ -1516,7 +1512,8 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
 
       Tensor tCrQ = thr_mma_g1.partition_fragment_A(sQ_persist_pi);
       if constexpr (kHeadDim <= 128) {
-        load_a_z_pattern(sQ_persist_pi, tCrQ, 0, kHeadDim / 32, kHeadDim);
+        clear(tCrQ);
+        load_a_z_pattern_layout(q_persist_base, SmemLayoutQ_SW128{}, tCrQ, 0, kHeadDim / 32);
       }
       if constexpr (kHeadDim <= 128) {
         if ((tidx_math & 31) == 0) {
@@ -1539,7 +1536,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         flash::convert_type_safe(acc_o, rO);
 
         if constexpr (!Kernel_traits::kUseIndependentOBuffer) {
-          Tensor cO_id = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});
+          Tensor cO_id = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDimGemm2>>{});
           Tensor tOcO = thr_mma_g2.partition_C(cO_id);
           OutElement* gO_ptr = reinterpret_cast<OutElement*>(params.o_ptr)
               + binfo.q_offset(params.o_row_stride)
@@ -1550,7 +1547,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
             const auto coord = tOcO(flat);
             const int m_rel = int(get<0>(coord));
             const int n_pos = int(get<1>(coord));
-            if (m_rel < valid_rows) {
+            if (m_rel < valid_rows && n_pos < kHeadDim) {
               gO_ptr[(m_block * kBlockM + m_rel) * params.o_row_stride + n_pos] = rO(flat);
             }
           }
@@ -1693,6 +1690,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
               make_tensor(make_smem_ptr(sK_cur), SmemLayoutK_SW128{}));
           auto tCrSFB_frg = BS1::transform_fragment_for_qmma(tCrSFB);
           Tensor tCrK = thr_mma_g1.partition_fragment_B(sK_cur_pi);
+          clear(tCrK);
           // GEMM1: tCrQ and tCrSFA_frg are N-loop invariants hoisted above the loop.
           if constexpr (kBlockN == 64) {
             auto tXsK = s2r_thr_B_g1.partition_S(sK_cur_pi);
@@ -2019,7 +2017,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
             if constexpr (kBlockN == 64) {
               using SmemLayoutVt_SW64 = decltype(tile_to_shape(
                   GMMA::Layout_K_SW64_Atom<FP8Elem>{},
-                  Shape<Int<kHeadDim>, Int<kBlockN>>{}));
+                  Shape<Int<kHeadDimGemm2>, Int<kBlockN>>{}));
               return make_tensor(make_smem_ptr(sVt_cur), SmemLayoutVt_SW64{});
             } else {
               using SmemLayoutVt_SW128 = decltype(tile_to_shape(
@@ -2031,6 +2029,9 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
           Tensor tCrV = thr_mma_g2.partition_fragment_B(sVt_ns);
           {
             auto tXrV = recast<uint32_t>(tCrV);
+            if constexpr (kHeadDim < kHeadDimGemm2) {
+              clear(tCrV);
+            }
             const uint32_t v_smem_base = static_cast<uint32_t>(__cvta_generic_to_shared(sVt_cur));
             typename Kernel_traits::SmemLayoutVt_TMA smem_layout_vt;
             const int lane  = tidx_math & 31;
@@ -2046,15 +2047,27 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
                 const int d_start = dg * 32 + d_mat;
                 const uint32_t addr_slab =
                     v_smem_base + (uint32_t)smem_layout_vt(n_k_row, d_start);
-                const int dg_slab = dg >> 2;
-                const int dg_in_slab = dg & 3;
-                const int base =
-                    (kHeadDim / 4) * (ni >> 1) + 32 * dg_slab + 2 * dg_in_slab + (ni & 1);
-                asm volatile(
-                    "ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0,%1,%2,%3},[%4];\n"
-                    : "=r"(tXrV(base + 0)), "=r"(tXrV(base + 8)),
-                      "=r"(tXrV(base + 16)), "=r"(tXrV(base + 24))
-                    : "r"(addr_slab));
+                if constexpr (kHeadDim <= 64) {
+                  // GEMM2 TileN is linear for D=32/64.  Each 32-D group has four
+                  // 8-wide N-atoms, and ni supplies the K-half within a 32-token
+                  // K block.  This mirrors GEMM1's BN64 B-fragment placement.
+                  const int base = 16 * (ni >> 1) + 8 * dg + (ni & 1);
+                  asm volatile(
+                      "ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0,%1,%2,%3},[%4];\n"
+                      : "=r"(tXrV(base + 0)), "=r"(tXrV(base + 2)),
+                        "=r"(tXrV(base + 4)), "=r"(tXrV(base + 6))
+                      : "r"(addr_slab));
+                } else {
+                  const int dg_slab = dg >> 2;
+                  const int dg_in_slab = dg & 3;
+                  const int base =
+                      (kHeadDim / 4) * (ni >> 1) + 32 * dg_slab + 2 * dg_in_slab + (ni & 1);
+                  asm volatile(
+                      "ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0,%1,%2,%3},[%4];\n"
+                      : "=r"(tXrV(base + 0)), "=r"(tXrV(base + 8)),
+                        "=r"(tXrV(base + 16)), "=r"(tXrV(base + 24))
+                      : "r"(addr_slab));
+                }
               }
             }
           }
@@ -2081,7 +2094,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
             // AtomLayoutSFB_TV = (4,8):(0,1): lane>>2 indexes the within-atom N-column offset.
             const int n_row_sfv = (tidx_math & 31) >> 2;
             const int sfv = smem_sfv_cur[n_row_sfv];
-            constexpr int kNAtomsSFV = kHeadDim / 8;
+            constexpr int kNAtomsSFV = kHeadDimGemm2 / 8;
             CUTE_UNROLL
             for (int nr = 0; nr < kNAtomsSFV; ++nr) {
               tCrSFV(0, nr, 0) = sfv;
@@ -2178,14 +2191,11 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       }
     };
 
-    auto run_math_tile_linear = [&](const int tile) {
-      const HstuWsTileCoord coord =
-          hstu_ws_decode_tile(tile, num_m_block_persistent, params.h);
-      run_math_tile(coord.bidb, coord.bidh, coord.m_block);
-    };
-
     // Static tile-id broadcast mirrors the load path exactly.
     if constexpr (Use_paired_persistent) {
+      const int num_m_block_persistent = (params.seqlen_q + kBlockM - 1) / kBlockM;
+      const int total_tiles_persistent = num_m_block_persistent * params.h * params.b;
+      const int total_tile_pairs_persistent = (total_tiles_persistent + 1) / 2;
       #pragma unroll 1
       for (int tile_pair = int(blockIdx.x); tile_pair < total_tile_pairs_persistent; tile_pair += int(gridDim.x)) {
         const int paired_tile = total_tiles_persistent - 1 - tile_pair;
@@ -2194,13 +2204,19 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         #pragma unroll 1
         for (int pair_slot = 0; pair_slot < tiles_this_pair; ++pair_slot) {
           const int tile = pair_slot == 0 ? tile_pair : paired_tile;
-          run_math_tile_linear(tile);
+          const HstuWsTileCoord coord =
+              hstu_ws_decode_tile(tile, num_m_block_persistent, params.h);
+          run_math_tile(coord.bidb, coord.bidh, coord.m_block);
         }
       }
     } else if constexpr (Use_full_persistent) {
+      const int num_m_block_persistent = (params.seqlen_q + kBlockM - 1) / kBlockM;
+      const int total_tiles_persistent = num_m_block_persistent * params.h * params.b;
       #pragma unroll 1
       for (int tile = int(blockIdx.x); tile < total_tiles_persistent; tile += int(gridDim.x)) {
-        run_math_tile_linear(tile);
+        const HstuWsTileCoord coord =
+            hstu_ws_decode_tile(tile, num_m_block_persistent, params.h);
+        run_math_tile(coord.bidb, coord.bidh, coord.m_block);
       }
     } else {
       run_math_tile(bidb_arg, bidh_arg, m_block_arg);
@@ -2217,9 +2233,6 @@ __global__ void __launch_bounds__(Kernel_traits::kNThreads, 1)
 hstu_fwd_kernel_sm120_fp8_ws_tma(
     __grid_constant__ Params const params) {
   constexpr int kBlockM = Kernel_traits::kBlockM;
-  const int num_m_block = (params.seqlen_q + kBlockM - 1) / kBlockM;
-  const int total_tiles = num_m_block * params.h * params.b;
-  const int total_tile_pairs = (total_tiles + 1) / 2;
   constexpr bool Use_full_persistent =
       !Kernel_traits::Is_causal &&
       !Kernel_traits::Is_target &&
@@ -2250,8 +2263,5 @@ hstu_fwd_kernel_sm120_fp8_ws_tma(
       params,
       0,
       0,
-      0,
-      num_m_block,
-      total_tiles,
-      total_tile_pairs);
+      0);
 }

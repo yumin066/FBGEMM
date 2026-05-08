@@ -63,12 +63,12 @@ using namespace cute;
 template <int Headdim, bool Has_rab, bool Is_fp8>
 constexpr std::tuple<int, int, int> get_tile_size_fwd_sm120() {
   if constexpr (Is_fp8) {
-    // FP8 Phase 2: FP8 in SMEM (1 byte each) → halved SMEM vs BF16.
-    // Allows kNWarps=8 for non-RAB cases (assert: 16*kNWarps <= kBlockM).
-    // RAB is still BF16 so uses kNWarps=4 to avoid exceeding SMEM budget.
+    // FP8 WS path uses a fixed 8-math-warp shape.  Keep BN64 for all head
+    // dimensions so paged KV page_size == kBlockN and RAB/DRAB share the same
+    // specialization family.
     if constexpr (Has_rab) {
       if constexpr (Headdim <= 64) {
-        return {128, 64, 4};
+        return {128, 64, 8};
       } else if constexpr (Headdim == 128) {
         // Use BN64 so non-paged RAB/DRAB can share the WS TMA path with paged
         // KV and hdim256 RAB; V block-scale metadata must match this tile size.

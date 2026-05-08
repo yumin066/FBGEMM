@@ -286,11 +286,15 @@ struct Hstu_fwd_kernel_traits_sm120_fp8 {
   using SmemLayoutVtransposedNoSwizzle =
       decltype(get_nonswizzle_portion(SmemLayoutVtransposed{}));
 
-  // WS TMA layouts: SW128 for 128B+ contiguous K tiles, SW64 for hdim64.
+  // WS TMA layouts: choose the smallest GMMA K-swizzle atom that matches the
+  // contiguous head-dim tile.
   using SmemLayoutAtomTMA = std::conditional_t<
-      (kHeadDim == 64),
-      GMMA::Layout_K_SW64_Atom<Element>,
-      GMMA::Layout_K_SW128_Atom<Element>>;
+      (kHeadDim == 32),
+      GMMA::Layout_K_SW32_Atom<Element>,
+      std::conditional_t<
+          (kHeadDim == 64),
+          GMMA::Layout_K_SW64_Atom<Element>,
+          GMMA::Layout_K_SW128_Atom<Element>>>;
   using SmemLayoutQ_TMA  = decltype(tile_to_shape(SmemLayoutAtomTMA{}, Shape<Int<kBlockM>, Int<kHeadDim>>{}));
   using SmemLayoutK_TMA  = decltype(tile_to_shape(SmemLayoutAtomTMA{}, Shape<Int<kBlockN>, Int<kHeadDim>>{}));
   // V row-major [kBlockN, kHeadDim] in SMEM, loaded via TMA from row-major V (d stride-1).
@@ -309,9 +313,12 @@ struct Hstu_fwd_kernel_traits_sm120_fp8 {
   // to perform 8-element (128-bit) stores correctly.
   // Reference: sm120_blockscaled_moe_gemm_impl.cuh SmemAtomLayoutO.
   // NOTE: kBlockKSmem=32 is for FP8 INPUT; output is BF16 with 64-wide SW128 atom.
-  using SmemLayoutAtomO = decltype(composition(
-      Swizzle<3, 3, 3>{},
-      Layout<Shape<_8, Shape<_8, _8>>, Stride<_8, Stride<_1, Int<64>>>>{}));
+  using SmemLayoutAtomO = std::conditional_t<
+      (kHeadDim == 32),
+      Layout<Shape<_8, _32>, Stride<_32, _1>>,
+      decltype(composition(
+          Swizzle<3, 3, 3>{},
+          Layout<Shape<_8, Shape<_8, _8>>, Stride<_8, Stride<_1, Int<64>>>>{}))>;
   using SmemLayoutO = decltype(tile_to_shape(
       SmemLayoutAtomO{},
       Shape<Int<kBlockM>, Int<kHeadDim>>{}));
@@ -504,7 +511,7 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
   static constexpr int kSmemWsQPersistOffset = ((kSmemWsFuncEnd + 2047) / 2048) * 2048;
   static constexpr int kSmemWsAfterQPersist = kSmemWsQPersistOffset + kSmemQPersistBytes;
   static constexpr int kSmemWsAfterQPersistPadded = ((kSmemWsAfterQPersist + 127) / 128) * 128;
-  static constexpr bool kUseIndependentOBuffer = kHeadDim_ <= 128;
+  static constexpr bool kUseIndependentOBuffer = kHeadDim_ == 128;
   static constexpr int kSmemWsOOffset = kSmemWsAfterQPersistPadded;
   static constexpr int kSmemWsOBytes =
       kUseIndependentOBuffer

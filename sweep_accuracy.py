@@ -31,7 +31,7 @@ if torch.cuda.is_available():
 DEVICE = "cuda"
 BS = 1
 ALPHA = 1.0
-SWEEP_DIMS = [128, 256]  # D=64 disabled in this build (HSTU_DISABLE_HDIM64=TRUE)
+SWEEP_DIMS = [32, 64, 128, 256]
 SWEEP_HEADS = [1, 4]
 SWEEP_SEQS = [128, 256, 512]
 
@@ -144,13 +144,17 @@ def dequantize_paged_kv_cache(kv_cache_raw: torch.Tensor,
     k_fp8 = kv_cache_fp8[:, 0].float()
     v_fp8 = kv_cache_fp8[:, 1].float()
 
-    k_view = k_raw.view(pages * page_size, heads, dim // 128, 128)
-    k_scale = torch.amax(k_view.abs(), dim=3).to(torch.float32) / fp8_max
-    k_scale = torch.pow(2.0, torch.ceil(torch.log2(k_scale.clamp(min=1e-38))))
-    k_deq = (
-        k_fp8.view(pages * page_size, heads, dim // 128, 128)
-        * k_scale.unsqueeze(-1)
-    ).view(pages, page_size, heads, dim)
+    d_chunks = (dim + 127) // 128
+    k_raw_flat = k_raw.view(pages * page_size, heads, dim)
+    k_fp8_flat = k_fp8.view(pages * page_size, heads, dim)
+    k_deq_flat = torch.empty_like(k_raw_flat, dtype=torch.float32)
+    for d_chunk in range(d_chunks):
+        d0 = d_chunk * 128
+        d1 = min(dim, d0 + 128)
+        k_scale = torch.amax(k_raw_flat[:, :, d0:d1].abs(), dim=2).to(torch.float32) / fp8_max
+        k_scale = torch.pow(2.0, torch.ceil(torch.log2(k_scale.clamp(min=1e-38))))
+        k_deq_flat[:, :, d0:d1] = k_fp8_flat[:, :, d0:d1] * k_scale.unsqueeze(-1)
+    k_deq = k_deq_flat.view(pages, page_size, heads, dim)
 
     v_scale = torch.amax(v_raw.abs(), dim=(1, 3)).to(torch.float32) / fp8_max
     v_scale = torch.pow(2.0, torch.ceil(torch.log2(v_scale.clamp(min=1e-38))))
@@ -351,6 +355,12 @@ def norm_report(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-12):
     nd = float(torch.linalg.vector_norm(diff).item())
     rel = nd / (na + eps)
     return na, nb, nd, rel
+
+
+def fmt_metric(value, width: int, precision: int = 4) -> str:
+    if value is None:
+        return f"{'N/A':>{width}}"
+    return f"{value:>{width}.{precision}f}"
 
 
 def stage_error_probe(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -617,8 +627,10 @@ for D in SWEEP_DIMS:
                 out_bf16 = run_attn(q, k, v, cu, SEQ, num_tgts, SEQ, -1)
                 torch.cuda.synchronize()
             except Exception as e:
-                print(f"{D:>4} {H:>4} {SEQ:>6} | BF16 ERROR: {e}")
-                continue
+                out_bf16 = None
+                bf16_error = str(e)
+            else:
+                bf16_error = None
 
             try:
                 # blockwise-scale fp8 (quant_mode=2), real per-block scales.
@@ -651,10 +663,14 @@ for D in SWEEP_DIMS:
                 import traceback; traceback.print_exc()
                 continue
 
-            o_b = out_bf16.float().flatten()
             o_f = out_fp8.float().flatten()
-            cos, me, mn = metric_report(o_b, o_f)
-            n_b, n_f, _, rel_l2 = norm_report(o_b, o_f)
+            if out_bf16 is not None:
+                o_b = out_bf16.float().flatten()
+                cos, me, mn = metric_report(o_b, o_f)
+                n_b, n_f, _, rel_l2 = norm_report(o_b, o_f)
+            else:
+                cos = me = mn = n_b = rel_l2 = None
+                n_f = float(torch.linalg.vector_norm(o_f.float()).item())
 
             # Dequantized ground truth for FP8: reproduces exactly the e8m0-rounded
             # scales that the kernel uses, so cross-head scale non-uniformity cancels out.
@@ -688,20 +704,26 @@ for D in SWEEP_DIMS:
                     return (gt / SEQ).flatten()
 
                 bf16_bn = 128 if D == 128 else 64
-                gt_b = gemm1_debug_reference(q, k, bf16_bn)
                 gt_f = gemm1_debug_reference(
                     q.to(torch.float8_e4m3fn), k.to(torch.float8_e4m3fn), fp8_bn)
-                cos_b_gt, me_b_gt, _ = metric_report(o_b, gt_b)
+                if out_bf16 is not None:
+                    gt_b = gemm1_debug_reference(q, k, bf16_bn)
+                    cos_b_gt, me_b_gt, _ = metric_report(o_b, gt_b)
+                else:
+                    cos_b_gt = me_b_gt = None
                 cos_f_gt, me_f_gt, _ = metric_report(o_f, gt_f)
                 print(
                     f"{D:>4} {H:>4} {SEQ:>6} | "
-                    f"{cos:>12.4f} {me:>10.6f} {mn:>10.6f} | "
-                    f"{n_b:>10.4f} {n_f:>10.4f} {rel_l2:>10.6f} | "
-                    f"{cos_b_gt:>11.4f} {me_b_gt:>12.6f} {cos_f_gt:>11.4f} {me_f_gt:>11.6f}{flag}"
+                    f"{fmt_metric(cos, 12, 4)} {fmt_metric(me, 10, 6)} {fmt_metric(mn, 10, 6)} | "
+                    f"{fmt_metric(n_b, 10, 4)} {fmt_metric(n_f, 10, 4)} {fmt_metric(rel_l2, 10, 6)} | "
+                    f"{fmt_metric(cos_b_gt, 11, 4)} {fmt_metric(me_b_gt, 12, 6)} {cos_f_gt:>11.4f} {me_f_gt:>11.6f}{flag}"
                 )
             else:
                 gt = fullpath_ground_truth(q, k, v, ALPHA, SEQ).float().flatten()
-                cos_b_gt, me_b_gt, mn_b_gt = metric_report(o_b, gt)
+                if out_bf16 is not None:
+                    cos_b_gt, me_b_gt, mn_b_gt = metric_report(o_b, gt)
+                else:
+                    cos_b_gt = me_b_gt = mn_b_gt = None
                 # FP8 kernel vs dequantized ground truth (correct comparison)
                 cos_f_gt, me_f_gt, mn_f_gt = metric_report(o_f, gt_deq_flat)
                 if RUN_PAGED_KV_SWEEP:
@@ -730,11 +752,15 @@ for D in SWEEP_DIMS:
                     )
                 print(
                     f"{D:>4} {H:>4} {SEQ:>6} | "
-                    f"{cos:>12.4f} {me:>10.6f} {mn:>10.6f} | "
-                    f"{n_b:>10.4f} {n_f:>10.4f} {rel_l2:>10.6f} | "
-                    f"{cos_b_gt:>11.4f} {me_b_gt:>12.6f} {mn_b_gt:>12.6f} | "
+                    f"{fmt_metric(cos, 12, 4)} {fmt_metric(me, 10, 6)} {fmt_metric(mn, 10, 6)} | "
+                    f"{fmt_metric(n_b, 10, 4)} {fmt_metric(n_f, 10, 4)} {fmt_metric(rel_l2, 10, 6)} | "
+                    f"{fmt_metric(cos_b_gt, 11, 4)} {fmt_metric(me_b_gt, 12, 6)} {fmt_metric(mn_b_gt, 12, 6)} | "
                     f"{cos_f_gt:>10.4f} {me_f_gt:>11.6f} {mn_f_gt:>11.6f}{paged_cols}{flag}"
                 )
+                if bf16_error is not None:
+                    print(
+                        f"{'':>18}   [bf16 unsupported for this row: {bf16_error}]"
+                    )
         sys.stdout.flush()
 
 

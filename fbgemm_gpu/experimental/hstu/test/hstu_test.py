@@ -2056,13 +2056,9 @@ class HSTU8Test(unittest.TestCase):
                 event(f"HSTU8 skip unsupported quant_mode={quant_mode}")
                 logger.info(f"Skipping test for SM120: unsupported quant_mode={quant_mode}")
                 return
-            if attn_dim not in (128, 256):
+            if attn_dim not in (32, 64, 128, 256):
                 event(f"HSTU8 skip unsupported d={attn_dim}")
                 logger.info(f"Skipping test for SM120: unsupported attn_dim={attn_dim}")
-                return
-            if quant_mode == 2 and attn_dim % 128 != 0:
-                event(f"HSTU8 skip qmode2 d={attn_dim}")
-                logger.info(f"Skipping test for SM120 quant_mode=2: attn_dim={attn_dim} not divisible by 128")
                 return
             # SM120 supports all configurations except backward.
             # quant_mode=2 + has_rab: RAB implemented in FP8 block-scale path.
@@ -2439,7 +2435,7 @@ class HSTU8Test(unittest.TestCase):
             ("rab", (True, False, None)),
             ("drab", (True, True, None)),
         ]
-        for attention_dim in (128, 256):
+        for attention_dim in (32, 64, 128, 256):
             for seq_len in (99, 128, 256):
                 mask_cases = [
                     ("full", 0, (0, (-1, -1), 1, False)),

@@ -268,6 +268,30 @@ if not SKIP_CUDA_BUILD:
             + (glob.glob("src/hstu_hopper/instantiations/*.cu") if "9.0" in arch_list else [])
             + (glob.glob("src/hstu_blackwell_sm120/instantiations/*.cu") if "12.0" in arch_list else [])
         )
+        def _enabled_instantiation_source(src: str) -> bool:
+            base = os.path.basename(src)
+            dim_match = re.search(r"hdim(\d+)", base)
+            if dim_match is not None:
+                dim = int(dim_match.group(1))
+                if dim == 32 and DISABLE_HDIM32:
+                    return False
+                if dim == 64 and DISABLE_HDIM64:
+                    return False
+                if dim == 128 and DISABLE_HDIM128:
+                    return False
+                if dim == 256 and DISABLE_HDIM256:
+                    return False
+            if "src/hstu_blackwell_sm120/" in src and "hdim32_bf16" in base:
+                return False
+            if "e4m3" in base and DISABLE_FP8:
+                return False
+            if "bf16" in base and DISABLE_BF16:
+                return False
+            if "fp16" in base and DISABLE_FP16:
+                return False
+            return True
+
+        cuda_sources = [src for src in cuda_sources if _enabled_instantiation_source(src)]
 
         nvcc_flags = [
             "-O3",

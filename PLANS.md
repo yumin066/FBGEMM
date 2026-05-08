@@ -4,6 +4,10 @@
 
 ## 当前状态
 
+Phase 31 当前状态：已修复 SM120 FP8 `D=64 paged full` register spill。修复方式是把 persistent scheduler 的 `num_m_block/total_tiles/total_tile_pairs` 从 top-level wrapper 参数和跨分支 live range 中移除，改为 load/math persistent 分支内局部计算。最终 D64 paged full resource 为 `REG:168 STACK:0 LOCAL:0`，SASS 无 `LDL/STL`。最终 correctness 通过 `hstu_test.py`、`sweep_accuracy.py` 和 `run_hstu8_examples.sh`；锁频全量 FP8+paged kernel benchmark 已完成，日志为 `2benchmark_results/phase31_gpu2407MHz_full_fp8_paged_kernel_final.log`。
+
+Phase 30 当前状态：SM120 FP8 `quant_mode=2` forward 已接入 headDim32/headDim64，并按当前 headDim128/headDim256 的支持面覆盖 `D=32/64 × non-paged/paged × full/causal/local/context/target/arbitrary × none/RAB/DRAB`。Correctness 已通过 examples、sweep 和 `hstu_test.py`；D32/D64 全 mask/bias kernel-only benchmark 已锁频跑完。
+
 Phase 29 已完成：repo 自带 `hstu_test.py` 的 SM120 FP8 `quant_mode=2` fixed matrix 已覆盖 irregular seqlen corner cases，并把 paged KV cache 纳入同一个 pytest 验收矩阵。`(99,99)` 等非 block 对齐输入现在真实运行通过，不再通过 alignment guard 跳过。
 
 Phase 28 已完成 `headDim=128/256 + paged KV + RAB/DRAB` 全配置：full、pure causal、context+causal、target+causal、local、arbitrary 真实运行通过。
@@ -30,7 +34,93 @@ Phase 25 的 SM120 forward headDim256 已完成第一阶段支持。FP8 hdim256 
 - Phase 28 paged RAB/DRAB complex coverage 已接入：D=128/D=256 的 full、pure causal、context+causal、target+causal、local、arbitrary + paged KV + RAB/DRAB examples 全部真实通过。RAB bias 仍在 WS math fragment 中从 global RAB tensor 直接加到 `acc_s`，不新增 RAB SMEM tile。D=128 paged causal+RAB SASS 为 `REG:168 STACK:0 LOCAL:0` 且无 `LDL/STL`；D=256 paged causal+RAB 为 `REG:168 STACK:8 LOCAL:0`，有 1 个 `STL` 和 1 个 `LDL`，作为残余风险记录。
 - Phase 27 non-paged RAB/DRAB WS 当前版已接入：D=128/D=256 full、pure causal、context+causal、target+causal、local、arbitrary non-paged RAB/DRAB 走 WS TMA，correctness 通过。`bs=2,seq=1024,h=4,d=256` kernel-only latency 相比 fallback：full `0.0693ms vs 0.1111ms`，local `0.0583ms vs 0.0825ms`，context `0.1264ms vs 0.2118ms`，target `0.0798ms vs 0.1246ms`；arbitrary WS 与 fallback 基本持平，用于统一路径。
 - `bench_hstu_attn_sm120.py` 已扩展为默认覆盖 `full/causal/local/context/target/arbitrary` × `none/rab/drab`，每个逻辑 case 同时输出 BF16、non-paged FP8、paged FP8。三列独立计时，BF16 unsupported 不再阻塞 FP8/paged 结果；可用 `--columns fp8 paged` 只跑目标列。TFLOPS 按 `generate_input` 产生的实际 valid attention pairs 计算，避免 causal/local/context/target 被 full FLOPs 高估。
-- repo 自带 `hstu_test.py` 已纳入当前 correctness 目标；最新全文件日志 `1test_results/592_phase29_hstu_test_full_after_k_offsets.log` 为 `3 passed, 1 skipped`。其中 `HSTU8Test::test_sm120_fp8_blockscale_matrix` 显式跑 SM120 FP8 `quant_mode=2` 的 216 个 subcases：D=128/D=256、seq=99/128/256、full/causal/local/context/target/arbitrary、none/RAB/DRAB、non-paged/paged。审计日志 `1test_results/592_phase29_hstu8_matrix_k_offsets.log` 通过。后续 HSTU CUDA/CuTe 改动必须保持该 pytest 入口通过。
+- repo 自带 `hstu_test.py` 已纳入当前 correctness 目标；Phase 31 最新全文件日志 `1test_results/phase31_final_hstu_test.log` 为 `3 passed, 1 skipped`。其中 `HSTU8Test::test_sm120_fp8_blockscale_matrix` 已扩展到 D=32/D=64/D=128/D=256、seq=99/128/256、full/causal/local/context/target/arbitrary、none/RAB/DRAB、non-paged/paged。后续 HSTU CUDA/CuTe 改动必须保持该 pytest 入口通过。
+
+## Phase 31：D64 paged full spill 修复与全量性能分析
+
+目标：
+
+- 解决 `D=64 paged full` 的 residual register spill。
+- 锁频全量 benchmark，确认 D128/D256 没有性能回退。
+- 以 FP8 non-paged D128 pure full/causal TFLOPS 为同 shape baseline，分析低于 baseline 的配置组合。
+
+实现状态：
+
+- 已从 `hstu_compute_attn_1rowblock_sm120_fp8_ws` 的参数和 top-level kernel wrapper 中移除 persistent scheduler count 参数，避免这些值跨 load/math 分支延长 live range。
+- load persistent loop 和 math persistent loop 内部分别局部计算 `num_m_block_persistent`、`total_tiles_persistent`、`total_tile_pairs_persistent`，保持 scheduler 语义不变。
+- `ncu_hstu_attn.py` 已支持 `--mask-config` 和 `--bias-config`，可直接 profile RAB/DRAB、local/context/target/arbitrary 等低 TFLOPS case。
+
+验证结果：
+
+- build：`1test_results/phase31_final_rebuild_after_rab_revert.log`。
+- pytest：`1test_results/phase31_final_hstu_test.log`，结果 `3 passed, 1 skipped`。
+- sweep：`1test_results/phase31_final_sweep.log`，通过；paged same-input full/causal 继续 `max_err=0`。
+- examples：`1test_results/phase31_final_examples.log`，内部日志 `1test_results/690_hstu8_examples_qm2.log`，结果 `284/284 passed`。
+- SASS：`4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I64_paged_full_final.sass`；resource 为 `REG:168 STACK:0 LOCAL:0`，无 `LDL/STL`。
+- 锁频全量 benchmark：`2benchmark_results/phase31_gpu2407MHz_full_fp8_paged_kernel_final.log`，覆盖 D=32/64/128/256、bs=1/4/8、seq=128/256/512/1024/2048/4096、H=4/16、full/causal/local/context/target/arbitrary、none/RAB/DRAB、FP8+paged 共 2592 行。
+
+D128/D256 regression 结论：
+
+- 对比 `2benchmark_results/phase31_gpu2407MHz_full_fp8_paged_kernel_after_d64_spillfix.log`，D128/D256 pure full/causal 平均无回退。
+- D128 pure full/causal：FP8 平均 `+0.61%`，paged 平均 `+0.49%`；最差分别约 `-1.42%`、`-1.55%`，属于小幅噪声。
+- D256 pure full/causal：FP8 平均 `+0.60%`；paged 平均 `+0.18%`。最差点为 `bs=8 seq=4096 h=16 d=256 causal paged`，`480.5 -> 453.4 TFLOPS`，需要后续单独复测确认是否为测量波动或 D256 paged causal 真实回退。
+
+低于 D128 pure baseline 的主要原因：
+
+- D32/D64 + RAB/DRAB 是最低 TFLOPS 主类。NCU 对比显示 D32 full no-RAB 计算侧仍有约 `42.9%` issue slots busy；D32 full+RAB 降到约 `10.3%`，No Eligible 升到约 `88.4%`，DRAM/L2 命中明显变差，且无 local spill。瓶颈是 math warp 在 `add_rab_bs` 中对 BF16 RAB 的 scalar global load 延迟，而不是 register spill。
+- RAB/DRAB 的额外 BF16 global load 不计入 HSTU GEMM FLOPs；D 越小，tensor-core 工作越少，RAB load 越容易主导 wall time，因此 D32/D64 的 TFLOPS 相对 D128 pure baseline 最低。
+- context/target/local/arbitrary 的 valid-pairs FLOP 分母低于 full/causal，但 tile-level overhead、mask/control flow、paged target tail 处理仍存在，TFLOPS 会自然低于 D128 pure full/causal baseline。
+- paged target+RAB/DRAB 额外叠加 page-id/tail path 和 RAB global load，是当前低 TFLOPS 的最差组合。
+
+已拒绝的优化实验：
+
+- 尝试把 D32/D64 RAB tile 用 K load warp 预取到 SMEM，correctness 通过，但锁频 smoke benchmark 严重回退：例如 `bs=1 seq=4096 h=16 d=32 full+rab` FP8 从约 `30.6 TFLOPS` 降到约 `6.0 TFLOPS`，D64 full+rab 从约 `60.5 TFLOPS` 降到约 `12.1 TFLOPS`。
+- 回退原因：单个 K load warp 串行搬 16KB RAB tile，延迟了 K-stage producer/consumer 节奏并破坏主流水。该方案不保留。
+
+后续可行方向：
+
+- 若继续优化 RAB/DRAB，不能再用单 warp 同步 SMEM copy。应评估独立 RAB TMA/异步 bulk copy，或把 RAB 访问改成更 cache-friendly 的布局/打包，并保证不会延迟 K/V stage release。
+- D256 paged causal 的单点回退需先复测同 shape，再决定是否 profile；若稳定回退，重点看 paged scheduler、page descriptor 控制流和 tail-wave。
+
+## Phase 30：SM120 FP8 headDim32/headDim64 full coverage
+
+目标：把 SM120 FP8 `quant_mode=2` forward 从当前 headDim128/headDim256 扩展到 headDim32/headDim64，并覆盖当前 hdim128/256 已支持的所有配置组合。
+
+范围：
+
+- `D=32/64` 都必须支持 non-paged FP8 和 paged KV FP8。
+- 每个 D 都必须覆盖 `full`、`causal`、`local`、`context+causal`、`target+causal`、`arbitrary`。
+- 每个 mask 组合都必须覆盖 `none`、`RAB`、`DRAB`。
+- irregular seqlen 继续沿用 Phase 29 actual/padded seqlen 方案，不能重新引入 block-alignment skip。
+- backward、BF16 paged KV、block-scale quant modes 1/3/4/5 不进入本阶段。
+
+实现状态：
+
+- SM120 FP8 runtime guard、kernel generation 和 setup source filtering 已允许 D=32/D=64/D=128/D=256；BF16 仍保持 D=64/D=128/D=256。
+- Python wrapper 与 C++ tile-size 已统一到 FP8 `{kBlockM=128,kBlockN=64,kNWarps=8}`，包括 RAB/DRAB 和 paged KV。
+- Q/K e8m0 scale 构造已支持 `D < 128`：D32/D64 都生成 1 个 128-D scale chunk 并按现有 int32 packing 传给 kernel。
+- WS TMA layout 现在按 headDim 选择 SW32/SW64/SW128；paged cp.async fallback 也改为通过 layout 计算 SMEM 地址，不再写死 SW128。
+- GEMM2 的 V fragment placement 对 D64 使用 linear 64-wide N-tile 公式；D32 在 GEMM2 内部使用 64-wide TileN 并只 store 前 32 列，额外 V fragment 清零。
+
+已完成：
+
+- 统一 FP8 tile-size：SM120 FP8 所有 headDim 优先使用 `{kBlockM=128,kBlockN=64,kNWarps=8}`，包括 RAB/DRAB；这样 paged KV 的 `page_size == kBlockN` 继续成立，WS warp 数也保持与现有 kernel invariant 一致。
+- 先启用 hdim64：移除 dispatch guard，使用 `Kernel_traits` 中的 SW64 TMA layout 替代 WS 文件里硬编码的 SW128 Q/K layout，修正 Python BN 和 scale chunk 逻辑，然后编译 `HSTU_DISABLE_HDIM64=FALSE`。
+- 再启用 hdim32：切到 SW32 或必要的等价 SMEM layout，处理 TMA/cp.async fallback 和 ldmatrix 地址计算，并编译 `HSTU_DISABLE_HDIM32=FALSE`。
+- 扩展测试矩阵：`run_hstu8_examples.sh`、`sweep_accuracy.py`、`hstu_test.py::HSTU8Test::test_sm120_fp8_blockscale_matrix` 都改为覆盖 D=32/64/128/256。
+- 扩展 benchmark：`bench_hstu_attn_sm120.py` 支持按 D=32/64/128/256 输出 FP8/paged 列；D32/D64 不再被旧 unsupported guard 跳过。全量 benchmark 必须锁频后运行。
+- SASS 验收：至少 dump D32/D64 的 full、causal、paged causal、RAB/DRAB 代表实例，检查 `LDL/STL` 和 `STACK`，避免把 register spill 引入默认路径。
+
+验证结果：
+
+- 构建命令使用 `HSTU_DISABLE_HDIM32=FALSE HSTU_DISABLE_HDIM64=FALSE HSTU_DISABLE_HDIM256=FALSE` 且通过。
+- `run_hstu8_examples.sh` 覆盖 D=32/64/128/256，日志 `1test_results/670_hstu8_examples_qm2.log` 为 `284/284 passed`。
+- `HSTU_SWEEP_FP8_QUANT_MODE=2 python sweep_accuracy.py` 日志 `1test_results/phase30_hdim32_64_sweep.log` 通过；D32/D64 的 `fp8_gt_cos >= 0.9996`，paged same-input full/causal 继续 `max_err=0`。
+- `HSTU8Test::test_sm120_fp8_blockscale_matrix` 日志 `1test_results/phase30_hdim32_64_hstu8_matrix.log` 通过；全文件 pytest `1test_results/phase30_hdim32_64_hstu_test_full.log` 为 `3 passed, 1 skipped`。
+- Resource/SASS：`1test_results/phase30_hdim32_64_resource_usage.log`；D32 代表项为 `REG:168 STACK:0 LOCAL:0`，D64 non-paged 代表项为 `REG:168 STACK:0 LOCAL:0`。Phase 31 已修复 D64 paged full residual spill；最终 SASS `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I64_paged_full_final.sass` 为 `REG:168 STACK:0 LOCAL:0`，无 `LDL/STL`。
+- 锁频 benchmark：`2benchmark_results/phase30_gpu2407MHz_hdim32_64_kernel_only_after_guard.log`，覆盖 D=32/D=64、batch=1/4/8、seq=128/256/512/1024/2048/4096、H=4/16、full/causal/local/context/target/arbitrary、none/RAB/DRAB、FP8+paged 共 1296 行；startup summary 为 `Unsupported selected cases: none`，无 `ERR`/`ERROR`。
+- D32/D64 benchmark 摘要：D32 平均 FP8/Paged 为 `50.8/47.4 TFLOPS`，paged 相对 non-paged 平均 `-9.3%`；D64 平均 FP8/Paged 为 `84.5/79.7 TFLOPS`，paged 相对 non-paged 平均 `-7.1%`。`seq>=4096` 时 paged 差距收敛到 D32 `-4.4%`、D64 `-4.0%`。
+- 已补全同频 D=128/D=256 全量 benchmark：`2benchmark_results/phase31_gpu2407MHz_full_fp8_paged_kernel_final.log`。
 
 ## Phase 29：SM120 FP8 hstu_test.py irregular seqlen + paged KV
 
@@ -49,7 +139,7 @@ Phase 25 的 SM120 forward headDim256 已完成第一阶段支持。FP8 hdim256 
 范围边界：
 
 - Phase 29 目标是 SM120 FP8 block-scale `quant_mode=2` forward。当前 C++ SM120 只支持 FP8 quant modes 0/2；Hypothesis 中 quant modes 1/3/4/5 属于 Hopper FP8 语义，不纳入本阶段。
-- headDim64 block-scale 仍不是当前 SM120 FP8 主路径。若后续要求 hdim64，也应作为独立 feature 设计 scale layout 和 dispatch。
+- headDim32/headDim64 已在 Phase 30 接入；Phase 29 的 irregular/paged padding 方案继续复用。
 - backward 不进入 Phase 29；SM120 backward 仍按现有测试逻辑跳过。
 
 验证计划：

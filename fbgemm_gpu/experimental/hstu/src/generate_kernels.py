@@ -356,13 +356,20 @@ def generate_kernels_blackwell(install_dir: str):
     Generate HSTU forward kernels for Blackwell architecture (SM120).
     SM120 uses per-warp mma.sync (same model as Ampere), not WGMMA.
     Supports BF16 and FP8 (e4m3) forward pass only (no backward in Phase 1).
-    Head dims: 64, 128, and 256 on SM120 HSTU.
+    Head dims: 32, 64, 128, and 256 on SM120 HSTU.
     """
 
     # SM120 supports BF16 and FP8; FP16 is low priority (same tiles as BF16)
     DTYPE_16 = (["bf16"] if not DISABLE_BF16 else [])
-    HEAD_DIMENSIONS = (
+    HEAD_DIMENSIONS_BF16 = (
         []
+        + ([64] if not DISABLE_HDIM64 else [])
+        + ([128] if not DISABLE_HDIM128 else [])
+        + ([256] if not DISABLE_HDIM256 else [])
+    )
+    HEAD_DIMENSIONS_FP8 = (
+        []
+        + ([32] if not DISABLE_HDIM32 else [])
         + ([64] if not DISABLE_HDIM64 else [])
         + ([128] if not DISABLE_HDIM128 else [])
         + ([256] if not DISABLE_HDIM256 else [])
@@ -407,7 +414,7 @@ template void run_hstu_fwd_sm120<120, {}, {}, {}, {}, {}, {}, {}, {}, {}>
 
     # BF16 kernels
     for hdim, dtype, rab, mask in itertools.product(
-        HEAD_DIMENSIONS, DTYPE_16, RAB, MASK
+        HEAD_DIMENSIONS_BF16, DTYPE_16, RAB, MASK
     ):
         file_name = f"{install_dir}/hstu_fwd_sm120_hdim{hdim}_{dtype}{rab}{mask}_fn{ARBITRARY_NFUNC}.cu" if "arbitrary" in mask else f"{install_dir}/hstu_fwd_sm120_hdim{hdim}_{dtype}{rab}{mask}.cu"
         if not os.path.exists(file_name):
@@ -428,7 +435,7 @@ template void run_hstu_fwd_sm120<120, {}, {}, {}, {}, {}, {}, {}, {}, {}>
 
     # FP8 (e4m3) kernels
     if not DISABLE_FP8:
-        for hdim, rab, mask in itertools.product(HEAD_DIMENSIONS, RAB, MASK):
+        for hdim, rab, mask in itertools.product(HEAD_DIMENSIONS_FP8, RAB, MASK):
             file_name = f"{install_dir}/hstu_fwd_sm120_hdim{hdim}_e4m3{rab}{mask}_fn{ARBITRARY_NFUNC}.cu" if "arbitrary" in mask else f"{install_dir}/hstu_fwd_sm120_hdim{hdim}_e4m3{rab}{mask}.cu"
             if not os.path.exists(file_name):
                 with open(file_name, "w") as f:

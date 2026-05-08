@@ -75,13 +75,16 @@ struct SM120QmmaBuilder {
   // Replicates SM120BlockScaledBuilder::TiledMma exactly.
   // AtomLayout <_2,_4,_1>: 2×4 warp grid (8 warps in the math warpgroup).
   // PermMmaTileN swizzles 128-wide N-tiles for SM120 QMMA optimal bank layout.
-  // The 64-wide experiment uses a linear 64-wide N tile; callers with hand-written
+  // The 32/64-wide cases use a linear N tile; callers with hand-written
   // fragment placement must branch on kTileN because the N-atom order changes.
   using PermMmaTileM = Int<32>;
   using PermMmaTileN = std::conditional_t<
-      (kTileN == 64),
-      Int<64>,
-      Layout<Shape<_8, _4, _4>, Stride<_1, _32, _8>>>;
+      (kTileN == 32),
+      Int<32>,
+      std::conditional_t<
+          (kTileN == 64),
+          Int<64>,
+          Layout<Shape<_8, _4, _4>, Stride<_1, _32, _8>>>>;
   using PermMmaTileK = Underscore;
 
   using MmaAtom = MMA_Atom<SM120::BLOCKSCALED::SM120_16x8x32_TN_VS<

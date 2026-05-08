@@ -118,7 +118,7 @@ base_cases = cases
 base_labels = labels
 cases = []
 labels = []
-for dim in (128, 256):
+for dim in (32, 64, 128, 256):
     for kw, label in zip(base_cases, base_labels):
         kw_dim = dict(kw)
         kw_dim['attn_hidden_dims'] = (dim, dim)
@@ -126,7 +126,7 @@ for dim in (128, 256):
         labels.append(f'D={dim} {label}')
 
 NONPAGED_EXTRA_CASES = []
-for dim in (128, 256):
+for dim in (32, 64, 128, 256):
     for seq in (128, 256):
         extra_specs = [
             ('full', 0, (0, (-1, -1), 1, False)),
@@ -537,7 +537,7 @@ PAGED_CASES = [
 ] + [
     (f'paged kv edge D={dim} partial-last-page',
      dict(batch_size=1, heads=2, new_history_len=64, prev_history_len=32, target_len=64, dim=dim))
-    for dim in (128, 256)
+    for dim in (32, 64, 128, 256)
 ]
 
 PAGED_FULL_CASES = [

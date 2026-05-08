@@ -243,6 +243,15 @@ void run_hstu_fwd_headdim_sm120(Hstu_fwd_params& params, cudaStream_t stream) {
     return;
   }
 #endif
+#ifndef HSTU_DISABLE_HDIM32
+  if (params.d == 32) {
+    if constexpr (std::is_same_v<Dtype, cutlass::float_e4m3_t>) {
+      run_hstu_fwd_sm120<Arch, Dtype, 32, Has_rab, Is_local, Is_causal,
+          Is_context, Is_target, Is_arbitrary, kNFunc>(params, stream);
+      return;
+    }
+  }
+#endif
 #ifndef HSTU_DISABLE_HDIM128
   if (params.d == 128) {
     run_hstu_fwd_sm120<Arch, Dtype, 128, Has_rab, Is_local, Is_causal,
@@ -257,7 +266,11 @@ void run_hstu_fwd_headdim_sm120(Hstu_fwd_params& params, cudaStream_t stream) {
     return;
   }
 #endif
-  TORCH_CHECK(false, "Unsupported head dim: ", params.d, " (SM120 supports 64, 128, 256)");
+  TORCH_CHECK(
+      false,
+      "Unsupported head dim: ",
+      params.d,
+      " (SM120 FP8 supports 32/64/128/256; SM120 BF16 supports 64/128/256)");
 }
 
 void run_hstu_fwd_blackwell(Hstu_fwd_params& params, cudaStream_t stream) {
@@ -265,8 +278,8 @@ void run_hstu_fwd_blackwell(Hstu_fwd_params& params, cudaStream_t stream) {
     // Dispatch on dtype: FP8 (quant_mode >= 0) or BF16/FP16
     if (params.quant_mode >= 0) {
       TORCH_CHECK(
-          params.d == 128 || params.d == 256,
-          "SM120 FP8 WS-only path supports headDim128/256, got headDim=",
+          params.d == 32 || params.d == 64 || params.d == 128 || params.d == 256,
+          "SM120 FP8 WS-only path supports headDim32/64/128/256, got headDim=",
           params.d);
       // FP8 mode: use float_e4m3_t as Element type
       using FP8Type = cutlass::float_e4m3_t;
@@ -419,8 +432,15 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_120(
 
   TORCH_CHECK(batch_size > 0, "batch_size must be positive");
   TORCH_CHECK(num_heads == num_heads_k, "num_heads_k must equal num_heads");
-  TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256,
-      "SM120 supports head_size 64, 128, or 256, got ", head_size);
+  if (quant_mode >= 0) {
+    TORCH_CHECK(
+        head_size == 32 || head_size == 64 || head_size == 128 || head_size == 256,
+        "SM120 FP8 supports head_size 32, 64, 128, or 256, got ",
+        head_size);
+  } else {
+    TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256,
+        "SM120 BF16 supports head_size 64, 128, or 256, got ", head_size);
+  }
   TORCH_CHECK(q.stride(-1) == 1, "q must have contiguous last dimension");
   TORCH_CHECK(k.stride(-1) == 1, "k must have contiguous last dimension");
   // V must be row-major (d-stride=1). WS TMA path uses row-major V with LDSM_T transpose.
@@ -429,8 +449,9 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_120(
 
   if (is_paged_kv) {
     TORCH_CHECK(quant_mode == 2, "SM120 paged KV initial path requires quant_mode=2");
-    TORCH_CHECK(head_size == 128 || head_size == 256,
-        "SM120 FP8 paged KV path requires head_size=128 or 256");
+    TORCH_CHECK(
+        head_size == 32 || head_size == 64 || head_size == 128 || head_size == 256,
+        "SM120 FP8 paged KV path requires head_size=32, 64, 128, or 256");
     const bool is_no_target_paged_kv = !num_targets.has_value();
     const bool is_causal_or_target_paged_kv =
         num_targets.has_value() && window_size_left < 0 && window_size_right == 0;

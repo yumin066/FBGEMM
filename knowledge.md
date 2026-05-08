@@ -1846,3 +1846,25 @@ Phase 22 第一轮结论：当前待提交 diff 只保留默认 BF16 cp.async �
 - BF16 no-RAB hdim128 causal 的 `{kBlockM=128, kBlockN=64, kNWarps=4} + __launch_bounds__(128, 2)` 候选已验证不应保留。SASS：`4sass_dump_ws/hstu_fwd_kernel_sm120_bf16_hdim128_causal_tile128x64x4_lb2.sass`，`cuobjdump --dump-resource-usage` 为 `REG:255 STACK:200 LOCAL:0`，SASS 中 `LDL=57`、`STL=55`。`hstu_test.py` BF16 主用例通过（`1test_results/266_phase22_bf16_tile128x64x4_lb2_hstu_test_main.log`），但 `bs=8 seq=4096 h=16` kernel-only benchmark（`2benchmark_results/117_phase22_bf16_causal_tile128x64x4_lb2_kernel.log`）显示 full `376.8`、causal `496.7 TFLOPS`；causal 相对 107 基线 `656.3 TFLOPS` 大幅回退，主要原因是 2CTA launch bound 下寄存器压力过高导致 spill。
 - BF16 no-RAB hdim128 causal 的 `{64,128,4} + K/V SMEM alias + __launch_bounds__(128,2)` 已验证不保留。该方案把 K/V 共用同一块 SMEM，SASS 无 spill（`REG:230 STACK:0 LOCAL:0`，`LDL/STL=0`，`4sass_dump_ws/hstu_fwd_kernel_sm120_bf16_hdim128_causal_tile64x128x4_kv_alias_lb2.sass`），correctness 通过（`1test_results/268_phase22_bf16_tile64x128x4_kv_alias_lb2_hstu_test_main.log`、`269_phase22_bf16_tile64x128x4_kv_alias_lb2_accuracy.log`），但 benchmark `bs=8 seq=4096 h=16` causal 只有 `580.0 TFLOPS`（`2benchmark_results/119_phase22_bf16_tile64x128x4_kv_alias_lb2_kernel_repeat.log`）。NCU（`3profile_results/059_phase22_bf16_tile64x128x4_kv_alias_lb2_causal_ncu_bf16.csv`）显示 dynamic SMEM 为 `32768B`、active warps/scheduler 仍为 `1.93`，且 `No Eligible` 从 `{64,64,4}+lb2` 的 `78.12%` 恶化到 `81.02%`；延后 V load 破坏了原先 overlap。
 - BF16 no-RAB hdim128 causal 的 `{64,64,4} + __launch_bounds__(128,3)` 已验证不保留。该方案无 spill（`REG:168 STACK:0 LOCAL:0`，`LDL/STL=0`，`4sass_dump_ws/hstu_fwd_kernel_sm120_bf16_hdim128_causal_tile64x64x4_lb3.sass`），correctness 通过（`1test_results/270_phase22_bf16_tile64x64x4_lb3_hstu_test_main.log`、`271_phase22_bf16_tile64x64x4_lb3_accuracy.log`）。NCU（`3profile_results/060_phase22_bf16_tile64x64x4_lb3_causal_ncu_bf16.csv`）显示 active warps/scheduler 提升到 `2.80`、achieved occupancy `23.36%`、No Eligible 降到 `75.92%`；但同环境 benchmark 不赢默认 `{128,128,8}`：`bs=8 seq=4096 h=16` causal 为 `653.0 TFLOPS`（`2benchmark_results/120_phase22_bf16_tile64x64x4_lb3_kernel.log`），默认 baseline 为 `668.6 TFLOPS`（`2benchmark_results/121_phase22_bf16_baseline_kbn128_sameenv_kernel.log`）；`bs=4 seq=2048 h=16` causal 也基本持平/略低（`507.9` vs baseline `508.7 TFLOPS`，`122/123`）。提高 occupancy 本身不足以抵消更小 M/N tile 的额外开销。
+
+---
+
+## 19. Phase 31：FP8 RAB/DRAB 低 TFLOPS 结论
+
+Phase 31 用 FP8 non-paged D128 pure full/causal TFLOPS 作为同 shape baseline 分析全量 benchmark。最低 TFLOPS 组合集中在 D32/D64 + RAB/DRAB，尤其是 paged target+RAB/DRAB。
+
+关键结论：
+
+- RAB/DRAB 的主要瓶颈不是 register spill。D32 full+RAB profile 中 local spilling requests 为 0，resource 仍是 `REG:168`。
+- D32 full no-RAB profile：issue slots busy 约 `42.9%`，No Eligible 约 `50.8%`。
+- D32 full+RAB profile：issue slots busy 降到约 `10.3%`，No Eligible 升到约 `88.4%`，DRAM throughput 和 L2 miss 明显变差。
+- 根因是 `add_rab_bs` 在 math warp 中对 BF16 RAB tensor 做 scalar global load；这部分开销不计入 GEMM FLOPs，D 越小越容易支配总耗时。
+- context/target/local/arbitrary 还叠加 mask/control flow、valid-pairs FLOP 分母变小和 paged target tail overhead，因此相对 D128 pure baseline 的 TFLOPS 更低。
+
+已拒绝的优化实验：
+
+- 将 D32/D64 RAB tile 由 K load warp 预取到 SMEM correctness 可过，但性能严重回退。
+- `bs=1 seq=4096 h=16 d=32 full+rab` FP8 从约 `30.6 TFLOPS` 降到约 `6.0 TFLOPS`；D64 full+rab 从约 `60.5 TFLOPS` 降到约 `12.1 TFLOPS`。
+- 原因是单 K warp 串行搬运 16KB RAB tile，延迟 K-stage release，破坏主 K/V pipeline。后续不应重复此路线。
+
+后续如果继续优化 RAB/DRAB，应优先考虑不会阻塞 K/V stage 的独立 RAB TMA/异步搬运或更 cache-friendly 的 RAB layout/packing。
