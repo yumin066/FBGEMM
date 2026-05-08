@@ -4,6 +4,8 @@
 
 ## 当前状态
 
+Phase 32 当前目标：参考现有 CuTe DSL 路径实现 SM120 BF16 prototype，并与当前 SM120 C++ BF16 路径做性能对比。已确认 SM100 DSL `tcgen05` BF16 MMA 不能直接用于 SM120：CUTLASS DSL 4.5 的 `tcgen05.MmaF16BF16Op` 只接受 `sm_100a/sm_101a/sm_103a`，`sm_120a` 会在 JIT 阶段报 arch 不支持；强制按 `sm_100a` 编译后也会在 SM120 上报 `cudaErrorNoKernelImageForDevice`。因此 Phase 32 prototype 改用 Ampere-style warp-level `mma.sync` CuTe DSL，与当前 SM120 C++ BF16 的 “SM80 mma.sync on SM120” 模型一致。当前 SM120 CuTe DSL BF16 已补齐 D32/D64/D128/D256 × full、causal、local、context+causal、target+causal、context+target+causal、arbitrary × none/RAB/DRAB；覆盖 dense full-batch、compact varlen、`alpha=1.0/0.1`。BF16 paged KV 以 wrapper-side materialization 接入，先还原成 dense K/V 后复用同一个 DSL kernel。最新结论：早期 CUDA-event benchmark 的 8%~12% ratio 主要是把 Python/CuTe DSL wrapper 的 descriptor/from_dlpack/launch 开销计入了 event 区间，不代表 GPU kernel 本身；nsys GPU kernel summary 显示对齐 8-warps、fast_silu 和 in-kernel scaling 后，`bs=1,seq=1024,H=4,D=128,full` DSL kernel 为 `40.0us`，当前 C++ BF16 为 `35.1us`，约 `87.7%`。
+
 Phase 31 当前状态：已修复 SM120 FP8 `D=64 paged full` register spill。修复方式是把 persistent scheduler 的 `num_m_block/total_tiles/total_tile_pairs` 从 top-level wrapper 参数和跨分支 live range 中移除，改为 load/math persistent 分支内局部计算。最终 D64 paged full resource 为 `REG:168 STACK:0 LOCAL:0`，SASS 无 `LDL/STL`。最终 correctness 通过 `hstu_test.py`、`sweep_accuracy.py` 和 `run_hstu8_examples.sh`；锁频全量 FP8+paged kernel benchmark 已完成，日志为 `2benchmark_results/phase31_gpu2407MHz_full_fp8_paged_kernel_final.log`。
 
 Phase 30 当前状态：SM120 FP8 `quant_mode=2` forward 已接入 headDim32/headDim64，并按当前 headDim128/headDim256 的支持面覆盖 `D=32/64 × non-paged/paged × full/causal/local/context/target/arbitrary × none/RAB/DRAB`。Correctness 已通过 examples、sweep 和 `hstu_test.py`；D32/D64 全 mask/bias kernel-only benchmark 已锁频跑完。
@@ -35,6 +37,42 @@ Phase 25 的 SM120 forward headDim256 已完成第一阶段支持。FP8 hdim256 
 - Phase 27 non-paged RAB/DRAB WS 当前版已接入：D=128/D=256 full、pure causal、context+causal、target+causal、local、arbitrary non-paged RAB/DRAB 走 WS TMA，correctness 通过。`bs=2,seq=1024,h=4,d=256` kernel-only latency 相比 fallback：full `0.0693ms vs 0.1111ms`，local `0.0583ms vs 0.0825ms`，context `0.1264ms vs 0.2118ms`，target `0.0798ms vs 0.1246ms`；arbitrary WS 与 fallback 基本持平，用于统一路径。
 - `bench_hstu_attn_sm120.py` 已扩展为默认覆盖 `full/causal/local/context/target/arbitrary` × `none/rab/drab`，每个逻辑 case 同时输出 BF16、non-paged FP8、paged FP8。三列独立计时，BF16 unsupported 不再阻塞 FP8/paged 结果；可用 `--columns fp8 paged` 只跑目标列。TFLOPS 按 `generate_input` 产生的实际 valid attention pairs 计算，避免 causal/local/context/target 被 full FLOPs 高估。
 - repo 自带 `hstu_test.py` 已纳入当前 correctness 目标；Phase 31 最新全文件日志 `1test_results/phase31_final_hstu_test.log` 为 `3 passed, 1 skipped`。其中 `HSTU8Test::test_sm120_fp8_blockscale_matrix` 已扩展到 D=32/D=64/D=128/D=256、seq=99/128/256、full/causal/local/context/target/arbitrary、none/RAB/DRAB、non-paged/paged。后续 HSTU CUDA/CuTe 改动必须保持该 pytest 入口通过。
+
+## Phase 32：SM120 BF16 CuTe DSL Prototype
+
+目标：
+
+- 用 CuTe DSL 实现一版可在 SM120 上运行的 BF16 HSTU forward prototype。
+- 不改变当前默认 `torch.ops.fbgemm.hstu_varlen_fwd_120` BF16 dispatch；prototype 只通过专用 Python wrapper/benchmark 调用。
+- 与当前 SM120 C++ BF16 做同输入 correctness 和锁频 kernel-only 性能对比。
+
+方案：
+
+- 不直接复用 SM100 DSL `HSTUAttentionForwardSm100` 的 kernel body，因为它依赖 `tcgen05` BF16 MMA/TMEM，当前 CUTLASS DSL 不支持 `sm_120a`。
+- 采用 `external/cutlass/examples/python/CuTeDSL/ampere/hstu_attention.py` 的 warp-level MMA HSTU 结构作为基础；SM120 BF16 C++ 路径同样使用 SM80 `mma.sync` atom，所以这条路线硬件模型一致。SM120 专用代码中的类/API 命名使用 `Sm120CuteDsl`，不再把 Ampere 写进 API 名称。
+- 给 SM120 CuTe DSL kernel 增加 compile-time `has_rab` 分支，no-RAB 时跳过 RAB 工作；RAB/DRAB forward bias 改为 GEMM1 后按 accumulator 坐标从 global RAB tensor 直接加到 `acc_S`，不再分配 RAB SMEM tile，因此 D256+RAB/DRAB 可以保留 `{kBlockM=64,kBlockN=64}`。
+- 当前 DSL prototype 默认使用 256 threads / 8 warps，对齐 SM120 C++ BF16 D128 no-RAB 的 `{kBlockM=128,kBlockN=128,kNWarps=8}`；默认启用 fast sigmoid，并把 `1 / seqlen_q` output scaling 放入 DSL kernel epilogue，避免 wrapper 额外发 PyTorch `mul_` kernel。
+- 新增 `hstu_blackwell_sm120_cutedsl.hstu_varlen_fwd_120_bf16_cutedsl` wrapper：dense full-batch 直接 view 成 `[B,S,H,D]`；compact varlen 先按 Ampere 语义 pad 到 dense max-seqlen，target tail 放到 dense 末尾，RAB/func 同步重映射，kernel 返回后再 gather 回 compact 输出。当前 wrapper 支持 local、context、target、context+target、arbitrary mask，并按 headDim/bias 选择 tile policy。paged KV 通过 wrapper-side materialization 支持：按 `kv_cache/page_offsets/page_ids/last_page_lens` 还原 history K/V，并把 target tail 从 contiguous K/V 放到 dense 末尾。
+- 新增 `bench_hstu_attn_sm120_bf16_cutedsl.py`：专门对比 current BF16 与 CuTe DSL BF16，可通过 `--masks`、`--biases`、`--headdims` 覆盖当前 DSL 支持面，输出 latency、TFLOPS、DSL/current ratio 和 correctness 误差。
+
+功能补齐验收：
+
+- correctness：`1test_results/phase32_cutedsl_bf16_ampere_fwd_matrix.log` 覆盖 Ampere forward 全配置面：D64/D128 × full、causal、local、context、target、context_target、arbitrary × none/RAB/DRAB × full_batch true/false × alpha 1.0/0.1，日志结尾 `PASS`。`1test_results/phase32_cutedsl_bf16_d32_d256arb_matrix.log` 覆盖 SM120 DSL 额外 D32 全 mask/bias 和早期 D256 no-RAB。`1test_results/phase32_cutedsl_bf16_paged_d256_rab.log` 覆盖 D256 × full/causal/local/context/target/arbitrary × RAB/DRAB，并验证 D128 full paged、HSTUPagedKVTest-style D128 target paged、D256 target paged+DRAB 对照。
+- benchmark：锁频运行专用 benchmark，记录到 `2benchmark_results/`，给出 DSL/current TFLOPS ratio；CuTe DSL Python wrapper 的 CUDA-event 数字只代表 wrapper-call latency，GPU kernel-only 结论必须以 nsys/ncu kernel summary 为准。
+- 结论：明确 CuTe DSL prototype 的性能是否有继续优化价值；若低于当前 C++ BF16，下一步优先看是否是 DSL wrapper overhead、epilogue scale 额外 torch kernel、tile scheduler 或 cp.async/mainloop 差异。
+
+当前实现与验证：
+
+- 已新增 `hstu_blackwell_sm120_cutedsl.hstu_varlen_fwd_120_bf16_cutedsl`，默认 dispatch 不变。
+- 已新增专用 benchmark：`fbgemm_gpu/experimental/hstu/benchmark/bench_hstu_attn_sm120_bf16_cutedsl.py`；RAB smoke 日志 `1test_results/phase32_cutedsl_bf16_benchmark_rab_smoke.log` 通过。
+- 功能补齐验证：`1test_results/phase32_cutedsl_bf16_ampere_fwd_matrix.log` 结尾为 `PASS`。当前支持面为 D32/D64/D128/D256 全 mask/bias、dense/compact varlen、alpha 1.0/0.1；paged KV 通过 wrapper-side dense materialization 覆盖 full、delta-q target 和 target+RAB smoke。
+- D256+RAB/DRAB 已保留：旧方案失败的原因是 RAB 使用 SMEM tile；当前改为 direct global RAB add 后不再额外占用 RAB SMEM。定向日志 `1test_results/phase32_cutedsl_bf16_paged_d256_rab.log` 中 D256 全 mask × RAB/DRAB cosine 均约 `0.999996`，paged 对照 `max=0`。
+- 默认 op 回归：`1test_results/phase32_bf16_cutedsl_hstu_test.log`，结果 `3 passed, 1 skipped`。
+- 早期锁频 CUDA-event smoke 日志：`2benchmark_results/phase32_gpu2407MHz_bf16_cutedsl_vs_current_smoke_final.log`，geomean DSL/current TFLOPS ratio 为 `0.082`；定向日志 `2benchmark_results/phase32_gpu2407MHz_bf16_cutedsl_vs_current_seq1024_final.log` 为 `0.115`。该口径后来确认包含 DSL Python wrapper 开销，不能作为 GPU kernel-only 结论。
+- 去掉 wrapper D2H 校验后的 CUDA-event 日志：`2benchmark_results/phase32_gpu2407MHz_bf16_cutedsl_after_remove_cpu_sync.log`，geomean ratio `0.127`；启用 8 warps、fast_silu、in-kernel scaling 后 `2benchmark_results/phase32_gpu2407MHz_bf16_cutedsl_fast_silu_scale_in_kernel.log`，geomean ratio `0.148`。这些仍是 wrapper-call latency，仍被 descriptor/from_dlpack/launch 开销压低。
+- nsys GPU kernel-only 结论：`3profile_results/phase32_cutedsl_fast_silu_once_nsys.nsys-rep` / `.sqlite` 中，`bs=1,seq=1024,H=4,D=128,full` DSL kernel avg `40.0us`，当前 C++ BF16 kernel avg `35.1us`，DSL 达到约 `87.7%`。这才是当前 prototype 与 C++ BF16 的合理 kernel-only 对比。
+- wrapper profile/优化：`3profile_results/phase32_bf16_cutedsl_wrapper_cprofile_before.log` 显示 `Tensor.dim_order()` 及其 memory-format 检查链是最大 per-call Python 热点；因 wrapper 已将 Q/K/V/O/RAB canonicalize 为 contiguous dense tensor，已改为直接传 contiguous stride order 常量。cProfile wall 从 `0.428ms/call` 降到 `0.195ms/call`；锁频默认 CUDA-event benchmark 从 `2benchmark_results/6483184e_gpu2407MHz_phase32_bf16_cutedsl_vs_cpp_default.log` 的 geomean `0.129` 提到 `2benchmark_results/6483184e_gpu2407MHz_phase32_bf16_cutedsl_dimorder_default.log` 的 `0.203`。代表 case `bs=4,seq=1024,H=16,D=128,full` 从 DSL/current `0.582` 提到 `0.874`。
+- 当前结论：prototype correctness 没问题，GPU kernel 本体性能有继续优化价值；但默认 72-case wrapper-call geomean `0.203` 仍然很差，不能作为生产端到端替代方案。`0.203` 主要由 Python/CuTe DSL wrapper 固定开销拉低，小 case 更严重；按规模拆分后 `seq>=1024,H>=16,D=128` geomean 约 `0.489`，而代表大 case kernel-only 约 `0.87`。后续需要分两条线：kernel 本体用 `nsys/ncu` 分析剩余约 `10%~15%` 差距；端到端若要可用，需要把 DSL launch 从 Python wrapper 下沉到 C++/extension 层或等价低开销路径。
 
 ## Phase 31：D64 paged full spill 修复与全量性能分析
 

@@ -399,6 +399,10 @@ if "10.0" in arch_list:
     packages.append("hstu.hstu_blackwell")
     package_dir["hstu.hstu_blackwell"] = "src/hstu_blackwell"
 
+if "12.0" in arch_list:
+    packages.append("hstu.hstu_blackwell_sm120_cutedsl")
+    package_dir["hstu.hstu_blackwell_sm120_cutedsl"] = "src/hstu_blackwell_sm120_cutedsl"
+
 setup(
     name=PACKAGE_NAME,
     version="0.1.0" + '+cu' + str(bare_metal_version),

@@ -1868,3 +1868,31 @@ Phase 31 用 FP8 non-paged D128 pure full/causal TFLOPS 作为同 shape baseline
 - 原因是单 K warp 串行搬运 16KB RAB tile，延迟 K-stage release，破坏主 K/V pipeline。后续不应重复此路线。
 
 后续如果继续优化 RAB/DRAB，应优先考虑不会阻塞 K/V stage 的独立 RAB TMA/异步搬运或更 cache-friendly 的 RAB layout/packing。
+
+---
+
+## 20. Phase 32：SM120 BF16 CuTe DSL 结论
+
+SM100 CuTe DSL forward 不能直接作为 SM120 BF16 实现：
+
+- `HSTUAttentionForwardSm100` 使用 `tcgen05` BF16 MMA/TMEM。
+- 当前 `nvidia-cutlass-dsl==4.5.0` 的 `tcgen05.MmaF16BF16Op` 只接受 `sm_100a/sm_101a/sm_103a`，在 `sm_120a` JIT 会报 arch 不支持。
+- 强制 `CUTE_DSL_ARCH=sm_100a` 可以编译，但 SM120 运行时报 `cudaErrorNoKernelImageForDevice`。
+
+可运行的 SM120 BF16 CuTe DSL prototype 应使用 Ampere-style warp-level `mma.sync`：
+
+- 当前 SM120 C++ BF16 kernel 本身也是 SM80 `mma.sync` atom 在 SM120 上运行。
+- Phase 32 prototype 基于 `external/cutlass/examples/python/CuTeDSL/ampere/hstu_attention.py` 的 warp-level MMA 结构，但 SM120 专用代码中的类/API 命名使用 `Sm120CuteDsl`；kernel 增加 compile-time `has_rab` 分支，no-RAB 性能路径不再被 RAB load 污染，RAB/DRAB forward bias 路径改为 GEMM1 后按 accumulator 坐标从 global RAB tensor 直接加到 `acc_S`。
+- 当前 wrapper 覆盖 D32/D64/D128/D256 的 full、causal、local、context+causal、target+causal、context+target+causal、arbitrary × none/RAB/DRAB，支持 dense full-batch 和 compact varlen，并支持 `alpha=1.0/0.1`。BF16 paged KV 通过 wrapper-side materialization 支持：先按 `kv_cache/page_offsets/page_ids/last_page_lens` 还原 dense K/V；当 `max_seqlen_k > max_seqlen_q` 时按 delta-q 语义把 Q 放到 `actual_k_len - actual_q_len` 偏移，再复用同一个 DSL kernel。不改变默认 dispatch。
+- 功能补齐 correctness 日志：`1test_results/phase32_cutedsl_bf16_ampere_fwd_matrix.log` 覆盖 Ampere forward 全配置面，结尾 `PASS`；`1test_results/phase32_cutedsl_bf16_d32_d256arb_matrix.log` 覆盖 SM120 DSL 额外 D32 和早期 D256 no-RAB；`1test_results/phase32_cutedsl_bf16_paged_d256_rab.log` 覆盖 D256 全 mask × RAB/DRAB，并验证 D128 full paged、HSTUPagedKVTest-style D128 target paged、D256 target paged+DRAB 对照。专用 benchmark 的 RAB 参数 smoke 日志：`1test_results/phase32_cutedsl_bf16_benchmark_rab_smoke.log`。
+- D256+RAB/DRAB 旧方案失败的原因是 RAB 使用 SMEM tile 导致 SMEM/ldmatrix copy 问题；改为 direct global RAB add 后，`{kBlockM=64,kBlockN=64}` 可运行。该路径是功能补齐，不是性能优化结论。
+- 当前 CUTLASS DSL 4.3 wheel 的 `cute.compile` package-walk 会导入 `cutlass.cute.experimental`，而该模块会直接 raise；SM120 DSL wrapper 内注册空 stub，因为本 prototype 不使用 experimental DSL。否则普通运行会在 JIT 前失败。
+- SM120 BF16 D128 no-RAB 要对齐当前 C++ 主配置：256 threads / 8 warps、fast sigmoid、output scaling 在 kernel epilogue 内完成。继续沿用 Ampere 示例默认的 128 threads/4 warps 和 wrapper 侧 `out.mul_` 会制造额外差距。
+
+性能结论：
+
+- correctness 对齐当前 C++ BF16：full/causal cosine 约 1.0；启用 fast sigmoid 和 in-kernel scaling 后，定向 smoke 中输出与当前 C++ BF16 逐元素一致。
+- 早期锁频 CUDA-event benchmark `2benchmark_results/phase32_gpu2407MHz_bf16_cutedsl_vs_current_smoke_final.log` / `phase32_gpu2407MHz_bf16_cutedsl_vs_current_seq1024_final.log` 显示的 `0.082~0.115` ratio 不是 GPU kernel-only 性能。根因是 CUDA event 在 Python wrapper 调用前记录，CuTe DSL wrapper 的 `from_dlpack` descriptor 构造、runtime lookup/launch 等 CPU 开销发生在 start event 之后、kernel enqueue 之前，会被 event elapsed time 计入。去掉 D2H 校验后 ratio 仅到 `0.127`，说明 D2H 不是唯一污染源。
+- nsys GPU kernel summary 才是当前 CuTe DSL prototype 的可信 kernel-only 口径：`3profile_results/phase32_cutedsl_fast_silu_once_nsys.nsys-rep` 中，`bs=1,seq=1024,H=4,D=128,full` DSL kernel avg `40.0us`，当前 C++ BF16 avg `35.1us`，DSL/C++ 约 `87.7%`。
+- wrapper-call cProfile 显示 `Tensor.dim_order()` 触发的 memory-format 检查链是最大 per-call Python 热点。因为 SM120 DSL wrapper 已把 Q/K/V/O/RAB 统一成 contiguous dense tensor，descriptor 创建时可直接使用 contiguous stride order 常量，避免每次调用 `t.dim_order()`。优化后 `bs=4,seq=1024,H=16,D=128,full` cProfile wall 从 `0.428ms/call` 降到 `0.195ms/call`；锁频默认 CUDA-event benchmark geomean DSL/current 从 `0.129` 提到 `0.203`，该代表 case 从 `0.582` 提到 `0.874`。日志：`3profile_results/phase32_bf16_cutedsl_wrapper_cprofile_before.log`、`3profile_results/phase32_bf16_cutedsl_wrapper_cprofile_after_dimorder.log`、`2benchmark_results/6483184e_gpu2407MHz_phase32_bf16_cutedsl_dimorder_default.log`。
+- 当前 CuTe DSL prototype 的 GPU kernel 本体已有继续优化价值，但 Python wrapper-call 端到端性能仍不可接受。默认 72-case geomean `0.203` 说明固定 launch/descriptor 开销仍主导小 case；拆分后 `seq<=512` geomean 约 `0.173`，`seq>=1024,H>=16,D=128` 约 `0.489`，与代表大 case kernel-only 约 `0.87` 明显不同。后续性能结论必须分开写：kernel-only 继续看 Q-in-reg/Share-Q-K-smem、mainloop cp.async overlap、epilogue store 路径与 C++ 手写实现的差异；生产端到端若要可用，需要低开销 C++/extension launch，而不是当前 Python DSL wrapper。
