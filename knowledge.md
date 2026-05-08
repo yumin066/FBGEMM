@@ -1920,3 +1920,18 @@ FP8 WS：
 - 第一轮可保留优化是 selective mask-before-RAB：只在收益明确的 masked specializations 中先执行 `apply_mask_bs`，再让 `add_rab_bs_skip_masked` 跳过已经为 `-inf` 的 accumulator 元素。全量复制 mask predicate 到 RAB load 内的版本 correctness 可过但 context/target/arbitrary 回退，不保留。
 - selective 版本锁频 D256 `bs=1,seq=2048,h=4` 相对同机原始基线：FP8 全部 case geomean `+1.95%`，FP8 RAB/DRAB geomean `+2.87%`；paged 全部 case geomean `+3.43%`，paged RAB/DRAB geomean `+5.24%`。local+RAB/DRAB 是主要收益来源：non-paged 约 `+12%`，paged 约 `+26%`。full/context 等少数 case 有 `<1%` 小波动，不能当成确定 regression。
 - 验证日志：`1test_results/phase33_fp8_ws_rab_selective_maskbefore_hstu_test.log`、`1test_results/phase33_fp8_ws_rab_selective_maskbefore_sweep.log`、`1test_results/phase33_fp8_ws_rab_selective_maskbefore_examples.log`；benchmark `2benchmark_results/600_gpu2407MHz_phase33_fp8_ws_rab_selective_maskbefore_d256_s2048_h4_kernel.log`；D256 resource `1test_results/phase33_fp8_ws_rab_selective_resource_d256.log`。D256 WS 仍为 `REG:168 LOCAL:0`，stack 分布未比 Phase 27/28 记录恶化。
+
+## 22. Phase 33：FP8 WS RAB TMA/SMEM 结论
+
+当前可保留实现：
+
+- RAB tile 由 K load warp 发起 TMA，搬到独立 RAB SMEM buffer；math warp 从 SMEM 加到 `acc_s`。这比原先 math warp direct global scalar load 明显更好，且不引入 register spill。
+- 当前保留单 stage RAB SMEM。double-buffer RAB 需要牺牲 D128 independent-O buffer，focus benchmark 更慢；direct pointer SMEM indexing 与 fused RAB+alpha+silu 也更慢，均不保留。
+- correctness：清理单-stage RAB 残留后，`1test_results/619_hstu_test_rab_smem_cleanup.log` 为 `3 passed, 1 skipped`，`1test_results/620_sweep_rab_smem_cleanup.log` 通过，`1test_results/621_hstu8_examples_rab_smem_cleanup.log` 为 `284/284 passed`。SASS `4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full_rab_cleanup.sass` 为 `REG:168 STACK:0 LOCAL:0`，无 `LDL/STL`。
+- benchmark：`2benchmark_results/607_6098fb7a_gpu2407MHz_rab_smem_cleanup_full_kernel.log`。代表 D128 `bs=8,seq=2048,h=16` full+RAB 从旧 direct-global 约 `120.7 TFLOPS` 提升到 `320.6 TFLOPS`，但 no-RAB full 为 `656.6 TFLOPS`，RAB 仍只有约 `48.8%`。D256 full+RAB 为 `444.7 TFLOPS`，no-RAB full 为 `566.5 TFLOPS`，约 `78.5%`。
+
+关键判断：
+
+- D128 full no-RAB vs full+RAB NCU：duration `504.7us -> 914.6us`，DRAM throughput `15.08% -> 84.85%`，memory throughput `240.6GB/s -> 1354.2GB/s`，L2 hit `85.87% -> 45.48%`，local spill 为 0。
+- 对 `bs=8,seq=2048,h=16,d=128`，dense per-head BF16 RAB 读量约 `1.07GB`。要让 full+RAB 达到 no-RAB latency 的 `95%`，即使把整个目标时间都给 RAB 读，也需要约 `2.4TB/s` 有效带宽；实际还要同时承担 no-RAB 的 Q/K/V/O 工作。在当前 dense BF16 per-head RAB 表示下，这不是通过同步点或 warp 分工能解决的问题。
+- 若继续追 RAB 接近 no-RAB，必须减少 RAB 字节量或提高复用：例如 `h_rab==1` 跨 head 复用、FP8/压缩 RAB、低秩/相对位置表在线生成，或在 causal/local/target 等 masked paths 中跳过 masked-out RAB tile。full dense per-head RAB 没有 mask 可跳，95% 目标不现实。

@@ -81,7 +81,7 @@ FP8 paged RAB/DRAB Phase 26/28 当前状态：
 
 - paged+RAB/DRAB 走 FP8 WS TMA kernel；Phase 28 后 D=128/D=256 full、pure causal、context+causal、target+causal、local、arbitrary + paged KV + RAB/DRAB 都已支持。
 - hdim128 RAB 必须使用 `kBlockN=64`，不能沿用旧 non-paged hdim128 RAB fallback 的 `kBlockN=128`；Python block-scale wrapper 对 `rab is not None && dim == 128` 返回 BN64，paged KV 下也继续以 `kv_cache.shape[2]` 作为 BN。
-- RAB/DRAB bias 在 GEMM1 后、mask/activation 前由 math warp 直接从 global BF16 RAB tensor 加到 `acc_s`，不额外占用 SMEM。
+- RAB/DRAB bias 在 GEMM1 后、mask/activation 前加到 `acc_s`。Phase 33 后 aligned RAB tile 由 K load warp 发起 TMA 到单-stage RAB SMEM，再由 math warp 从 SMEM 加；不适合 TMA 的 paged target tail 等 unaligned case 仍 fallback 到 direct-global RAB add。
 - Scheduler 口径：paged full RAB/DRAB 走 full persistent；D=128 paged pure causal/target+causal RAB/DRAB 走 paired persistent；D=256 paged RAB/DRAB 以及 context/local/arbitrary 走 3D grid。
 - host guard 当前允许 no-target paged full/local/arbitrary/context window；带 `num_targets` 的 paged KV 仍要求 `window_size_left < 0 && window_size_right == 0`，即 target/local-window 组合仍不属于当前支持范围。
 - SASS：`I128_paged_causal_rab` 为 `REG:168 STACK:0 LOCAL:0`，无 `LDL/STL`；`I256_paged_causal_rab` 为 `REG:168 STACK:8 LOCAL:0`，有 1 个 `STL` 和 1 个 `LDL`。尝试将 hdim256 RAB-add loop 改为 `#pragma unroll 1` 会恶化到 `STACK:128`，不保留。
@@ -98,7 +98,7 @@ FP8 irregular seqlen Phase 29 当前状态：
 
 FP8 non-paged RAB/DRAB Phase 27 当前状态：
 
-- D=128/D=256 non-paged RAB/DRAB 已切到 FP8 WS TMA，覆盖 full、pure causal、context+causal、target+causal、local、arbitrary，使用 `{kBlockM=128,kBlockN=64,kNWarps=8}` 和 direct global RAB add。
+- D=128/D=256 non-paged RAB/DRAB 已切到 FP8 WS TMA，覆盖 full、pure causal、context+causal、target+causal、local、arbitrary，使用 `{kBlockM=128,kBlockN=64,kNWarps=8}`。Phase 33 后 aligned RAB 主路径使用 K-warp RAB TMA/SMEM；direct-global RAB add 只作为 unaligned fallback。
 - D=128 non-paged RAB/DRAB 的 V block-scale BN 已从旧 fallback 的 128 改为 64；Python wrapper、C++ tile-size 和 WS specialization 必须保持一致。
 - Scheduler 口径：full RAB 对 D=128/D=256 使用 full persistent；pure causal RAB 只有 D=128 使用 paired persistent；D=256 pure causal RAB 和 context/target/local/arbitrary RAB 使用 3D grid。
 - D=256 arbitrary + non-paged RAB/DRAB 也切到 WS；同频 kernel-only 对照中 WS 与 fallback 基本持平，因此这是路径统一改动，不是性能优化改动。

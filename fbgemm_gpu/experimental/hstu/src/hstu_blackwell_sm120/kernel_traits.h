@@ -467,6 +467,20 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
   // kNMathThreads: math-warp-only thread count used for per-warp layout arithmetic.
   static constexpr int kNMathThreads = kNMathWarps * cutlass::NumThreadsPerWarp;  // 256
 
+  // Double-buffer KV SMEM layout.
+  // Each K or Vt tile is kBlockN * kHeadDim FP8 bytes (1 byte each).
+  static constexpr int kSmemKVBytes =
+      Base::kBlockN * Base::kHeadDim * (int)sizeof(typename Base::Element);
+  // hdim256 arbitrary needs ValidBlockIds SMEM; two KV stages would exceed SM120's
+  // 101376B opt-in limit.  RAB-in-SMEM also needs a 128x64 BF16 tile; for D256
+  // RAB and D128 arbitrary+RAB we release one KV stage to stay under the limit.
+  static constexpr bool kUseSingleKVStage =
+      (Is_arbitrary_ && kHeadDim_ > 128) ||
+      (Has_rab_ && (kHeadDim_ > 128 || (Is_arbitrary_ && kHeadDim_ == 128)));
+  static constexpr int kSmemWsKVStages = kUseSingleKVStage ? 1 : 2;
+  static constexpr int kSmemWsRabStages = Has_rab_ ? 1 : 0;
+  static constexpr int kSmemWsRabLayoutStages = 1;
+
   // Producer/consumer mbarriers: ready barriers model cnt=1, empty barriers model cnt=0.
   //   k_ready[0/1]: K/SFK TMA completion per stage
   //   v_ready[0/1]: V/SFV TMA completion per stage
@@ -476,17 +490,8 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
   //   q_empty: Q/SFA consumed into registers
   //   o_ready[0]: O SMEM ready for TMA store
   //   o_empty[0]: independent O SMEM buffer is free for math epilogue writes
-  // Each barrier is 8 bytes; total = 112 bytes.  Placed at the last 112 bytes of kSmemSize.
-  static constexpr int kSmemMbarSize = 112;
-
-  // Double-buffer KV SMEM layout.
-  // Each K or Vt tile is kBlockN * kHeadDim FP8 bytes (1 byte each).
-  static constexpr int kSmemKVBytes =
-      Base::kBlockN * Base::kHeadDim * (int)sizeof(typename Base::Element);
-  // hdim256 arbitrary needs ValidBlockIds SMEM; two KV stages would exceed SM120's
-  // 101376B opt-in limit.  Keep arbitrary hdim256 correct with one KV stage.
-  static constexpr bool kUseSingleKVStage = Is_arbitrary_ && kHeadDim_ > 128;
-  static constexpr int kSmemWsKVStages = kUseSingleKVStage ? 1 : 2;
+  // Each barrier is 8 bytes.  RAB adds one ready/empty pair.
+  static constexpr int kSmemMbarSize = Has_rab_ ? 128 : 112;
   // kSmemWsKVStages × (K + Vt).
   static constexpr int kSmemWsKVTotalBytes = 2 * kSmemWsKVStages * kSmemKVBytes;
 
@@ -495,7 +500,7 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
   //   [kSmemWsKVTotalBytes .. +ValidBl)   : ValidBlockIds (Is_arbitrary only)
   //   [.. + func region)                  : func arrays (Is_arbitrary only)
   //   [padded to 8B)                      : SFA(512B) + SFB(512B) = 1024B
-  //   [last kSmemMbarSize bytes)          : 14 mbarriers × 8B
+  //   [last kSmemMbarSize bytes)          : 14 or 16 mbarriers × 8B
   static constexpr int kSmemWsValidBlockIdsOffset = kSmemWsKVTotalBytes;
   static constexpr int kSmemWsFuncOffset = kSmemWsValidBlockIdsOffset +
       (Is_arbitrary_ ? (int)(size(typename Base::SmemLayoutValidBlockIds{}) * sizeof(int)) : 0);
@@ -518,19 +523,29 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
           ? kBlockM_ * kHeadDim_ * (int)sizeof(out_type)
           : 0;
   static constexpr int kSmemWsAfterO = kSmemWsOOffset + kSmemWsOBytes;
+  static constexpr int kSmemWsRabOffset = kSmemWsAfterO;
+  static constexpr int kSmemWsRabBytes =
+      Has_rab_ ? kBlockM_ * kBlockN_ * (int)sizeof(cutlass::bfloat16_t) : 0;
+  static constexpr int kSmemWsAfterRab = kSmemWsRabOffset + kSmemWsRabBytes;
   // WS data region padded to 128B; SF (TMA targets) starts at this offset from smem_.
-  static constexpr int kSmemWsDataSizePadded = ((kSmemWsAfterO + 127) / 128) * 128;
+  static constexpr int kSmemWsDataSizePadded = ((kSmemWsAfterRab + 127) / 128) * 128;
   // WS SF SMEM: SFA(512B) + SFP unit(512B) + SFB[0]+[1] + SFV[0]+[1] (each 512B @ 128) = 3072B.
   // SFP is separate so real SFA SMEM is never clobbered — enables per-tile s2r of SFA for GEMM1.
   static constexpr int kSmemWsSFSize =
       (kBlockM_ * 2 + kBlockN_ * 4) * (int)sizeof(int32_t);
   static constexpr int kSmemSize = kSmemWsDataSizePadded + kSmemWsSFSize + kSmemMbarSize;
 
+  // RAB is loaded as a dense row-major BF16 [M,N] tile.  Math warps read it
+  // scalar from SMEM after GEMM1; no QMMA/LDSM layout is required.
+  using SmemLayoutRab_TMA = Layout<
+      Shape<Int<kBlockM_>, Int<kBlockN_>, _1>,
+      Stride<Int<kBlockN_>, _1, Int<kBlockM_ * kBlockN_>>>;
+
   // Invariant checks
   static_assert(kNMathWarps * 16 == Base::kBlockM,
       "kNMathWarps * 16 must equal kBlockM (8 warps × 16 rows = 128)");
   static_assert(kNThreads == (kNMathWarps + kNLoadWarps) * 32,
       "kNThreads == (kNMathWarps + kNLoadWarps) * 32");  // 384
-  static_assert(kSmemMbarSize == 112,
-      "kSmemMbarSize must be 112 (14 producer/consumer mbarriers)");
+  static_assert(kSmemMbarSize == (Has_rab_ ? 128 : 112),
+      "kSmemMbarSize must be 112 without RAB or 128 with RAB");
 };

@@ -718,7 +718,8 @@ __global__ void hstu_fwd_kernel_sm120(Params params) {
 // TMA_Q_t / TMA_K_t / TMA_Vt_t are TMA copy atoms for FP8 data.
 // TMA_SFA_t / TMA_SFB_t are TMA copy atoms for int32 SF data.
 template <typename TMA_Q_t, typename TMA_K_t, typename TMA_Vt_t,
-          typename TMA_SFA_t, typename TMA_SFB_t, typename TMA_SFV_t, typename TMA_O_t>
+          typename TMA_SFA_t, typename TMA_SFB_t, typename TMA_SFV_t,
+          typename TMA_O_t, typename TMA_Rab_t>
 struct Hstu_fwd_params_fp8_ws_tma : public Hstu_fwd_params {
     TMA_Q_t   tma_q;   // TMA descriptor for Q:        [total_q, d, h]
     TMA_K_t   tma_k;   // TMA descriptor for K:        [total_k, d, h_k]
@@ -727,14 +728,17 @@ struct Hstu_fwd_params_fp8_ws_tma : public Hstu_fwd_params {
     TMA_SFB_t tma_sfb; // TMA descriptor for K scale:  [kv_block_descale_head_stride, 1, h_k]
     TMA_SFV_t tma_sfv; // TMA descriptor for V scale:  [v_block_descale_head_stride, 1, h_k]
     TMA_O_t   tma_o;   // TMA descriptor for O store:  [total_q, d, h] (same dim ordering as tma_q)
+    TMA_Rab_t tma_rab; // TMA descriptor for RAB:      [seqlen_k_rounded, seqlen_k_rounded, h_rab, b]
 };
 
 template <typename TMA_Q_t, typename TMA_K_t, typename TMA_Vt_t,
-          typename TMA_SFA_t, typename TMA_SFB_t, typename TMA_SFV_t, typename TMA_O_t,
+          typename TMA_SFA_t, typename TMA_SFB_t, typename TMA_SFV_t,
+          typename TMA_O_t, typename TMA_Rab_t,
           typename TMA_KPage_t, typename TMA_VtPage_t>
 struct Hstu_fwd_params_fp8_ws_tma_paged
     : public Hstu_fwd_params_fp8_ws_tma<
-          TMA_Q_t, TMA_K_t, TMA_Vt_t, TMA_SFA_t, TMA_SFB_t, TMA_SFV_t, TMA_O_t> {
+          TMA_Q_t, TMA_K_t, TMA_Vt_t, TMA_SFA_t, TMA_SFB_t, TMA_SFV_t,
+          TMA_O_t, TMA_Rab_t> {
     TMA_KPage_t  tma_k_page;   // TMA descriptor for paged K: [page_size, d, h_k, total_pages]
     TMA_VtPage_t tma_vt_page;  // TMA descriptor for paged V: [page_size, d, h_k, total_pages]
 };
@@ -771,9 +775,11 @@ void run_hstu_fwd_sm120_fp8_ws_tma_impl(Hstu_fwd_params& params, cudaStream_t st
       Paged_KV, Is_Q_in_regs, Share_Q_K_smem, cutlass::half_t>;
 
   using FP8Elem = typename Kernel_traits::Element;
+  using RabElement = cutlass::bfloat16_t;
   using SmemLayoutQ_TMA  = typename Kernel_traits::SmemLayoutQ_TMA;
   using SmemLayoutK_TMA  = typename Kernel_traits::SmemLayoutK_TMA;
   using SmemLayoutVt_TMA = typename Kernel_traits::SmemLayoutVt_TMA;
+  using SmemLayoutRab_TMA = typename Kernel_traits::SmemLayoutRab_TMA;
 
   // Q TMA descriptor: Q described as [total_q, d, h] with strides [q_row_stride, 1, q_head_stride].
   auto tensor_Q_full = cute::make_tensor(
@@ -896,6 +902,32 @@ void run_hstu_fwd_sm120_fp8_ws_tma_impl(Hstu_fwd_params& params, cudaStream_t st
       cute::make_shape(cute::Int<kBlockM>{}, cute::Int<kHeadDim>{}),
       cute::_1{});
 
+  // RAB TMA descriptor.  Has_rab=false still builds a dummy descriptor with
+  // valid box dimensions; the kernel never issues it in that specialization.
+  RabElement* rab_base = Has_rab
+      ? static_cast<RabElement*>(params.rab_ptr)
+      : reinterpret_cast<RabElement*>(params.q_ptr);
+  const int64_t rab_dim0 = Has_rab ? (int64_t)params.seqlen_k_rounded : (int64_t)kBlockM;
+  const int64_t rab_dim1 = Has_rab ? (int64_t)params.seqlen_k_rounded : (int64_t)kBlockN;
+  const int64_t rab_heads = Has_rab ? (int64_t)params.h_rab : 1;
+  const int64_t rab_batch = Has_rab ? (int64_t)params.b : 1;
+  const int64_t rab_stride_m = Has_rab ? (int64_t)params.rab_seqlen_k_stride : (int64_t)kBlockN;
+  const int64_t rab_stride_h = Has_rab ? (int64_t)params.rab_seqlen_q_stride
+                                       : (int64_t)kBlockM * kBlockN;
+  const int64_t rab_stride_b = Has_rab ? (int64_t)params.rab_seqlen_qk_stride
+                                       : (int64_t)kBlockM * kBlockN;
+  auto tensor_Rab_full = cute::make_tensor(
+      cute::make_gmem_ptr(rab_base),
+      cute::make_layout(
+          cute::make_shape(rab_dim0, rab_dim1, rab_heads, rab_batch),
+          cute::make_stride(rab_stride_m, cute::_1{}, rab_stride_h, rab_stride_b)));
+  auto tma_rab = cute::make_tma_copy(
+      cute::SM90_TMA_LOAD{},
+      tensor_Rab_full,
+      SmemLayoutRab_TMA{}(_, _, _0{}),
+      cute::make_shape(cute::Int<kBlockM>{}, cute::Int<kBlockN>{}),
+      cute::_1{});
+
   using TMA_Q_t   = decltype(tma_q);
   using TMA_K_t   = decltype(tma_k);
   using TMA_Vt_t  = decltype(tma_vt);
@@ -903,6 +935,7 @@ void run_hstu_fwd_sm120_fp8_ws_tma_impl(Hstu_fwd_params& params, cudaStream_t st
   using TMA_SFB_t = decltype(tma_sfb);
   using TMA_SFV_t = decltype(tma_sfv);
   using TMA_O_t   = decltype(tma_o);
+  using TMA_Rab_t = decltype(tma_rab);
 
   size_t smem_size = Kernel_traits::kSmemSize;
   const int num_m_block = (params.seqlen_q + kBlockM - 1) / kBlockM;
@@ -973,7 +1006,7 @@ void run_hstu_fwd_sm120_fp8_ws_tma_impl(Hstu_fwd_params& params, cudaStream_t st
     using TMA_VtPage_t = decltype(tma_vt_page);
     Hstu_fwd_params_fp8_ws_tma_paged<
         TMA_Q_t, TMA_K_t, TMA_Vt_t, TMA_SFA_t, TMA_SFB_t, TMA_SFV_t, TMA_O_t,
-        TMA_KPage_t, TMA_VtPage_t> tma_params;
+        TMA_Rab_t, TMA_KPage_t, TMA_VtPage_t> tma_params;
     static_cast<Hstu_fwd_params&>(tma_params) = params;
     tma_params.tma_q   = tma_q;
     tma_params.tma_k   = tma_k;
@@ -982,12 +1015,14 @@ void run_hstu_fwd_sm120_fp8_ws_tma_impl(Hstu_fwd_params& params, cudaStream_t st
     tma_params.tma_sfb = tma_sfb;
     tma_params.tma_sfv = tma_sfv;
     tma_params.tma_o   = tma_o;
+    tma_params.tma_rab = tma_rab;
     tma_params.tma_k_page = tma_k_page;
     tma_params.tma_vt_page = tma_vt_page;
     launch_tma_kernel(tma_params);
   } else {
     Hstu_fwd_params_fp8_ws_tma<
-        TMA_Q_t, TMA_K_t, TMA_Vt_t, TMA_SFA_t, TMA_SFB_t, TMA_SFV_t, TMA_O_t> tma_params;
+        TMA_Q_t, TMA_K_t, TMA_Vt_t, TMA_SFA_t, TMA_SFB_t, TMA_SFV_t, TMA_O_t,
+        TMA_Rab_t> tma_params;
     static_cast<Hstu_fwd_params&>(tma_params) = params;
     tma_params.tma_q   = tma_q;
     tma_params.tma_k   = tma_k;
@@ -996,6 +1031,7 @@ void run_hstu_fwd_sm120_fp8_ws_tma_impl(Hstu_fwd_params& params, cudaStream_t st
     tma_params.tma_sfb = tma_sfb;
     tma_params.tma_sfv = tma_sfv;
     tma_params.tma_o   = tma_o;
+    tma_params.tma_rab = tma_rab;
     launch_tma_kernel(tma_params);
   }
 }
