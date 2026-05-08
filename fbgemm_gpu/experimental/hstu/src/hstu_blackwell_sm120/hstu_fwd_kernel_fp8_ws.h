@@ -1486,6 +1486,50 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         }
       };
 
+      auto add_rab_bs_skip_masked = [&](auto& tSrS, int nb) {
+        if constexpr (Has_rab) {
+          static constexpr int Row = 0, Col = 1;
+          Tensor cS   = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
+          Tensor tScS = thr_mma_g1.partition_C(cS);
+          const int bidh_rab = (params.h_rab > 1) ? bidh : 0;
+          const size_t rab_offset = bidb * params.rab_seqlen_qk_stride
+              + bidh_rab * params.rab_seqlen_q_stride
+              + params.seqlen_k_rounded * actual_seqlen_offset;
+          const RabElement* rab_ptr =
+              reinterpret_cast<const RabElement*>(params.rab_ptr) + rab_offset;
+          const int base_col = nb * kBlockN;
+
+          CUTE_UNROLL
+          for (int flat = 0; flat < size(tSrS); ++flat) {
+            if (tSrS(flat) == -INFINITY) {
+              continue;
+            }
+            const auto coord = tScS(flat);
+            const int block_row = int(get<Row>(coord));
+            const int q_idx = m_block * kBlockM + block_row;
+            if (q_idx >= actual_seqlen_q) {
+              continue;
+            }
+            const int block_col = int(get<Col>(coord));
+            int col = block_col + base_col;
+            if constexpr (Paged_KV && Is_target) {
+              if (nb >= n_block_paged) {
+                col -= last_page_offset;
+              }
+            }
+            if constexpr (Paged_KV && Is_target) {
+              if (nb < n_block_paged && col >= actual_seqlen_h) {
+                continue;
+              }
+            }
+            if (0 <= col && col < actual_seqlen_k) {
+              tSrS(flat) += static_cast<float>(
+                  rab_ptr[q_idx * params.rab_seqlen_k_stride + col]);
+            }
+          }
+        }
+      };
+
       // SFP (unit scale for P) — separate buffer so real SFA SMEM stays valid for per-tile GEMM1 s2r.
       for (int i = tidx_math; i < kBlockM; i += kNMathThreads)
         smem_sfp_ptr[i] = 0x7f7f7f7f;
@@ -1802,8 +1846,16 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
             arrive_mbar(k_empty_addr);
           }
         }
-        add_rab_bs(acc_s, nb);
+        constexpr bool kUseRabSkipMasked =
+            (Is_causal && !Is_context && !Is_target && !Is_local && !Is_arbitrary) ||
+            Is_local || Is_arbitrary || (Is_context && !Paged_KV) || (Is_target && Paged_KV);
+        if constexpr (!(Has_rab && kUseRabSkipMasked)) {
+          add_rab_bs(acc_s, nb);
+        }
         if (params.debug_gemm1_only) {
+          if constexpr (Has_rab && kUseRabSkipMasked) {
+            add_rab_bs(acc_s, nb);
+          }
           for (int i = 0; i < size(acc_s); ++i) acc_o(i) += acc_s(i);
           {
             const int cur_parity = math_stage ? tma_parity1 : tma_parity0;
@@ -1826,19 +1878,37 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
           return n_valid_ref;
         }
 
-        // Masking (Opt C: compile-time specialized).
+        // Masking (Opt C: compile-time specialized).  For RAB, apply the mask
+        // first on masked tiles so add_rab_bs can skip -inf entries without
+        // recomputing the mask predicate on the math critical path.
         // kIsMasking=true  (Phase 1): always apply_mask_bs (causal diagonal or Is_arbitrary/Is_local).
         // kIsMasking=false (Phase 2): steady-state; skip diagonal masking; varlen-end check only.
+        bool mask_applied = false;
         if constexpr (Is_arbitrary || Is_local || kIsMasking) {
           apply_mask_bs(acc_s, nb);
+          mask_applied = true;
         } else if constexpr (kRuntimeMasking) {
           if (do_mask_runtime) {
             apply_mask_bs(acc_s, nb);
+            mask_applied = true;
           } else {
-            if ((nb + 1) * kBlockN > actual_seqlen_h) apply_mask_bs(acc_s, nb);
+            if ((nb + 1) * kBlockN > actual_seqlen_h) {
+              apply_mask_bs(acc_s, nb);
+              mask_applied = true;
+            }
           }
         } else {
-          if ((nb + 1) * kBlockN > actual_seqlen_h) apply_mask_bs(acc_s, nb);
+          if ((nb + 1) * kBlockN > actual_seqlen_h) {
+            apply_mask_bs(acc_s, nb);
+            mask_applied = true;
+          }
+        }
+        if constexpr (Has_rab && kUseRabSkipMasked) {
+          if (mask_applied) {
+            add_rab_bs_skip_masked(acc_s, nb);
+          } else {
+            add_rab_bs(acc_s, nb);
+          }
         }
         for (int i = 0; i < size(acc_s); ++i) acc_s(i) *= params.alpha;
         fast_silu(acc_s);

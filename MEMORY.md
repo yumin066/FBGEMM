@@ -60,3 +60,37 @@
 - `MEMORY.md`：项目背景摘要。
 - `HISTORY.md`：详细历史阶段记录。
 - `CLAUDE.md`、`PLAN.md`、`memory.md`：迁移来源，暂时保留不改。
+
+## 换机 handoff：Phase 33
+
+时间：2026-05-08。当前机器即将释放，本段记录下一台机器继续工作的入口。
+
+当前目标：
+
+- BF16 CuTe DSL：GPU kernel-only 性能至少达到 BF16 C++ 的 95%。当前可信 kernel-only 约 87-88%，wrapper-call geomean 约 0.203 另算。
+- FP8 WS：聚焦 `bs=1,seq=2048,h=4,d=256`，分析并优化 RAB/DRAB 降 TFLOPS、causal 低于 full、context TFLOPS 偏高，以及 benchmark `596` vs `173` 的 D128 regression。
+
+本轮已完成：
+
+- 两个只读 sub-agent 已完成分析，均未改文件。
+- 已更新 `PLANS.md` 和 `knowledge.md`，写入 Phase 33 证据、计划和风险。
+- 已锁频跑 FP8 WS NCU，并已解锁 GPU clocks。产物：
+  - `3profile_results/phase33_fp8_d256_s2048_h4_full_none_ncu.ncu-rep`
+  - `3profile_results/phase33_fp8_d256_s2048_h4_full_rab_ncu.ncu-rep`
+  - `3profile_results/phase33_fp8_d256_s2048_h4_causal_none_ncu.ncu-rep`
+  - `3profile_results/phase33_fp8_d256_s2048_h4_causal_rab_ncu.ncu-rep`
+  - 同名 `.csv`
+- 没有完成任何业务代码优化改动；当前只应把 `PLANS.md`、`knowledge.md`、`MEMORY.md` 视为本轮新增 handoff。
+
+关键结论：
+
+- BF16 CuTe DSL kernel 差距最可能来自没有复刻 C++ 的 `Q-in-reg + Share_Q_K_smem`：DSL 每个 N block 重复 LDSM Q，dynamic SMEM 约 99KB；C++ D128 约 64KB。
+- FP8 WS RAB/DRAB 降 TFLOPS 的第一主因是 math critical path 上的 global scalar RAB load。D256 full+RAB NCU 无 local spill，但 DRAM throughput 升高、L2 hit 降低、No Eligible 升高。
+- D256 causal no-RAB latency 与 full 接近，而 valid pairs 只有 full 的约一半；同时 D256 non-paged causal 当前不走 paired persistent scheduler。
+- benchmark `596` 相比 `173`：D128 full 无 regression；D128 causal long-seq 有约 6% 小回退。
+
+下一步建议：
+
+1. 优先实现 BF16 DSL D64/D128 no-RAB 的 Q-in-reg/Share-Q-K-smem，先用 kernel-only profile 验证是否接近 95%。
+2. FP8 WS RAB 不要重复单 K warp 预取 RAB 到 SMEM 的旧方案；如优化，优先考虑独立 RAB TMA/异步搬运、layout/packing，或 D256 中复用已消费 K/V stage。
+3. 所有性能结论继续锁频后记录到 `2benchmark_results/`；CUDA/CuTe 改动后按 `AGENTS.md` 跑 `hstu_test.py`、`sweep_accuracy.py` 和 `run_hstu8_examples.sh`。

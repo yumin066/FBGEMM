@@ -4,6 +4,8 @@
 
 ## 当前状态
 
+Phase 33 当前目标：并行推进两条性能问题。BF16 CuTe DSL 的目标是 GPU kernel-only 性能接近当前 BF16 C++，验收线为代表 aligned D128 full/causal 至少达到 C++ 的 95%；wrapper-call 端到端开销单独记录，不和 kernel-only 混算。FP8 WS 的目标聚焦 `seq=2048,h=4,d=256`：解释并降低 RAB/DRAB 带来的 TFLOPS 下降，解释各 mask 的 valid-pairs 与调度差异，分析 D256 causal 只有 full 约一半 TFLOPS 的原因，并对比 benchmark `596` 与 `173` 的 D128 full/causal regression。
+
 Phase 32 当前目标：参考现有 CuTe DSL 路径实现 SM120 BF16 prototype，并与当前 SM120 C++ BF16 路径做性能对比。已确认 SM100 DSL `tcgen05` BF16 MMA 不能直接用于 SM120：CUTLASS DSL 4.5 的 `tcgen05.MmaF16BF16Op` 只接受 `sm_100a/sm_101a/sm_103a`，`sm_120a` 会在 JIT 阶段报 arch 不支持；强制按 `sm_100a` 编译后也会在 SM120 上报 `cudaErrorNoKernelImageForDevice`。因此 Phase 32 prototype 改用 Ampere-style warp-level `mma.sync` CuTe DSL，与当前 SM120 C++ BF16 的 “SM80 mma.sync on SM120” 模型一致。当前 SM120 CuTe DSL BF16 已补齐 D32/D64/D128/D256 × full、causal、local、context+causal、target+causal、context+target+causal、arbitrary × none/RAB/DRAB；覆盖 dense full-batch、compact varlen、`alpha=1.0/0.1`。BF16 paged KV 以 wrapper-side materialization 接入，先还原成 dense K/V 后复用同一个 DSL kernel。最新结论：早期 CUDA-event benchmark 的 8%~12% ratio 主要是把 Python/CuTe DSL wrapper 的 descriptor/from_dlpack/launch 开销计入了 event 区间，不代表 GPU kernel 本身；nsys GPU kernel summary 显示对齐 8-warps、fast_silu 和 in-kernel scaling 后，`bs=1,seq=1024,H=4,D=128,full` DSL kernel 为 `40.0us`，当前 C++ BF16 为 `35.1us`，约 `87.7%`。
 
 Phase 31 当前状态：已修复 SM120 FP8 `D=64 paged full` register spill。修复方式是把 persistent scheduler 的 `num_m_block/total_tiles/total_tile_pairs` 从 top-level wrapper 参数和跨分支 live range 中移除，改为 load/math persistent 分支内局部计算。最终 D64 paged full resource 为 `REG:168 STACK:0 LOCAL:0`，SASS 无 `LDL/STL`。最终 correctness 通过 `hstu_test.py`、`sweep_accuracy.py` 和 `run_hstu8_examples.sh`；锁频全量 FP8+paged kernel benchmark 已完成，日志为 `2benchmark_results/phase31_gpu2407MHz_full_fp8_paged_kernel_final.log`。
@@ -37,6 +39,58 @@ Phase 25 的 SM120 forward headDim256 已完成第一阶段支持。FP8 hdim256 
 - Phase 27 non-paged RAB/DRAB WS 当前版已接入：D=128/D=256 full、pure causal、context+causal、target+causal、local、arbitrary non-paged RAB/DRAB 走 WS TMA，correctness 通过。`bs=2,seq=1024,h=4,d=256` kernel-only latency 相比 fallback：full `0.0693ms vs 0.1111ms`，local `0.0583ms vs 0.0825ms`，context `0.1264ms vs 0.2118ms`，target `0.0798ms vs 0.1246ms`；arbitrary WS 与 fallback 基本持平，用于统一路径。
 - `bench_hstu_attn_sm120.py` 已扩展为默认覆盖 `full/causal/local/context/target/arbitrary` × `none/rab/drab`，每个逻辑 case 同时输出 BF16、non-paged FP8、paged FP8。三列独立计时，BF16 unsupported 不再阻塞 FP8/paged 结果；可用 `--columns fp8 paged` 只跑目标列。TFLOPS 按 `generate_input` 产生的实际 valid attention pairs 计算，避免 causal/local/context/target 被 full FLOPs 高估。
 - repo 自带 `hstu_test.py` 已纳入当前 correctness 目标；Phase 31 最新全文件日志 `1test_results/phase31_final_hstu_test.log` 为 `3 passed, 1 skipped`。其中 `HSTU8Test::test_sm120_fp8_blockscale_matrix` 已扩展到 D=32/D=64/D=128/D=256、seq=99/128/256、full/causal/local/context/target/arbitrary、none/RAB/DRAB、non-paged/paged。后续 HSTU CUDA/CuTe 改动必须保持该 pytest 入口通过。
+
+## Phase 33：BF16 CuTe DSL 与 FP8 WS 性能优化
+
+目标：
+
+- BF16 CuTe DSL：先把 GPU kernel-only 性能从当前约 87-88% 提到接近 BF16 C++，代表 aligned D128 full/causal 验收线为 `>=95%`。wrapper-call 端到端开销单独作为 Python/CuTe DSL launch 问题，不用 CUDA-event wrapper-call 口径判断 kernel 本体。
+- FP8 WS：以 `bs=1,seq=2048,h=4,d=256` 为第一代表形状，降低 RAB/DRAB 性能损失，解释 full/causal/local/context/target/arbitrary 的 FLOP 口径和调度差异，并复查 D128 benchmark `596` 相对 `173` 的 full/causal regression。
+
+当前证据：
+
+- BF16 CuTe DSL kernel-only 差距不是 tile size 或 MMA atom 不一致。D128 no-RAB 两边都使用 `{kBlockM=128,kBlockN=128}` 和 SM80-style `mma.sync`，但 DSL 固定分配 `sQ/sK/sV`，每个 N block 重新从 SMEM 读 Q；C++ BF16 对 `kHeadDim<=128` 使用 `Q-in-reg + Share_Q_K_smem`。nsys 代表 case 显示 DSL dynamic SMEM 约 `99KB`，C++ 约 `64KB`。
+- BF16 CuTe DSL wrapper-call 仍由 Python/CuTe descriptor/from_dlpack/launch 固定开销主导。当前默认 CUDA-event geomean DSL/C++ 约 `0.203`，不能代表 GPU kernel-only；后续 benchmark 必须明确区分 wrapper-call 与 kernel-only。
+- FP8 WS D256 RAB/DRAB 的主要瓶颈是 `add_rab_bs` 在 math warp critical path 中对 BF16 RAB tensor 做 scalar global load。NCU `full -> full+RAB` 显示 duration 约 `109.5us -> 193.9us`，DRAM throughput `3.69% -> 12.93%`，L2 hit `91.4% -> 65.4%`，No Eligible `67.3% -> 76.1%`；full+RAB 无 local spill，因此主因不是 register spill。
+- FP8 WS D256 causal no-RAB 的 latency 与 full 接近，但 valid pairs 只有 full 的约 50%，所以 TFLOPS 约为 full 一半。该形状只有 `16 M-blocks * 4 heads = 64 CTAs`，且 D256 non-paged causal 当前不走 paired persistent scheduler，仍使用 runtime mask 单体 N-loop。
+- benchmark `596` 相比 `173`：D128 no-bias full kernel-only 无 regression，long-seq geomean 约 `+3.4%`；D128 no-bias causal 有小幅回退，long-seq geomean 约 `-6.1%`，需作为后续 FP8 WS causal 调度检查项。
+
+本轮已完成：
+
+- 已启动两个只读子 agent 分别分析 BF16 CuTe DSL 与 FP8 WS；子 agent 未修改文件。
+- 已在锁频 `2407MHz` 下完成 FP8 WS D256 `bs=1,seq=2048,h=4` 的 NCU 对照，并已解锁 GPU clocks。profile 产物：
+  - `3profile_results/phase33_fp8_d256_s2048_h4_full_none_ncu.ncu-rep`
+  - `3profile_results/phase33_fp8_d256_s2048_h4_full_rab_ncu.ncu-rep`
+  - `3profile_results/phase33_fp8_d256_s2048_h4_causal_none_ncu.ncu-rep`
+  - `3profile_results/phase33_fp8_d256_s2048_h4_causal_rab_ncu.ncu-rep`
+  - 同名 `.csv` 已导出，便于下一台机器继续解析。
+- FP8 WS 已完成第一轮 direct-global RAB 优化：在 selected masked paths 中先 apply mask，再让 `add_rab_bs_skip_masked` 跳过已为 `-inf` 的 accumulator 元素，避免无效 RAB global load。未采用“对所有 masked paths 复制完整 mask predicate 到 RAB add 内”的版本；该版本 correctness 通过但 context/target/arbitrary 明显回退。
+- 当前保留的 selective 版本 correctness 已通过：
+  - `1test_results/phase33_fp8_ws_rab_selective_maskbefore_hstu_test.log`
+  - `1test_results/phase33_fp8_ws_rab_selective_maskbefore_sweep.log`
+  - `1test_results/phase33_fp8_ws_rab_selective_maskbefore_examples.log`
+- 锁频 D256 `bs=1,seq=2048,h=4` 子集 benchmark：`2benchmark_results/600_gpu2407MHz_phase33_fp8_ws_rab_selective_maskbefore_d256_s2048_h4_kernel.log`。相对原始同机基线 `2benchmark_results/597_gpu2407MHz_phase33_fp8_ws_original_d256_s2048_h4_kernel_after_revert.log`，FP8 全部 case geomean `+1.95%`，FP8 RAB/DRAB geomean `+2.87%`；paged 全部 case geomean `+3.43%`，paged RAB/DRAB geomean `+5.24%`。最大收益来自 local+RAB/DRAB：non-paged 约 `+12%`，paged 约 `+26%`；full/context 等少数 case 有 `<1%` 波动或小回退。
+- D256 resource 扫描日志：`1test_results/phase33_fp8_ws_rab_selective_resource_d256.log`。当前 D256 WS 仍为 `REG:168 LOCAL:0`，stack 分布没有比既有 Phase 27/28 记录恶化。完成 benchmark 后已执行 `sudo nvidia-smi -rgc` 解锁。
+- BF16 CuTe DSL 已完成 D64/D128 no-RAB 的 `Q-in-reg + Share_Q_K_smem` 第一版实现，修改位置为 `fbgemm_gpu/experimental/hstu/src/hstu_blackwell_sm120_cutedsl/hstu_attention_warp.py`。实现方式是在 no-RAB 且 `head_dim<=128` 时，把 Q 从 SMEM 读入寄存器后跨 N-loop 复用，并让 K 复用 Q 的 SMEM storage。D128 full 代表 case dynamic SMEM 已从约 `99KB` 降到 `66.56KB`，接近 C++ BF16 的 `65.54KB`；register/thread 为 DSL `210`、C++ `216`，未引入 local spill。
+- BF16 CuTe DSL correctness smoke 已通过 D64/D128 full/causal no-RAB：`1test_results/phase33_cutedsl_bf16_qinreg_final_smoke.log`。整体验证在 FP8 WS 与 BF16 DSL 两项改动后也通过：`1test_results/phase33_after_fp8_bf16dsl_hstu_test.log`、`1test_results/phase33_after_fp8_bf16dsl_sweep.log`、`1test_results/phase33_after_fp8_bf16dsl_hstu8_examples.log`。
+- BF16 CuTe DSL 当前未达到 `>=95%` kernel-only 目标。锁频 nsys kernel-only 代表 case `bs=4,seq=1024,h=16,d=128,full`：DSL kernel avg `124.2us`，C++ avg `113.5us`，约为 C++ 的 `91.4%`。对应 stats：`3profile_results/phase33_bf16_cutedsl_qinreg_d128_full_stats.log`。CUDA-event wrapper-call benchmark `2benchmark_results/601_gpu2407MHz_phase33_bf16_cutedsl_qinreg_event_d64_d128.log` 仍受 Python/CuTe DSL wrapper 开销污染，不能作为 kernel-only 结论。
+- BF16 CuTe DSL 已排除两条错误方向：Q-in-reg 但不 share Q/K SMEM 的版本更慢，D128 full DSL kernel avg 约 `127.7us`；把 DSL swizzle 从 `cute.make_swizzle(swizzle_bits, 4, 3)` 改为 `(swizzle_bits, 3, 3)` 会破坏 correctness，说明 Python DSL swizzle 参数不能直接按 C++ `Swizzle<kSwizzle,3,3>` 等价替换。
+- BF16 CuTe DSL 下一步瓶颈更可能是 SMEM layout/copy schedule。NCU instruction 对照显示 DSL 与 C++ 的 `ldsm` 指令数相同，且 local ld/st 为 0，但 DSL shared bank conflicts 约 `16,935,305`，C++ 约 `11,139`；shared data bytes DSL `2.46GB`，C++ `2.34GB`。日志：`3profile_results/phase33_bf16_cutedsl_qkshare_d128_full_ncu_inst.log` 与 `3profile_results/phase33_bf16_cpp_d128_full_ncu_inst.log`。
+
+实施顺序：
+
+1. 先做 FP8 WS RAB/DRAB 第一轮优化：
+   - 固定代表形状 `bs=1,seq=2048,h=4,d=256`，先用已有 `596` 与 Phase 33 NCU 作为基线。
+   - 直接优化 `add_rab_bs` direct-global path：对 aligned full/context 等路径减少 per-element 分支和整数计算；对 causal/local/arbitrary/target 把 mask predicate 提前用于 RAB load skip，避免后续会被置为 `-inf` 的元素仍然发起 global RAB load。
+   - 不重复 Phase 31 的单 K warp RAB SMEM copy；如果 direct-global 优化不够，再评估独立 RAB TMA、RAB layout/packing，或 D256 中复用已消费 K/V stage。
+   - 当前 selective mask-before-RAB 版本已完成 D256 `seq=2048,h=4` 全 mask/bias 子集和三项 correctness。下一步若继续 FP8，应补全量锁频 benchmark，并用 NCU 对 local+RAB、paged local+RAB、target+RAB 检查 RAB load sectors 与 No Eligible 是否按预期下降。
+2. FP8 WS D256 causal 单独处理：
+   - 先用 SASS/resource 和 NCU 确认当前 no-RAB / RAB 的 spill、runtime mask loop、tail-wave 和 No Eligible 代价。
+   - 若尝试 paired persistent 或 split masked/unmasked loop，保留条件是无 `LDL/STL`、latency 下降、且 D128 causal 不继续 regression。
+3. 再做 BF16 CuTe DSL kernel-body 优化：
+   - D64/D128 no-RAB 的 `Q-in-reg + Share_Q_K_smem` 第一版已实现，dynamic SMEM footprint 已基本对齐 C++，但 D128 full kernel-only 仍只有 C++ 的约 `91.4%`。
+   - 验证必须用 nsys/ncu kernel-only 口径；wrapper-call CUDA-event geomean 只能作为 Python launch overhead 参考。
+   - 下一步优先查 DSL SMEM bank conflict 和 shared copy schedule；保留 correctness 约束为 BF16 DSL smoke + repo `hstu_test.py`，性能目标仍为代表 aligned D128 full/causal 达到 C++ BF16 的 `>=95%`。
 
 ## Phase 32：SM120 BF16 CuTe DSL Prototype
 

@@ -118,6 +118,8 @@ class HSTUAttentionForwardSm120CuteDsl(object):
         self._alpha = alpha
         self._has_rab = has_rab
         self._scale_output = scale_output
+        self._use_q_in_regs = (not has_rab) and self._head_dim_padded <= 128
+        self._share_q_k_smem = self._use_q_in_regs
         assert self._dtype == cutlass.Float16 or self._dtype == cutlass.BFloat16, (
             "Only Float16 or BFloat16 is supported"
         )
@@ -196,7 +198,20 @@ class HSTUAttentionForwardSm120CuteDsl(object):
         sO_layout = sQ_layout
 
         @cute.struct
-        class SharedStorage:
+        class SharedStorageQKAlias:
+            sQ: cute.struct.Align[
+                cute.struct.MemRange[self._dtype, cute.cosize(sQ_layout)], 1024
+            ]
+            sV: cute.struct.Align[
+                cute.struct.MemRange[self._dtype, cute.cosize(sKV_layout)], 1024
+            ]
+            sRAB: cute.struct.Align[
+                cute.struct.MemRange[self._dtype, 1],
+                1024,
+            ]
+
+        @cute.struct
+        class SharedStorageDefault:
             sQ: cute.struct.Align[
                 cute.struct.MemRange[self._dtype, cute.cosize(sQ_layout)], 1024
             ]
@@ -210,6 +225,10 @@ class HSTUAttentionForwardSm120CuteDsl(object):
                 cute.struct.MemRange[self._dtype, 1],
                 1024,
             ]
+
+        SharedStorage = (
+            SharedStorageQKAlias if self._share_q_k_smem else SharedStorageDefault
+        )
 
         assert SharedStorage.size_in_bytes() < utils.get_smem_capacity_in_bytes(
             "sm_80"
@@ -410,7 +429,10 @@ class HSTUAttentionForwardSm120CuteDsl(object):
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         sQ = storage.sQ.get_tensor(sQ_layout)
-        sK = storage.sK.get_tensor(sKV_layout)
+        if cutlass.const_expr(self._share_q_k_smem):
+            sK = storage.sQ.get_tensor(sKV_layout)
+        else:
+            sK = storage.sK.get_tensor(sKV_layout)
         sV = storage.sV.get_tensor(sKV_layout)
 
         # Transpose view of V to tensor with layout (head_dim, n_block_size) for tiled mma
@@ -549,6 +571,18 @@ class HSTUAttentionForwardSm120CuteDsl(object):
                 # Clear the smem tiles to account for predicated off loads
                 tQsQ[None, m, None].fill(0)
 
+        if cutlass.const_expr(self._share_q_k_smem):
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
+            self.cta_sync_barrier.arrive_and_wait()
+            for k in cutlass.range_constexpr(0, cute.size(tSsQ.shape[2])):
+                cute.copy(
+                    smem_tiled_copy_Q,
+                    tSsQ[None, None, k],
+                    tSrQ_copy_view[None, None, k],
+                )
+            self.cta_sync_barrier.arrive_and_wait()
+
         for n in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
             if cute.elem_less(tKVcKV[0, n, 0][1], mK.layout.shape[1]):
                 cute.copy(
@@ -602,11 +636,12 @@ class HSTUAttentionForwardSm120CuteDsl(object):
             # S gemm calculation
             # ///////////////////////////////////////////////////////////////////////////////
             # ldmatrix first QK k-block for mma
-            cute.copy(
-                smem_tiled_copy_Q,
-                tSsQ[None, None, 0],
-                tSrQ_copy_view[None, None, 0],
-            )
+            if cutlass.const_expr(not self._use_q_in_regs):
+                cute.copy(
+                    smem_tiled_copy_Q,
+                    tSsQ[None, None, 0],
+                    tSrQ_copy_view[None, None, 0],
+                )
             cute.copy(
                 smem_tiled_copy_K,
                 tSsK[None, None, 0],
@@ -615,11 +650,12 @@ class HSTUAttentionForwardSm120CuteDsl(object):
             for k in cutlass.range_constexpr(0, cute.size(tSsQ.shape[2])):
                 # ldmatrix next QK k-block for mma
                 if k < cute.size(tSsQ.shape[2]) - 1:
-                    cute.copy(
-                        smem_tiled_copy_Q,
-                        tSsQ[None, None, k + 1],
-                        tSrQ_copy_view[None, None, k + 1],
-                    )
+                    if cutlass.const_expr(not self._use_q_in_regs):
+                        cute.copy(
+                            smem_tiled_copy_Q,
+                            tSsQ[None, None, k + 1],
+                            tSrQ_copy_view[None, None, k + 1],
+                        )
                     cute.copy(
                         smem_tiled_copy_K,
                         tSsK[None, None, k + 1],
