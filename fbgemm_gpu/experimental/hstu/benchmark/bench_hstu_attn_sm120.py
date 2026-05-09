@@ -50,6 +50,7 @@ ITERS = 50
 MASK_CONFIGS = ("full", "causal", "local", "context", "target", "arbitrary")
 BIAS_CONFIGS = ("none", "rab", "drab")
 COLUMNS = ("bf16", "fp8", "paged")
+RAB_HEAD_MODES = ("per-head", "shared")
 
 
 @dataclass(frozen=True)
@@ -177,8 +178,10 @@ def fp8_round_bf16(x: torch.Tensor) -> torch.Tensor:
 
 
 def make_case_inputs(batch_size: int, seqlen: int, nheads: int,
-                     headdim: int, case: BenchCase) -> dict:
+                     headdim: int, case: BenchCase,
+                     rab_heads: str = "per-head") -> dict:
     max_context_len, max_target_len, window_size, is_arbitrary = _case_shape(case, seqlen)
+    heads_rab = 1 if case.has_rab and rab_heads == "shared" else None
     (
         _,
         _,
@@ -198,7 +201,7 @@ def make_case_inputs(batch_size: int, seqlen: int, nheads: int,
     ) = generate_input(
         batch_size=batch_size,
         heads=nheads,
-        heads_rab=None,
+        heads_rab=heads_rab,
         max_seq_len_q=seqlen,
         max_seq_len_k=seqlen,
         max_context_len=max_context_len,
@@ -227,6 +230,7 @@ def make_case_inputs(batch_size: int, seqlen: int, nheads: int,
 
     return {
         "case": case,
+        "rab_heads": rab_heads,
         "q": q.detach().contiguous(),
         "k": k.detach().contiguous(),
         "v": v.detach().contiguous(),
@@ -478,6 +482,7 @@ def bench_kernel_only(
     headdim: int,
     case: BenchCase,
     columns: Sequence[str],
+    rab_heads: str,
 ) -> dict:
     """
     Returns dict with keys: bf16_ms, fp8_ms, bf16_tflops, fp8_tflops, speedup_pct.
@@ -486,7 +491,7 @@ def bench_kernel_only(
     result = {}
 
     try:
-        inputs = make_case_inputs(batch_size, seqlen, nheads, headdim, case)
+        inputs = make_case_inputs(batch_size, seqlen, nheads, headdim, case, rab_heads)
         result["pairs"] = inputs["pairs"]
     except Exception as e:
         result["input_error"] = str(e)
@@ -591,12 +596,13 @@ def bench_e2e(
     headdim: int,
     case: BenchCase,
     columns: Sequence[str],
+    rab_heads: str,
 ) -> dict:
     """Returns dict with end-to-end BF16 and FP8 latencies and speedup."""
     result = {}
 
     try:
-        inputs = make_case_inputs(batch_size, seqlen, nheads, headdim, case)
+        inputs = make_case_inputs(batch_size, seqlen, nheads, headdim, case, rab_heads)
         result["pairs"] = inputs["pairs"]
     except Exception as e:
         result["input_error"] = str(e)
@@ -665,8 +671,14 @@ def bench_e2e(
 # Pretty print helpers
 # ---------------------------------------------------------------------------
 
+def _case_config_label(bs: int, seqlen: int, nheads: int, headdim: int,
+                       case: BenchCase, rab_heads: str) -> str:
+    suffix = " rab_h=1" if case.has_rab and rab_heads == "shared" else ""
+    return f"bs={bs} seq={seqlen} h={nheads} d={headdim} {case.label}{suffix}"
+
+
 def print_kernel_table(
-    batch_sizes, seqlens, nheads_list, headdims, cases, columns
+    batch_sizes, seqlens, nheads_list, headdims, cases, columns, rab_heads
 ):
     print("=" * 120)
     print("KERNEL-ONLY BENCHMARK  (FP8 quantization not included)")
@@ -685,9 +697,8 @@ def print_kernel_table(
                     for case in cases:
                         if not has_supported_column(columns, headdim, case):
                             continue
-                        cfg = (f"bs={bs} seq={seqlen} h={nheads} "
-                               f"d={headdim} {case.label}")
-                        res = bench_kernel_only(bs, seqlen, nheads, headdim, case, columns)
+                        cfg = _case_config_label(bs, seqlen, nheads, headdim, case, rab_heads)
+                        res = bench_kernel_only(bs, seqlen, nheads, headdim, case, columns, rab_heads)
 
                         bf16_str = (f"{res['bf16_ms']:9.3f}" if "bf16_ms" in res
                                     else (f"{'N/A':>9}" if "bf16" not in columns or "bf16_unsupported" in res else f"{'ERR':>9}"))
@@ -725,7 +736,7 @@ def print_kernel_table(
 
 
 def print_e2e_table(
-    batch_sizes, seqlens, nheads_list, headdims, cases, columns
+    batch_sizes, seqlens, nheads_list, headdims, cases, columns, rab_heads
 ):
     print("=" * 120)
     print("END-TO-END BENCHMARK  (includes FP8 quantization overhead)")
@@ -744,9 +755,8 @@ def print_e2e_table(
                     for case in cases:
                         if not has_supported_column(columns, headdim, case):
                             continue
-                        cfg = (f"bs={bs} seq={seqlen} h={nheads} "
-                               f"d={headdim} {case.label}")
-                        res = bench_e2e(bs, seqlen, nheads, headdim, case, columns)
+                        cfg = _case_config_label(bs, seqlen, nheads, headdim, case, rab_heads)
+                        res = bench_e2e(bs, seqlen, nheads, headdim, case, columns, rab_heads)
 
                         bf16_str = (f"{res['bf16_ms']:9.3f}" if "bf16_ms" in res
                                     else (f"{'N/A':>9}" if "bf16" not in columns or "bf16_unsupported" in res else f"{'ERR':>9}"))
@@ -790,7 +800,7 @@ def print_e2e_table(
 # ---------------------------------------------------------------------------
 
 def check_accuracy(
-    batch_sizes, seqlens, nheads_list, headdims, cases
+    batch_sizes, seqlens, nheads_list, headdims, cases, rab_heads
 ):
     print("=" * 120)
     print("ACCURACY CHECK  (FP8 quant_mode=2 vs BF16)")
@@ -806,10 +816,9 @@ def check_accuracy(
             for nheads in nheads_list:
                 for headdim in headdims:
                     for case in cases:
-                        cfg = (f"bs={bs} seq={seqlen} h={nheads} "
-                               f"d={headdim} {case.label}")
+                        cfg = _case_config_label(bs, seqlen, nheads, headdim, case, rab_heads)
                         try:
-                            inputs = make_case_inputs(bs, seqlen, nheads, headdim, case)
+                            inputs = make_case_inputs(bs, seqlen, nheads, headdim, case, rab_heads)
                             bf16_reason = column_unsupported_reason("bf16", headdim, case)
                             fp8_reason = column_unsupported_reason("fp8", headdim, case)
                             if bf16_reason or fp8_reason:
@@ -919,6 +928,15 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--rab-heads",
+        choices=RAB_HEAD_MODES,
+        default="per-head",
+        help=(
+            "RAB head layout for generated inputs: per-head uses heads_rab=heads; "
+            "shared uses heads_rab=1 for RAB/DRAB cases. Default: per-head"
+        ),
+    )
+    parser.add_argument(
         "--warmup", type=int, default=WARMUP,
         help=f"Number of warmup iterations (default: {WARMUP})",
     )
@@ -967,6 +985,7 @@ def main():
     print(f"Mask configs={mask_configs}")
     print(f"Bias configs={bias_configs}")
     print(f"Columns={columns}")
+    print(f"RAB heads={args.rab_heads}")
     print(f"Total logical configs={len(cases)}")
     print()
     print_unsupported_summary(args.headdims, cases, columns)
@@ -979,6 +998,7 @@ def main():
             nheads_list=[1, 4],
             headdims=args.headdims,
             cases=cases,
+            rab_heads=args.rab_heads,
         )
 
     if args.mode in ("kernel", "all"):
@@ -989,6 +1009,7 @@ def main():
             headdims=args.headdims,
             cases=cases,
             columns=columns,
+            rab_heads=args.rab_heads,
         )
 
     if args.mode in ("e2e", "all"):
@@ -999,6 +1020,7 @@ def main():
             headdims=args.headdims,
             cases=cases,
             columns=columns,
+            rab_heads=args.rab_heads,
         )
 
 

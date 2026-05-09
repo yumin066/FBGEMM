@@ -140,13 +140,24 @@ struct HstuWsTileCoord {
 __device__ __forceinline__ HstuWsTileCoord hstu_ws_decode_tile(
     const int tile,
     const int num_m_block,
-    const int num_heads) {
-  const int m_linear = tile % num_m_block;
-  const int bh = tile / num_m_block;
-  return HstuWsTileCoord{
-      bh / num_heads,
-      bh % num_heads,
-      num_m_block - 1 - m_linear};
+    const int num_heads,
+    const bool head_shared_rab) {
+  if (head_shared_rab) {
+    const int bidh = tile % num_heads;
+    const int bm = tile / num_heads;
+    const int m_linear = bm % num_m_block;
+    return HstuWsTileCoord{
+        bm / num_m_block,
+        bidh,
+        num_m_block - 1 - m_linear};
+  } else {
+    const int m_linear = tile % num_m_block;
+    const int bh = tile / num_m_block;
+    return HstuWsTileCoord{
+        bh / num_heads,
+        bh % num_heads,
+        num_m_block - 1 - m_linear};
+  }
 }
 
 // Rearrange GEMM1 C-fragment (acc_s_packed[16]) to GEMM2 A-fragment (tCrP[16]) layout
@@ -981,6 +992,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     // Static tile-id broadcast: load and math paths run the same deterministic
     // scheduler and decode the same tile ids locally.  There is no dynamic work
     // queue, atomic counter, or shared tile-id sync on this path.
+    const bool head_shared_rab = Has_rab && params.h_rab == 1 && params.h > 1;
     if constexpr (Use_paired_persistent) {
       const int num_m_block_persistent = (params.seqlen_q + kBlockM - 1) / kBlockM;
       const int total_tiles_persistent = num_m_block_persistent * params.h * params.b;
@@ -994,7 +1006,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         for (int pair_slot = 0; pair_slot < tiles_this_pair; ++pair_slot) {
           const int tile = pair_slot == 0 ? tile_pair : paired_tile;
           const HstuWsTileCoord coord =
-              hstu_ws_decode_tile(tile, num_m_block_persistent, params.h);
+              hstu_ws_decode_tile(tile, num_m_block_persistent, params.h, head_shared_rab);
           run_load_tile(coord.bidb, coord.bidh, coord.m_block);
         }
       }
@@ -1004,7 +1016,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       #pragma unroll 1
       for (int tile = int(blockIdx.x); tile < total_tiles_persistent; tile += int(gridDim.x)) {
         const HstuWsTileCoord coord =
-            hstu_ws_decode_tile(tile, num_m_block_persistent, params.h);
+            hstu_ws_decode_tile(tile, num_m_block_persistent, params.h, head_shared_rab);
         run_load_tile(coord.bidb, coord.bidh, coord.m_block);
       }
     } else {
@@ -2395,6 +2407,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     };
 
     // Static tile-id broadcast mirrors the load path exactly.
+    const bool head_shared_rab = Has_rab && params.h_rab == 1 && params.h > 1;
     if constexpr (Use_paired_persistent) {
       const int num_m_block_persistent = (params.seqlen_q + kBlockM - 1) / kBlockM;
       const int total_tiles_persistent = num_m_block_persistent * params.h * params.b;
@@ -2408,7 +2421,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         for (int pair_slot = 0; pair_slot < tiles_this_pair; ++pair_slot) {
           const int tile = pair_slot == 0 ? tile_pair : paired_tile;
           const HstuWsTileCoord coord =
-              hstu_ws_decode_tile(tile, num_m_block_persistent, params.h);
+              hstu_ws_decode_tile(tile, num_m_block_persistent, params.h, head_shared_rab);
           run_math_tile(coord.bidb, coord.bidh, coord.m_block);
         }
       }
@@ -2418,7 +2431,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       #pragma unroll 1
       for (int tile = int(blockIdx.x); tile < total_tiles_persistent; tile += int(gridDim.x)) {
         const HstuWsTileCoord coord =
-            hstu_ws_decode_tile(tile, num_m_block_persistent, params.h);
+            hstu_ws_decode_tile(tile, num_m_block_persistent, params.h, head_shared_rab);
         run_math_tile(coord.bidb, coord.bidh, coord.m_block);
       }
     } else {
@@ -2452,9 +2465,21 @@ hstu_fwd_kernel_sm120_fp8_ws_tma(
   constexpr bool Use_persistent = Use_full_persistent || Use_paired_persistent;
 
   if constexpr (!Use_persistent) {
-    int m_block = gridDim.x - blockIdx.x - 1;
-    int bidh    = blockIdx.y;
-    int bidb    = blockIdx.z;
+    int m_block;
+    int bidh;
+    int bidb = blockIdx.z;
+    if constexpr (Kernel_traits::Has_rab) {
+      if (params.h_rab == 1 && params.h > 1) {
+        m_block = gridDim.y - blockIdx.y - 1;
+        bidh    = blockIdx.x;
+      } else {
+        m_block = gridDim.x - blockIdx.x - 1;
+        bidh    = blockIdx.y;
+      }
+    } else {
+      m_block = gridDim.x - blockIdx.x - 1;
+      bidh    = blockIdx.y;
+    }
     hstu_compute_attn_1rowblock_sm120_fp8_ws<Kernel_traits>(params, bidb, bidh, m_block);
     return;
   }

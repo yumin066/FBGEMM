@@ -1935,3 +1935,25 @@ FP8 WS：
 - D128 full no-RAB vs full+RAB NCU：duration `504.7us -> 914.6us`，DRAM throughput `15.08% -> 84.85%`，memory throughput `240.6GB/s -> 1354.2GB/s`，L2 hit `85.87% -> 45.48%`，local spill 为 0。
 - 对 `bs=8,seq=2048,h=16,d=128`，dense per-head BF16 RAB 读量约 `1.07GB`。要让 full+RAB 达到 no-RAB latency 的 `95%`，即使把整个目标时间都给 RAB 读，也需要约 `2.4TB/s` 有效带宽；实际还要同时承担 no-RAB 的 Q/K/V/O 工作。在当前 dense BF16 per-head RAB 表示下，这不是通过同步点或 warp 分工能解决的问题。
 - 若继续追 RAB 接近 no-RAB，必须减少 RAB 字节量或提高复用：例如 `h_rab==1` 跨 head 复用、FP8/压缩 RAB、低秩/相对位置表在线生成，或在 causal/local/target 等 masked paths 中跳过 masked-out RAB tile。full dense per-head RAB 没有 mask 可跳，95% 目标不现实。
+
+## 23. Phase 33：FP8 WS head-shared RAB 结论
+
+本轮保留实现：
+
+- 当 `Has_rab && params.h_rab == 1 && params.h > 1` 时，FP8 WS persistent scheduler 使用 head-fast tile decode，让同一 `(b,m)` 的不同 head 相邻执行，从而复用同一个 RAB tile 的 L2 cache。non-persistent RAB grid 同步改为 `dim3(h, num_m_block, b)`，kernel 内按 head-fast 解释 `blockIdx`。
+- `h=1` 不启用 head-shared scheduler，因为没有跨 head 复用，额外 runtime 分支只会增加风险。
+- benchmark 新增 `--rab-heads shared`，用于构造 `heads_rab=1` 输入；默认 `--rab-heads per-head` 保持每个 head 一份 RAB。
+- `run_hstu8_examples.sh` 增加 D128/D256、h=4 的 `rab_h1/drab_h1` full/causal non-paged 与 paged mirror。
+
+验证与性能：
+
+- correctness：`1test_results/638_hstu_test_rab_h1_scheduler_final_retry.log` 为 `3 passed, 1 skipped`；`1test_results/629_sweep_rab_h1_scheduler.log` 通过；`1test_results/630_hstu8_examples_rab_h1_scheduler.log` 为 `300/300 passed`。
+- SASS：`4sass_dump_ws/hstu_fwd_kernel_sm120_fp8_ws_tma_I128_full_rab_h1_scheduler.sass`，resource 为 `REG:168 STACK:0 LOCAL:0`，无 `LDL/STL`。
+- 锁频 focused benchmark：per-head RAB `2benchmark_results/633_gpu2407MHz_rab_h1_scheduler_per_head_focus.log`，head-shared RAB `2benchmark_results/634_gpu2407MHz_rab_h1_scheduler_shared_focus.log`，no-RAB `2benchmark_results/635_gpu2407MHz_rab_h1_scheduler_no_rab_focus.log`。
+- `rab_h=1` 相比 per-head RAB 的 TFLOPS geomean `+8.3%`；full `+9.3%`，causal `+7.3%`，D128 `+9.5%`，D256 `+7.1%`，h=16 `+11.5%`。典型 case：`bs=8,h=16,d=128 full+rab` 从 `317.2` 到 `391.4 TFLOPS`；`bs=1,h=16,d=256 causal+rab` 从 `194.0` 到 `247.2 TFLOPS`。
+- head-shared RAB 仍未达到 no-RAB `95%`。同形状对 no-RAB 的 geomean 约 `66.6%`；D256 full 约 `82%~84%`，D128 full 约 `62%~64%`，D128 causal 约 `50%`。原因是 tile 顺序只能改善 L2/DRAM reuse；每个 head 的 CTA 仍然要各自 TMA 同一 RAB tile 到 SMEM，并执行同样的 SMEM read 和 RAB add。
+
+已拒绝实验：
+
+- `h_rab==1` direct-global RAB add：日志 `2benchmark_results/636_gpu2407MHz_rab_h1_direct_global_focus.log`。它消除了每 head RAB TMA/SMEM，但 full case 全面回退，只在少数 causal 小形状略好，不保留。
+- masked tile-level 额外 predicate：当前 N-loop 的 `n_block_min/max` 和 arbitrary valid-block list 已跳过整块无效 N tile，额外 predicate 没有新增可跳过 tile，还会扰动 RAB mbarrier 热路径，不保留。

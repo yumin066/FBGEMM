@@ -156,6 +156,29 @@ for dim in (32, 64, 128, 256):
                     ),
                 ))
 
+for dim in (128, 256):
+    for tag, window, rab_tag, rab_params in (
+        ('full', (-1, -1), 'rab_h1', (True, False, 1)),
+        ('full', (-1, -1), 'drab_h1', (True, True, 1)),
+        ('causal', (-1, 0), 'rab_h1', (True, False, 1)),
+        ('causal', (-1, 0), 'drab_h1', (True, True, 1)),
+    ):
+        NONPAGED_EXTRA_CASES.append((
+            f'D={dim} seq=256 h=4 {tag}+{rab_tag}',
+            dict(
+                batch_size=2,
+                heads=4,
+                seq_len_params=(256, 256),
+                max_context_len=0,
+                target_params=(0, window, 1, False),
+                attn_hidden_dims=(dim, dim),
+                alpha=1.0,
+                rab_params=rab_params,
+                dtype=torch.float8_e4m3fn,
+                quant_mode_full_batch=(2, True),
+            ),
+        ))
+
 def metric_report(a, b):
     diff = (a.float() - b.float()).abs()
     cos = float(torch.nn.functional.cosine_similarity(

@@ -957,7 +957,9 @@ void run_hstu_fwd_sm120_fp8_ws_tma_impl(Hstu_fwd_params& params, cudaStream_t st
   }
   dim3 grid = Use_persistent
       ? dim3(std::min(persistent_work_units, sm_count))
-      : dim3(num_m_block, params.h, params.b);
+      : (Has_rab && params.h_rab == 1 && params.h > 1
+          ? dim3(params.h, num_m_block, params.b)
+          : dim3(num_m_block, params.h, params.b));
 
   auto launch_tma_kernel = [&](auto& tma_params) {
     using TmaParamsT = std::decay_t<decltype(tma_params)>;
