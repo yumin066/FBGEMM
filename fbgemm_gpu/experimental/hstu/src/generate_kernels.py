@@ -363,6 +363,7 @@ def generate_kernels_blackwell(install_dir: str):
     DTYPE_16 = (["bf16"] if not DISABLE_BF16 else [])
     HEAD_DIMENSIONS_BF16 = (
         []
+        + ([32] if not DISABLE_HDIM32 else [])
         + ([64] if not DISABLE_HDIM64 else [])
         + ([128] if not DISABLE_HDIM128 else [])
         + ([256] if not DISABLE_HDIM256 else [])

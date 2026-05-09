@@ -281,8 +281,6 @@ if not SKIP_CUDA_BUILD:
                     return False
                 if dim == 256 and DISABLE_HDIM256:
                     return False
-            if "src/hstu_blackwell_sm120/" in src and "hdim32_bf16" in base:
-                return False
             if "e4m3" in base and DISABLE_FP8:
                 return False
             if "bf16" in base and DISABLE_BF16:

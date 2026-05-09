@@ -49,12 +49,8 @@ def _sm120_hstu16_supported(
     has_rab: bool,
     is_arbitrary: bool,
 ) -> bool:
-    # Match the current local SM120 build/test target. hdim64 is commonly
-    # disabled in this repo build, and BF16 hdim256 RAB/arbitrary are not part
-    # of the supported forward surface yet.
-    if attn_dim not in (128, 256):
-        return False
-    if attn_dim == 256 and (has_rab or is_arbitrary):
+    # Match the current local SM120 build/test target.
+    if attn_dim not in (32, 64, 128, 256):
         return False
     return True
 
@@ -1264,8 +1260,12 @@ def _make_paged_cache_from_varlen_kv(
 
 
 @unittest.skipIf(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() >= (9, 0),
-    "Skip when only Hopper GPU. This test is not supported."
+    not torch.cuda.is_available()
+    or (
+        torch.cuda.get_device_capability() >= (9, 0)
+        and not _is_sm120_or_newer()
+    ),
+    "Skip on unsupported GPU; SM120 BF16 uses wrapper-side paged KV materialization."
 )
 class HSTUPagedKVTest(unittest.TestCase):
     """Test HSTU paged kv attention."""

@@ -4,6 +4,10 @@
 
 ## 当前状态
 
+Phase 36 当前目标：先完成 FP8 WS scheduler 统一与代码可 review 性重构。性能方向是让所有 FP8 WS 配置都走 persistent kernel：pure/full 等一般配置使用 non-paired static grid-stride persistent；pure causal 等三角工作量不均衡配置使用 paired persistent。重构方向是把 SM120 dispatch、BF16 C++ launch、FP8 WS launch/implementation 拆到更清晰的文件边界，并把 FP8 WS 中重复的 load warp / mbarrier / TMA stage 逻辑抽成 `__device__ __forceinline__` helper。每一步都必须以 correctness、SASS spill 检查、锁频 benchmark 闭环，不接受为了“统一 persistent”引入性能 regression。
+
+Phase 35 已完成：SM120 BF16 CuTe DSL 已支持的配置组合已经补齐到 BF16 CuTe C++ 路径。C++ kernel/dispatch 覆盖 D32/D64/D128/D256 × full/causal/local/context/target/arbitrary × none/RAB/DRAB；BF16 paged KV 与 DSL 保持同一语义，通过 Python wrapper-side dense materialization 后调用现有 C++ BF16 kernel。该阶段不声明原生 paged BF16 kernel。最终 correctness：`1test_results/788_phase35_bf16_cpp_full_hstu_test_after_arbitrary_fix.log` 为 `4 passed`，`1test_results/789_phase35_bf16_cpp_sweep_after_arbitrary_fix.log` 通过，`1test_results/790_phase35_bf16_cpp_hstu8_examples_after_arbitrary_fix.log` / 内部 `791` 为 `300/300 passed`。锁频性能对比：`2benchmark_results/646_c36869fd_gpu2407MHz_phase35_bf16_cpp_dsl_dense_paged_all_config.log` 无 ERROR，CUDA-event wrapper-call geomean DSL/C++ TFLOPS ratio 为 `0.311`；dense-only 仍主要反映 Python/CuTe DSL wrapper 开销，paged 比值包含双方 wrapper-side materialization，不能作为 native paged kernel 结论。
+
 Phase 34 当前目标：持续分析 FP8 WS benchmark，按锁频 kernel-only TFLOPS 自动挑出低效 case，优先处理 `seq>=2048`、非小 launch-overhead 主导的组合。第一轮已完成 `bs=1/8,seq=2048,h=4/16,d=256` focused benchmark、NCU profile 和一个小工作量 causal+RAB 优化。保留改动：`D=256 pure causal RAB/DRAB` 且 `params.b * params.h <= 4` 时，aligned RAB tile 不走 K-warp RAB TMA/SMEM，改用 direct-global RAB add；`local/context/target/arbitrary` 和大 batch/head causal 保持 RAB TMA/SMEM。下一步继续从同频全量 benchmark 中挑低 TFLOPS case，按 profile 证据逐个优化。
 
 Phase 33 当前目标：并行推进两条性能问题。BF16 CuTe DSL 的目标是 GPU kernel-only 性能接近当前 BF16 C++，验收线为代表 aligned D128 full/causal 至少达到 C++ 的 95%；wrapper-call 端到端开销单独记录，不和 kernel-only 混算。FP8 WS 的目标聚焦 `seq=2048,h=4,d=256`：解释并降低 RAB/DRAB 带来的 TFLOPS 下降，解释各 mask 的 valid-pairs 与调度差异，分析 D256 causal 只有 full 约一半 TFLOPS 的原因，并对比 benchmark `596` 与 `173` 的 D128 full/causal regression。
@@ -41,6 +45,77 @@ Phase 25 的 SM120 forward headDim256 已完成第一阶段支持。FP8 hdim256 
 - Phase 27 non-paged RAB/DRAB WS 当前版已接入：D=128/D=256 full、pure causal、context+causal、target+causal、local、arbitrary non-paged RAB/DRAB 走 WS TMA，correctness 通过。`bs=2,seq=1024,h=4,d=256` kernel-only latency 相比 fallback：full `0.0693ms vs 0.1111ms`，local `0.0583ms vs 0.0825ms`，context `0.1264ms vs 0.2118ms`，target `0.0798ms vs 0.1246ms`；arbitrary WS 与 fallback 基本持平，用于统一路径。
 - `bench_hstu_attn_sm120.py` 已扩展为默认覆盖 `full/causal/local/context/target/arbitrary` × `none/rab/drab`，每个逻辑 case 同时输出 BF16、non-paged FP8、paged FP8。三列独立计时，BF16 unsupported 不再阻塞 FP8/paged 结果；可用 `--columns fp8 paged` 只跑目标列。TFLOPS 按 `generate_input` 产生的实际 valid attention pairs 计算，避免 causal/local/context/target 被 full FLOPs 高估。
 - repo 自带 `hstu_test.py` 已纳入当前 correctness 目标；Phase 31 最新全文件日志 `1test_results/phase31_final_hstu_test.log` 为 `3 passed, 1 skipped`。其中 `HSTU8Test::test_sm120_fp8_blockscale_matrix` 已扩展到 D=32/D=64/D=128/D=256、seq=99/128/256、full/causal/local/context/target/arbitrary、none/RAB/DRAB、non-paged/paged。后续 HSTU CUDA/CuTe 改动必须保持该 pytest 入口通过。
+
+## Phase 36：FP8 WS Persistent 统一与代码重构
+
+目标：
+
+- 所有 SM120 FP8 WS 配置都走 persistent kernel。paired persistent 只用于确实需要 heavy/light 配对的三角调度；其余配置使用 non-paired static grid-stride persistent。
+- 不使用 dynamic work queue、atomic counter 或跨 tile shared tile-id sync；load/math 分支继续本地确定性 decode 同一 tile id。
+- 先改 scheduler，不同时做大规模文件搬迁；确认 correctness、SASS、锁频 benchmark 后再拆文件和抽 helper。
+- 重构后 `hstu_fwd_kernel.h` 只保留共同 kernel/launch 骨架；SM120 dispatch、BF16 C++ launch、FP8 WS launch/implementation 分离，减少 peer review 负担。
+- FP8 WS 内部去重优先抽取 load warp TMA issue、ready/empty mbarrier wait/arrive、K/V/RAB stage pointer 选择、O-store handoff 等重复逻辑。helper 必须 `__device__ __forceinline__`，避免影响 SASS。
+- 过滤并精简 FP8 WS 注释：保留设计约束、同步语义、SASS/ISA 依赖和非显然的 layout invariant；删除过长的历史叙述、重复解释和已能从函数名看出的注释。
+- 让代码结构能直接看出 warp-specialized 架构：load warp roles、math warp mainloop、Q/K/V/RAB/O handoff、tile scheduler 应通过命名清晰的 inline helper 串起来，而不是全部压在一个巨大的 kernel 函数和多层 lambda 中。
+- 减少 `hstu_compute_attn_1rowblock_sm120_fp8_ws` 内部 lambda 嵌套。第一轮先抽无状态或低状态 helper；捕获大量局部变量的逻辑只在能保持 SASS 稳定时抽出。
+
+为什么以前只有 full/causal persistent：
+
+- full 的 tile worklist 简单、每个 tile 工作量接近，因此最早适合 grid-stride persistent。
+- pure causal 的 tile 工作量呈三角分布，因此加入 paired persistent，用首尾 tile 配对减少 SM tail imbalance。
+- local/context/target/arbitrary/RAB/paged target tail 含 per-tile `n_block_min/max`、target jump、arbitrary valid-block list、RAB/TMA/mbarrier 额外状态；此前为控制 live range、spill 和 correctness 风险，保留 3D grid。
+- 当前代码已经把主要 WS mbarrier 初始化和 K/V stage parity 提到 persistent loop 外，具备把一般配置切到 non-paired persistent 的基础，但必须逐 case 验证 spill 和性能。
+
+实施顺序：
+
+1. Scheduler 第一刀：
+   - 在 host launch 和 device kernel entry 中把 `Use_full_persistent` 泛化为 `Use_tile_persistent`。
+   - `Use_paired_persistent` 保持为 pure causal 且经过 SASS/benchmark 证明不 spill、不回退的配置；D256 causal+RAB 这类历史 spill/回退风险配置先走 non-paired persistent。
+   - `Use_persistent = Use_tile_persistent || Use_paired_persistent`，host grid 对 non-paired 使用 `min(total_tiles, sm_count)`，paired 使用 `min(total_tile_pairs, sm_count)`。
+   - device load/math 两侧统一走同一 static decode loop；非 persistent 入口只作为临时 fallback，最终如果所有配置通过，再删除或收窄。
+2. 验证第一刀：
+   - 构建启用 D32/D64/D256。
+   - 跑 `hstu_test.py`、`sweep_accuracy.py`、`run_hstu8_examples.sh`。
+   - dump SASS/resource，重点看 D128/D256 的 full/causal/local/context/target/arbitrary × RAB/DRAB × paged/non-paged 代表实例，不能新增 `LDL/STL`。
+   - 锁频全量 benchmark，对比最新 FP8 基线；任何 regression 先 profile 再决定是否局部回退 paired/non-paired 策略。
+3. 文件边界重构：
+   - 把 SM120 host dispatch 从 `hstu_ops_gpu.cpp` 拆到独立 dispatch 文件或 header/impl 组合，保持模板实例化可见性。
+   - 把 BF16 C++ launch helper 与 FP8 WS launch helper 分离，避免 `hstu_fwd_kernel.h` 同时承担所有 dtype 和 scheduler 逻辑。
+   - 每次拆分只做机械移动和 include 调整，单独构建验证。
+4. FP8 WS 内部去重：
+   - 抽 load warp 通用 helper；先处理 K/V 两条最接近的路径，再处理 RAB TMA 和 O-store handoff。
+   - 抽 mbarrier wrapper 和 stage selector，替代重复的 stage0/stage1 if/else。
+   - 精简注释并把长说明移动到函数级短注释；代码中只保留必要 invariant。
+   - 去重后重跑 correctness、SASS、锁频 benchmark，确保 reviewability 改善不牺牲性能。
+
+验收：
+
+- correctness：`hstu_test.py`、`sweep_accuracy.py`、`run_hstu8_examples.sh` 全部通过。
+- SASS：新增 persistent 配置代表实例无新增 local spill；历史已知 D256 RAB 残余 spill 不得恶化。
+- 性能：锁频全量 benchmark 中 no-RAB full/causal 不回退；RAB/DRAB、local/context/target/arbitrary、paged/non-paged 没有系统性 regression。若某配置 persistent 后回退，必须给出 profile 证据和局部策略。
+
+## Phase 35：BF16 C++ 补齐 CuTe DSL 支持面
+
+目标：
+
+- BF16 C++ 路径支持 D32/D64/D128/D256。
+- BF16 C++ 路径支持 `full/causal/local/context/target/arbitrary` × `none/RAB/DRAB`。
+- BF16 paged KV 先与 CuTe DSL 对齐为 wrapper-side dense materialization，再调用现有 C++ BF16 kernel；该阶段不声明原生 paged BF16 kernel。
+- `bench_hstu_attn_sm120_bf16_cutedsl.py` 能对 dense 与 paged-materialized 两种 layout 做 C++ vs DSL 计时，并在输出中明确 wrapper-call 口径。
+
+实施方案：
+
+1. 放开 `hstu_ops_gpu.cpp` 的 BF16 D32 runtime guard 和 dispatch。
+2. 修正 BF16 D32+RAB tile size，避免旧 `{192,128,16}` 触发 `16*kNWarps <= kBlockM` 静态断言。
+3. 让 generator/setup 把 SM120 D32 BF16 instantiation 纳入构建。
+4. 放开 benchmark 与 `hstu_test.py` 中旧的 BF16 unsupported guard。
+5. 在 SM120 BF16 Python wrapper 中为 paged KV materialize dense K/V，然后清空 paged 参数，复用现有 C++ BF16 kernel。
+
+最终结果：
+
+- 构建已通过，启用 `HSTU_DISABLE_HDIM32=FALSE HSTU_DISABLE_HDIM64=FALSE HSTU_DISABLE_HDIM256=FALSE`。
+- Correctness：`1test_results/788_phase35_bf16_cpp_full_hstu_test_after_arbitrary_fix.log`，`1test_results/789_phase35_bf16_cpp_sweep_after_arbitrary_fix.log`，`1test_results/790_phase35_bf16_cpp_hstu8_examples_after_arbitrary_fix.log` / `791`。
+- 性能：`2benchmark_results/646_c36869fd_gpu2407MHz_phase35_bf16_cpp_dsl_dense_paged_all_config.log`。该日志用于确认支持面和 wrapper-call 口径；CuTe DSL kernel-only 是否达到 C++ `95%` 仍属于 Phase 33/后续 DSL kernel-body 优化问题。
 
 ## Phase 34：FP8 WS benchmark-driven 持续优化
 

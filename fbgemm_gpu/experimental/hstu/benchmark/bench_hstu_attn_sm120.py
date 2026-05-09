@@ -114,12 +114,8 @@ def fp8_block_n(headdim: int, has_rab: bool = False) -> int:
 
 def bf16_unsupported_reason(headdim: int, case: BenchCase) -> str:
     """Return why the BF16 baseline is unavailable for this SM120 benchmark case."""
-    if headdim not in (64, 128, 256):
-        return "current SM120 BF16 benchmark supports headDim 64, 128, or 256"
-    if headdim == 256 and case.has_rab:
-        return "current SM120 BF16 baseline does not support hdim256 RAB/DRAB"
-    if headdim == 256 and case.mask == "arbitrary":
-        return "current SM120 BF16 baseline does not support hdim256 arbitrary"
+    if headdim not in (32, 64, 128, 256):
+        return "current SM120 BF16 benchmark supports headDim 32, 64, 128, or 256"
     return ""
 
 

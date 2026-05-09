@@ -60,7 +60,7 @@ using namespace cute;
 // SM120 uses per-warp mma.sync (same model as Ampere).
 // For FP8: MMA shape is M16×N8×K32 (k=32 per step, 2× Ampere BF16's k=16).
 // We use larger tiles to amortize overheads since FP8 halves SMEM usage.
-template <int Headdim, bool Has_rab, bool Is_fp8>
+template <int Headdim, bool Has_rab, bool Is_fp8, bool Is_arbitrary = false>
 constexpr std::tuple<int, int, int> get_tile_size_fwd_sm120() {
   if constexpr (Is_fp8) {
     // FP8 WS path uses a fixed 8-math-warp shape.  Keep BN64 for all head
@@ -88,13 +88,12 @@ constexpr std::tuple<int, int, int> get_tile_size_fwd_sm120() {
   } else {
     // BF16: Same tile sizes as Ampere
     if constexpr (Has_rab) {
-      if constexpr (Headdim == 32) {
-        return {192, 128, 16};
-      } else if constexpr (Headdim <= 64) {
+      if constexpr (Headdim <= 64) {
         return {128, 64, 8};
       } else {
-        // kNWarps=4 required: assert(16 * kNWarps <= kBlockM) → 16*4=64 <= 64 ✓
-        return {64, 64, 4};
+        // D256 + RAB with BN64 needs about 104KB dynamic SMEM
+        // (Q + K/V + RAB), which can exceed the SM120 opt-in limit.
+        return {64, 32, 4};
       }
     } else {
       if constexpr (Headdim <= 64) {
@@ -102,6 +101,9 @@ constexpr std::tuple<int, int, int> get_tile_size_fwd_sm120() {
       } else if constexpr (Headdim == 128) {
         return {128, 128, 8};
       } else {
+        if constexpr (Is_arbitrary) {
+          return {64, 32, 4};
+        }
         return {64, 64, 4};
       }
     }

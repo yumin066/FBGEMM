@@ -245,11 +245,9 @@ void run_hstu_fwd_headdim_sm120(Hstu_fwd_params& params, cudaStream_t stream) {
 #endif
 #ifndef HSTU_DISABLE_HDIM32
   if (params.d == 32) {
-    if constexpr (std::is_same_v<Dtype, cutlass::float_e4m3_t>) {
-      run_hstu_fwd_sm120<Arch, Dtype, 32, Has_rab, Is_local, Is_causal,
-          Is_context, Is_target, Is_arbitrary, kNFunc>(params, stream);
-      return;
-    }
+    run_hstu_fwd_sm120<Arch, Dtype, 32, Has_rab, Is_local, Is_causal,
+        Is_context, Is_target, Is_arbitrary, kNFunc>(params, stream);
+    return;
   }
 #endif
 #ifndef HSTU_DISABLE_HDIM128
@@ -270,7 +268,7 @@ void run_hstu_fwd_headdim_sm120(Hstu_fwd_params& params, cudaStream_t stream) {
       false,
       "Unsupported head dim: ",
       params.d,
-      " (SM120 FP8 supports 32/64/128/256; SM120 BF16 supports 64/128/256)");
+      " (SM120 FP8 and BF16 support 32/64/128/256)");
 }
 
 void run_hstu_fwd_blackwell(Hstu_fwd_params& params, cudaStream_t stream) {
@@ -438,8 +436,10 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_120(
         "SM120 FP8 supports head_size 32, 64, 128, or 256, got ",
         head_size);
   } else {
-    TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256,
-        "SM120 BF16 supports head_size 64, 128, or 256, got ", head_size);
+    TORCH_CHECK(
+        head_size == 32 || head_size == 64 || head_size == 128 || head_size == 256,
+        "SM120 BF16 supports head_size 32, 64, 128, or 256, got ",
+        head_size);
   }
   TORCH_CHECK(q.stride(-1) == 1, "q must have contiguous last dimension");
   TORCH_CHECK(k.stride(-1) == 1, "k must have contiguous last dimension");

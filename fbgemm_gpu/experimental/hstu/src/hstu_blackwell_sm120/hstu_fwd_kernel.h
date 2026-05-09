@@ -1054,7 +1054,8 @@ template <
 void run_hstu_fwd_sm120(Hstu_fwd_params& params, cudaStream_t stream) {
   constexpr bool Is_fp8_type = std::is_same_v<elem_type, cutlass::float_e4m3_t>;
 
-  static constexpr auto tile_size = flash::get_tile_size_fwd_sm120<kHeadDim, Has_rab, Is_fp8_type>();
+  static constexpr auto tile_size =
+      flash::get_tile_size_fwd_sm120<kHeadDim, Has_rab, Is_fp8_type, Is_arbitrary>();
   static constexpr int kBlockM = std::get<0>(tile_size);
   static constexpr int kBlockN = std::get<1>(tile_size);
   static constexpr int kNWarps = std::get<2>(tile_size);

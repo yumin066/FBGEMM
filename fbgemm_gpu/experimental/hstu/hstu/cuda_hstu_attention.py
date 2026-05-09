@@ -218,6 +218,88 @@ def _pad_paged_kv_tail_to_page_layout(
     return out.contiguous(), new_cu, actual_k_tensor
 
 
+def _materialize_paged_kv_cache_to_varlen(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    seqused_q: Optional[torch.Tensor],
+    seqused_k: Optional[torch.Tensor],
+    num_targets: Optional[torch.Tensor],
+    kv_cache: torch.Tensor,
+    page_offsets: torch.Tensor,
+    page_ids: torch.Tensor,
+    last_page_lens: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    q_offsets = _int_list(cu_seqlens_q)
+    k_offsets = _int_list(cu_seqlens_k)
+    actual_q = _actual_varlen_lengths(cu_seqlens_q, seqused_q)
+    actual_k = _actual_varlen_lengths(cu_seqlens_k, seqused_k)
+    targets = (
+        _int_list(num_targets)
+        if num_targets is not None
+        else [0 for _ in actual_k]
+    )
+    page_offsets_h = _int_list(page_offsets)
+    page_ids_h = _int_list(page_ids)
+    last_page_lens_h = _int_list(last_page_lens)
+    page_size = int(kv_cache.shape[2])
+
+    use_k_offsets_for_tail = k_offsets[-1] <= int(k.shape[0])
+    use_q_offsets_for_tail = q_offsets[-1] <= int(k.shape[0])
+    k_full = k.new_zeros((k_offsets[-1], *k.shape[1:]))
+    v_full = v.new_zeros((k_offsets[-1], *v.shape[1:]))
+
+    for b, actual_k_len in enumerate(actual_k):
+        target_len = targets[b]
+        actual_q_len = actual_q[b]
+        if target_len > actual_q_len or target_len > actual_k_len:
+            raise ValueError(
+                f"num_targets[{b}]={target_len} exceeds q/k lengths "
+                f"{actual_q_len}/{actual_k_len}")
+        cache_len = actual_k_len - target_len
+        dst = k_offsets[b]
+        remaining = cache_len
+        page_begin = page_offsets_h[b]
+        page_end = page_offsets_h[b + 1]
+        if page_end <= page_begin and remaining > 0:
+            raise ValueError(f"paged KV metadata has no pages for batch {b}")
+
+        for logical_page in range(page_begin, page_end):
+            if remaining <= 0:
+                break
+            page_id = page_ids_h[logical_page]
+            valid = page_size
+            if logical_page == page_end - 1:
+                valid = last_page_lens_h[b]
+            valid = min(valid, remaining)
+            if valid > 0:
+                k_full[dst : dst + valid].copy_(kv_cache[page_id, 0, :valid])
+                v_full[dst : dst + valid].copy_(kv_cache[page_id, 1, :valid])
+                dst += valid
+                remaining -= valid
+        if remaining != 0:
+            raise ValueError(
+                f"paged KV metadata covers {cache_len - remaining} of "
+                f"{cache_len} cache tokens for batch {b}")
+
+        if target_len > 0:
+            if use_k_offsets_for_tail:
+                src_end = k_offsets[b + 1]
+            elif use_q_offsets_for_tail:
+                src_end = q_offsets[b + 1]
+            else:
+                raise ValueError(
+                    "paged KV target tail is not addressable through K or Q offsets")
+            src_begin = src_end - target_len
+            dst_begin = k_offsets[b] + cache_len
+            dst_end = dst_begin + target_len
+            k_full[dst_begin:dst_end].copy_(k[src_begin:src_end])
+            v_full[dst_begin:dst_end].copy_(v[src_begin:src_end])
+
+    return k_full.contiguous(), v_full.contiguous()
+
+
 def quantize_for_two_directions(x, seq_offsets, fp8_type=torch.float8_e4m3fn):
     B = seq_offsets.size(0) - 1
     fp8_max = 448.0 if fp8_type == torch.float8_e4m3fn else 57344.0
@@ -541,6 +623,32 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
             cu_seqlens_kv_block_descale = None
             cu_seqlens_v_block_descale = None
             sm120_fp8_unpad_q: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+            is_paged_kv = (
+                kv_cache is not None
+                and page_offsets is not None
+                and page_ids is not None
+                and last_page_lens is not None
+            )
+            if (quant_mode is None or quant_mode < 0) and is_paged_kv:
+                if kv_cache.dtype != q.dtype:
+                    raise ValueError("SM120 BF16 paged KV requires kv_cache dtype to match q")
+                k, v = _materialize_paged_kv_cache_to_varlen(
+                    k,
+                    v,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    seqused_q,
+                    seqused_k,
+                    num_targets,
+                    kv_cache,
+                    page_offsets,
+                    page_ids,
+                    last_page_lens,
+                )
+                kv_cache = None
+                page_offsets = None
+                page_ids = None
+                last_page_lens = None
             if quant_mode == 0:
                 # Per-tensor FP8 quantization
                 fp8_max = 448.0
@@ -556,12 +664,6 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
             elif quant_mode == 2:
                 # Blockwise FP8 quantization
                 dim = q.shape[-1]
-                is_paged_kv = (
-                    kv_cache is not None
-                    and page_offsets is not None
-                    and page_ids is not None
-                    and last_page_lens is not None
-                )
                 bm, bn = get_bm_and_bn_block_size_fwd(rab, dim)
                 if is_paged_kv:
                     # Paged SM120 FP8 K/V tiles are page-size aligned.  RAB
