@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-Phase 36 当前目标：先完成 FP8 WS scheduler 统一与代码可 review 性重构。性能方向是让所有 FP8 WS 配置都走 persistent kernel：pure/full 等一般配置使用 non-paired static grid-stride persistent；pure causal 等三角工作量不均衡配置使用 paired persistent。重构方向是把 SM120 dispatch、BF16 C++ launch、FP8 WS launch/implementation 拆到更清晰的文件边界，并把 FP8 WS 中重复的 load warp / mbarrier / TMA stage 逻辑抽成 `__device__ __forceinline__` helper。每一步都必须以 correctness、SASS spill 检查、锁频 benchmark 闭环，不接受为了“统一 persistent”引入性能 regression。
+Phase 36 当前状态：FP8 WS scheduler 第一刀已完成并保留。所有 SM120 FP8 WS 配置都走 persistent kernel；pure causal/部分 paged target 使用 paired persistent，其余 full/local/context/target/arbitrary/RAB/DRAB 使用 non-paired static grid-stride persistent。load/math 分支已共用 `hstu_ws_run_static_schedule` inline helper，避免重复 tile decode；RAB full-persistent 路径保留 tile 间 CTA sync，防止单-stage RAB SMEM 被下一 tile 覆盖。锁频 benchmark `649` 是当前保留性能版本；尝试把 D32/D64/D128 no-RAB context/target 也切到 paired 的 benchmark `650` 因小 `h=4` context/target 明显回退已拒绝并回退。后续目标仍是文件边界重构和 FP8 WS 内部 load warp/mbarrier/TMA helper 去重，但每一步必须单独验证 correctness、SASS 和锁频 benchmark。
 
 Phase 35 已完成：SM120 BF16 CuTe DSL 已支持的配置组合已经补齐到 BF16 CuTe C++ 路径。C++ kernel/dispatch 覆盖 D32/D64/D128/D256 × full/causal/local/context/target/arbitrary × none/RAB/DRAB；BF16 paged KV 与 DSL 保持同一语义，通过 Python wrapper-side dense materialization 后调用现有 C++ BF16 kernel。该阶段不声明原生 paged BF16 kernel。最终 correctness：`1test_results/788_phase35_bf16_cpp_full_hstu_test_after_arbitrary_fix.log` 为 `4 passed`，`1test_results/789_phase35_bf16_cpp_sweep_after_arbitrary_fix.log` 通过，`1test_results/790_phase35_bf16_cpp_hstu8_examples_after_arbitrary_fix.log` / 内部 `791` 为 `300/300 passed`。锁频性能对比：`2benchmark_results/646_c36869fd_gpu2407MHz_phase35_bf16_cpp_dsl_dense_paged_all_config.log` 无 ERROR，CUDA-event wrapper-call geomean DSL/C++ TFLOPS ratio 为 `0.311`；dense-only 仍主要反映 Python/CuTe DSL wrapper 开销，paged 比值包含双方 wrapper-side materialization，不能作为 native paged kernel 结论。
 
@@ -93,6 +93,17 @@ Phase 25 的 SM120 forward headDim256 已完成第一阶段支持。FP8 hdim256 
 - correctness：`hstu_test.py`、`sweep_accuracy.py`、`run_hstu8_examples.sh` 全部通过。
 - SASS：新增 persistent 配置代表实例无新增 local spill；历史已知 D256 RAB 残余 spill 不得恶化。
 - 性能：锁频全量 benchmark 中 no-RAB full/causal 不回退；RAB/DRAB、local/context/target/arbitrary、paged/non-paged 没有系统性 regression。若某配置 persistent 后回退，必须给出 profile 证据和局部策略。
+
+当前执行结果：
+
+- 已完成 scheduler 第一刀：host launch 和 device kernel entry 对所有 FP8 WS 配置统一使用 persistent grid。`Use_paired_persistent` 只保留在 pure causal 及历史已验证的 paged target 形态；其余配置使用 full/non-paired persistent。
+- 已抽取 `hstu_ws_run_static_schedule`，load warp path 和 math warp path 共享同一 tile decode。head-shared RAB 仍使用 head-fast decode；paired 路径继续做首尾 tile 配对。
+- 已验证 RAB full-persistent 不能无条件去掉 tile 间 CTA sync：无 sync 版本在 `hstu_test.py` 的 irregular target+RAB case 出现数值偏差。当前保留 `Use_full_persistent && Has_rab` 的 tile 间 sync。
+- correctness：`1test_results/831_phase36_fp8_ws_final_predicate_hstu_test.log` 为 `4 passed`；`1test_results/832_phase36_fp8_ws_final_predicate_sweep.log` 通过；`1test_results/833_phase36_fp8_ws_final_predicate_examples.log` / 内部 `834` 为 `300/300 passed`。
+- 性能：保留锁频全量 kernel-only benchmark `2benchmark_results/649_f8b71818_gpu2407MHz_phase36_fp8_ws_rab_tile_sync_kernel.log`。相对 `596` 的 common FP8 geomean：non-paged `+10.52%`，paged `+17.79%`；主要收益来自 RAB/DRAB 和 long-seq，no-bias 仍有少量回退，需要继续逐 case profile。
+- Rejected：`2benchmark_results/650_f8b71818_gpu2407MHz_phase36_fp8_ws_pair_d128_norab_kernel.log` 把 D32/D64/D128 no-RAB context/target 也切到 paired 后，相对 `649` non-paged FP8 geomean `-0.98%`，no-bias `-2.28%`，小 `h=4` context/target 最差约 `-45%`，因此不保留。
+- 残余风险：D256 no-RAB full-persistent 仍观察到少量 spill（此前代表 SASS 为 `STACK:8`、1 对 `LDL/STL`）；它不是 D128 paired 实验引入，但后续要继续处理。
+- 尚未完成：大规模文件拆分、load warp/RAB/O-store helper 深抽取和注释清理只完成了 scheduler 层第一步。下一步要按小 patch 机械拆分，避免一次性改动造成难以 review 或性能归因困难。
 
 ## Phase 35：BF16 C++ 补齐 CuTe DSL 支持面
 

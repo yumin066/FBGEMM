@@ -941,25 +941,21 @@ void run_hstu_fwd_sm120_fp8_ws_tma_impl(Hstu_fwd_params& params, cudaStream_t st
   const int num_m_block = (params.seqlen_q + kBlockM - 1) / kBlockM;
   const int total_tiles = num_m_block * params.h * params.b;
   const int total_tile_pairs = (total_tiles + 1) / 2;
-  static constexpr bool Use_full_persistent =
-      !Is_causal && !Is_target && !Is_context && !Is_local && !Is_arbitrary;
   static constexpr bool Use_paired_persistent =
-      Is_causal && !Is_context && !Is_local && !Is_arbitrary &&
+      Is_causal &&
+      !Is_context &&
+      !Is_local &&
+      !Is_arbitrary &&
       (!Is_target || Paged_KV) &&
       (kHeadDim <= 128 || (Paged_KV && !Has_rab));
-  static constexpr bool Use_persistent = Use_full_persistent || Use_paired_persistent;
+  static constexpr bool Use_full_persistent = !Use_paired_persistent;
+  static_assert(Use_full_persistent || Use_paired_persistent);
   const int persistent_work_units = Use_paired_persistent ? total_tile_pairs : total_tiles;
+  int device = 0;
   int sm_count = 0;
-  if constexpr (Use_persistent) {
-    int device = 0;
-    C10_CUDA_CHECK(cudaGetDevice(&device));
-    C10_CUDA_CHECK(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
-  }
-  dim3 grid = Use_persistent
-      ? dim3(std::min(persistent_work_units, sm_count))
-      : (Has_rab && params.h_rab == 1 && params.h > 1
-          ? dim3(params.h, num_m_block, params.b)
-          : dim3(num_m_block, params.h, params.b));
+  C10_CUDA_CHECK(cudaGetDevice(&device));
+  C10_CUDA_CHECK(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
+  dim3 grid(std::min(persistent_work_units, sm_count));
 
   auto launch_tma_kernel = [&](auto& tma_params) {
     using TmaParamsT = std::decay_t<decltype(tma_params)>;

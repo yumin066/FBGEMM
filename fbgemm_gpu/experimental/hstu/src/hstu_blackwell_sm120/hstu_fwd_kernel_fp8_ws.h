@@ -16,8 +16,8 @@
 //
 // CTA-level __syncthreads__ map (must match between branches):
 //   S_arb : Is_arbitrary only — math warp 1 writes sValidBlockIds; load warp just syncs
-//   S1    : after load warp inits producer/consumer mbarriers + fence; persistent full/causal does this
-//           once before the static scheduler loop, non-persistent paths keep the per-tile S1
+//   S1    : after load warp inits producer/consumer mbarriers + fence; persistent paths do this
+//           once before the static scheduler loop
 //   S2→   : replaced by wait_mbar_parity(q_ready_mbar_ptr, parity) for all 256 math threads
 //   S3    : removed (was a no-op rendezvous with no real data dependency)
 //   S5    : partial-tile-only math bar.sync; full O-store handoff uses o_ready/o_empty.
@@ -157,6 +157,48 @@ __device__ __forceinline__ HstuWsTileCoord hstu_ws_decode_tile(
         bh / num_heads,
         bh % num_heads,
         num_m_block - 1 - m_linear};
+  }
+}
+
+template <
+    bool Use_full_persistent,
+    bool Use_paired_persistent,
+    bool Sync_between_tiles,
+    typename TileFn>
+__device__ __forceinline__ void hstu_ws_run_static_schedule(
+    const int num_m_block,
+    const int num_heads,
+    const int num_batches,
+    const bool head_shared_rab,
+    TileFn const& run_tile) {
+  const int total_tiles = num_m_block * num_heads * num_batches;
+  static_assert(
+      Use_full_persistent || Use_paired_persistent,
+      "FP8 WS static scheduler requires a persistent mode");
+
+  if constexpr (Use_paired_persistent) {
+    const int total_tile_pairs = (total_tiles + 1) / 2;
+    #pragma unroll 1
+    for (int tile_pair = int(blockIdx.x); tile_pair < total_tile_pairs; tile_pair += int(gridDim.x)) {
+      const int paired_tile = total_tiles - 1 - tile_pair;
+      const int tiles_this_pair = paired_tile == tile_pair ? 1 : 2;
+
+      #pragma unroll 1
+      for (int pair_slot = 0; pair_slot < tiles_this_pair; ++pair_slot) {
+        const int tile = pair_slot == 0 ? tile_pair : paired_tile;
+        run_tile(hstu_ws_decode_tile(tile, num_m_block, num_heads, head_shared_rab));
+      }
+    }
+  } else if constexpr (Use_full_persistent) {
+    #pragma unroll 1
+    for (int tile = int(blockIdx.x); tile < total_tiles; tile += int(gridDim.x)) {
+      run_tile(hstu_ws_decode_tile(tile, num_m_block, num_heads, head_shared_rab));
+      if constexpr (Sync_between_tiles) {
+        if (tile + int(gridDim.x) < total_tiles) {
+          __syncthreads();
+        }
+      }
+    }
   }
 }
 
@@ -964,71 +1006,51 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
 
       if (is_o_store_warp) {
         if constexpr (Kernel_traits::kUseIndependentOBuffer) {
-        // Math warps own compute/softmax and write O to independent SMEM; O-store waits
-        // for o_ready[0], then releases o_empty[0] after the TMA store completes.
-        wait_mbar_parity(o_ready_mbar_ptr0, (uint32_t)o_ready_wait_parity0);
-        o_ready_wait_parity0 ^= 1;
-        if (tidx == kNMathThreads + 96) {
-          asm volatile("fence.proxy.async.shared::cta;\n" : : : "memory");
-          static_assert(
-              Kernel_traits::kSmemWsOBytes >= kBlockM * kHeadDim * (int)sizeof(OutElement),
-              "Independent O SMEM buffer is too small.");
-          char* smem_o = reinterpret_cast<char*>(smem_) + Kernel_traits::kSmemWsOOffset;
-          using SmemLayoutO_TMA_t = cute::Layout<
-              cute::Shape<cute::Int<kBlockM>, cute::Int<kHeadDim>>,
-              cute::Stride<cute::Int<kHeadDim>, cute::_1>>;
-          Tensor sO_tma = make_tensor(
-              make_smem_ptr(reinterpret_cast<OutElement*>(smem_o)),
-              SmemLayoutO_TMA_t{});
-          auto mO_tma   = params.tma_o.get_tma_tensor(make_shape(params.total_q, params.d, params.h));
-          auto gO_head  = mO_tma(_, _, bidh);
-          auto gO_tiles = local_tile(gO_head, Shape<Int<kBlockM>, Int<kHeadDim>>{}, make_coord(_, _));
-          const int m_abs = binfo.sum_s_q / kBlockM + m_block;
-          auto tma_slice_O = params.tma_o.get_slice(0);
-          Tensor tOsO     = tma_slice_O.partition_S(sO_tma);
-          Tensor tOgO_all = tma_slice_O.partition_D(gO_tiles(_, _, _, Int<0>{}));
-          cute::copy(params.tma_o, tOsO, tOgO_all(_, _, _, m_abs));
-          cute::tma_store_arrive();
-          cute::tma_store_wait<0>();
-          arrive_mbar(o_empty_mbar_ptr0);
-        }
+          // Math writes O to SMEM; this warp waits on o_ready and performs TMA store.
+          wait_mbar_parity(o_ready_mbar_ptr0, (uint32_t)o_ready_wait_parity0);
+          o_ready_wait_parity0 ^= 1;
+          if (tidx == kNMathThreads + 96) {
+            asm volatile("fence.proxy.async.shared::cta;\n" : : : "memory");
+            static_assert(
+                Kernel_traits::kSmemWsOBytes >= kBlockM * kHeadDim * (int)sizeof(OutElement),
+                "Independent O SMEM buffer is too small.");
+            char* smem_o = reinterpret_cast<char*>(smem_) + Kernel_traits::kSmemWsOOffset;
+            using SmemLayoutO_TMA_t = cute::Layout<
+                cute::Shape<cute::Int<kBlockM>, cute::Int<kHeadDim>>,
+                cute::Stride<cute::Int<kHeadDim>, cute::_1>>;
+            Tensor sO_tma = make_tensor(
+                make_smem_ptr(reinterpret_cast<OutElement*>(smem_o)),
+                SmemLayoutO_TMA_t{});
+            auto mO_tma   = params.tma_o.get_tma_tensor(make_shape(params.total_q, params.d, params.h));
+            auto gO_head  = mO_tma(_, _, bidh);
+            auto gO_tiles = local_tile(gO_head, Shape<Int<kBlockM>, Int<kHeadDim>>{}, make_coord(_, _));
+            const int m_abs = binfo.sum_s_q / kBlockM + m_block;
+            auto tma_slice_O = params.tma_o.get_slice(0);
+            Tensor tOsO     = tma_slice_O.partition_S(sO_tma);
+            Tensor tOgO_all = tma_slice_O.partition_D(gO_tiles(_, _, _, Int<0>{}));
+            cute::copy(params.tma_o, tOsO, tOgO_all(_, _, _, m_abs));
+            cute::tma_store_arrive();
+            cute::tma_store_wait<0>();
+            arrive_mbar(o_empty_mbar_ptr0);
+          }
         }
       }
     };
 
-    // Static tile-id broadcast: load and math paths run the same deterministic
-    // scheduler and decode the same tile ids locally.  There is no dynamic work
-    // queue, atomic counter, or shared tile-id sync on this path.
+    // Load and math branches run the same static scheduler; no dynamic tile queue.
+    constexpr bool kSyncBetweenTiles = Use_full_persistent && Has_rab;
     const bool head_shared_rab = Has_rab && params.h_rab == 1 && params.h > 1;
-    if constexpr (Use_paired_persistent) {
-      const int num_m_block_persistent = (params.seqlen_q + kBlockM - 1) / kBlockM;
-      const int total_tiles_persistent = num_m_block_persistent * params.h * params.b;
-      const int total_tile_pairs_persistent = (total_tiles_persistent + 1) / 2;
-      #pragma unroll 1
-      for (int tile_pair = int(blockIdx.x); tile_pair < total_tile_pairs_persistent; tile_pair += int(gridDim.x)) {
-        const int paired_tile = total_tiles_persistent - 1 - tile_pair;
-        const int tiles_this_pair = paired_tile == tile_pair ? 1 : 2;
-
-        #pragma unroll 1
-        for (int pair_slot = 0; pair_slot < tiles_this_pair; ++pair_slot) {
-          const int tile = pair_slot == 0 ? tile_pair : paired_tile;
-          const HstuWsTileCoord coord =
-              hstu_ws_decode_tile(tile, num_m_block_persistent, params.h, head_shared_rab);
+    hstu_ws_run_static_schedule<
+        Use_full_persistent,
+        Use_paired_persistent,
+        kSyncBetweenTiles>(
+        (params.seqlen_q + kBlockM - 1) / kBlockM,
+        params.h,
+        params.b,
+        head_shared_rab,
+        [&](HstuWsTileCoord const& coord) {
           run_load_tile(coord.bidb, coord.bidh, coord.m_block);
-        }
-      }
-    } else if constexpr (Use_full_persistent) {
-      const int num_m_block_persistent = (params.seqlen_q + kBlockM - 1) / kBlockM;
-      const int total_tiles_persistent = num_m_block_persistent * params.h * params.b;
-      #pragma unroll 1
-      for (int tile = int(blockIdx.x); tile < total_tiles_persistent; tile += int(gridDim.x)) {
-        const HstuWsTileCoord coord =
-            hstu_ws_decode_tile(tile, num_m_block_persistent, params.h, head_shared_rab);
-        run_load_tile(coord.bidb, coord.bidh, coord.m_block);
-      }
-    } else {
-      run_load_tile(bidb_arg, bidh_arg, m_block_arg);
-    }
+        });
     // Load warp path exits here.  Active load warp has also completed O TMA-store.
 
   // ============================================================
@@ -2420,37 +2442,20 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       }
     };
 
-    // Static tile-id broadcast mirrors the load path exactly.
+    // Same scheduler as the load branch.
+    constexpr bool kSyncBetweenTiles = Use_full_persistent && Has_rab;
     const bool head_shared_rab = Has_rab && params.h_rab == 1 && params.h > 1;
-    if constexpr (Use_paired_persistent) {
-      const int num_m_block_persistent = (params.seqlen_q + kBlockM - 1) / kBlockM;
-      const int total_tiles_persistent = num_m_block_persistent * params.h * params.b;
-      const int total_tile_pairs_persistent = (total_tiles_persistent + 1) / 2;
-      #pragma unroll 1
-      for (int tile_pair = int(blockIdx.x); tile_pair < total_tile_pairs_persistent; tile_pair += int(gridDim.x)) {
-        const int paired_tile = total_tiles_persistent - 1 - tile_pair;
-        const int tiles_this_pair = paired_tile == tile_pair ? 1 : 2;
-
-        #pragma unroll 1
-        for (int pair_slot = 0; pair_slot < tiles_this_pair; ++pair_slot) {
-          const int tile = pair_slot == 0 ? tile_pair : paired_tile;
-          const HstuWsTileCoord coord =
-              hstu_ws_decode_tile(tile, num_m_block_persistent, params.h, head_shared_rab);
+    hstu_ws_run_static_schedule<
+        Use_full_persistent,
+        Use_paired_persistent,
+        kSyncBetweenTiles>(
+        (params.seqlen_q + kBlockM - 1) / kBlockM,
+        params.h,
+        params.b,
+        head_shared_rab,
+        [&](HstuWsTileCoord const& coord) {
           run_math_tile(coord.bidb, coord.bidh, coord.m_block);
-        }
-      }
-    } else if constexpr (Use_full_persistent) {
-      const int num_m_block_persistent = (params.seqlen_q + kBlockM - 1) / kBlockM;
-      const int total_tiles_persistent = num_m_block_persistent * params.h * params.b;
-      #pragma unroll 1
-      for (int tile = int(blockIdx.x); tile < total_tiles_persistent; tile += int(gridDim.x)) {
-        const HstuWsTileCoord coord =
-            hstu_ws_decode_tile(tile, num_m_block_persistent, params.h, head_shared_rab);
-        run_math_tile(coord.bidb, coord.bidh, coord.m_block);
-      }
-    } else {
-      run_math_tile(bidb_arg, bidh_arg, m_block_arg);
-    }
+        });
   }
 }
 
@@ -2462,41 +2467,16 @@ template <typename Kernel_traits, typename Params>
 __global__ void __launch_bounds__(Kernel_traits::kNThreads, 1)
 hstu_fwd_kernel_sm120_fp8_ws_tma(
     __grid_constant__ Params const params) {
-  constexpr int kBlockM = Kernel_traits::kBlockM;
-  constexpr bool Use_full_persistent =
-      !Kernel_traits::Is_causal &&
-      !Kernel_traits::Is_target &&
-      !Kernel_traits::Is_context &&
-      !Kernel_traits::Is_local &&
-      !Kernel_traits::Is_arbitrary;
   constexpr bool Use_paired_persistent =
       Kernel_traits::Is_causal &&
       !Kernel_traits::Is_context &&
       !Kernel_traits::Is_local &&
       !Kernel_traits::Is_arbitrary &&
       (!Kernel_traits::Is_target || Kernel_traits::Paged_KV) &&
-      (Kernel_traits::kHeadDim <= 128 || (Kernel_traits::Paged_KV && !Kernel_traits::Has_rab));
-  constexpr bool Use_persistent = Use_full_persistent || Use_paired_persistent;
-
-  if constexpr (!Use_persistent) {
-    int m_block;
-    int bidh;
-    int bidb = blockIdx.z;
-    if constexpr (Kernel_traits::Has_rab) {
-      if (params.h_rab == 1 && params.h > 1) {
-        m_block = gridDim.y - blockIdx.y - 1;
-        bidh    = blockIdx.x;
-      } else {
-        m_block = gridDim.x - blockIdx.x - 1;
-        bidh    = blockIdx.y;
-      }
-    } else {
-      m_block = gridDim.x - blockIdx.x - 1;
-      bidh    = blockIdx.y;
-    }
-    hstu_compute_attn_1rowblock_sm120_fp8_ws<Kernel_traits>(params, bidb, bidh, m_block);
-    return;
-  }
+      (Kernel_traits::kHeadDim <= 128 ||
+       (Kernel_traits::Paged_KV && !Kernel_traits::Has_rab));
+  constexpr bool Use_full_persistent = !Use_paired_persistent;
+  static_assert(Use_full_persistent || Use_paired_persistent);
 
   hstu_compute_attn_1rowblock_sm120_fp8_ws<
       Kernel_traits,
