@@ -305,7 +305,9 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
   //   warp 11 (tidx 352-383): O store
   // ============================================================
   if (is_load_warp) {
-    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" : : "n"(56));
+    static constexpr int kLoadWarpRegBudget =
+        Kernel_traits::kHeadDim > 128 ? 40 : 56;
+    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" : : "n"(kLoadWarpRegBudget));
     // Four load warps are role-specialized:
     //   warp 8  : Q + SFA TMA load
     //   warp 9  : K + SFB TMA load
@@ -1057,7 +1059,9 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
   } else {
   // MATH WARP PATH  (warps 0-7, threads 0-255)
   // ============================================================
-    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" : : "n"(224));
+    static constexpr int kMathWarpRegBudget =
+        Kernel_traits::kHeadDim > 128 ? 232 : 224;
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" : : "n"(kMathWarpRegBudget));
 
     constexpr bool Is_causal    = Kernel_traits::Is_causal;
     constexpr bool Is_target    = Kernel_traits::Is_target;
