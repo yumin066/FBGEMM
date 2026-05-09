@@ -151,9 +151,9 @@ struct Hstu_fwd_params : public Hstu_params {
   // 1 -> use sK as P-roundtrip SMEM buffer (A/B path)
   int exp_b_pbuf_in_sk = 0;
 
-  // Debug switch: when true, both BF16 and FP8 paths bypass GEMM2 and
-  // instead accumulate raw GEMM1 outputs (Q×K^T tiles) into acc_o.
-  // Set HSTU_DEBUG_GEMM1_ONLY=1 to enable.  Useful to isolate GEMM1 bugs.
+  // BF16 debug switch: when true, bypass GEMM2 and instead accumulate raw
+  // GEMM1 outputs (Q×K^T tiles) into acc_o. FP8 WS no longer uses this path.
+  // Set HSTU_DEBUG_GEMM1_ONLY=1 to enable. Useful to isolate GEMM1 bugs.
   bool debug_gemm1_only = false;
 
 };

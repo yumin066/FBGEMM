@@ -12,5 +12,5 @@
 
 #pragma once
 
-#include "hstu_fwd_kernel.h"
+#include "hstu_fwd_kernel_launch.h"
 #include "static_switch.h"

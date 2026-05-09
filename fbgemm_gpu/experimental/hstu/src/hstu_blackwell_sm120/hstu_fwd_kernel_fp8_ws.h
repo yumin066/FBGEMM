@@ -1,26 +1,13 @@
-// Phase 6 warp-specialized FP8 kernel body — Q, K, and V^T via TMA.
-// Included inside namespace flash from hstu_fwd_kernel.h.
-// Do not include directly; use hstu_fwd_kernel.h.
+// Warp-specialized SM120 FP8 forward kernel body.
+// Included inside namespace flash from hstu_fwd_kernel_launch.h.
 //
-// Warp layout (12 warps = 3 complete warpgroups, kNThreads=384):
-//   WG0: warps 0-3  (math)
-//   WG1: warps 4-7  (math)
-//   WG2: warps 8-11 (load warpgroup)
-//     warp 8  = Q/SFA TMA load
-//     warp 9  = K/SFB TMA load
-//     warp 10 = V/SFV TMA load
-//     warp 11 = O TMA store
-// Complete WG2 ensures setmaxnreg TRY_ALLOC WARPSYNC.ALL retry loop works correctly.
-// With __launch_bounds__(384,1): compiler budget = 65536/384 ≈ 168 regs → TRY_ALLOC(inc) succeeds
-// on first attempt (already at budget), no retry needed.
+// Warps 0-7 are math warps. Warps 8-11 are specialized load/store warps:
+// Q/SFA load, K/SFB/RAB load, V/SFV load, and O TMA store.
 //
-// CTA-level __syncthreads__ map (must match between branches):
-//   S_arb : Is_arbitrary only — math warp 1 writes sValidBlockIds; load warp just syncs
-//   S1    : after load warp inits producer/consumer mbarriers + fence; persistent paths do this
-//           once before the static scheduler loop
-//   S2→   : replaced by wait_mbar_parity(q_ready_mbar_ptr, parity) for all 256 math threads
-//   S3    : removed (was a no-op rendezvous with no real data dependency)
-//   S5    : partial-tile-only math bar.sync; full O-store handoff uses o_ready/o_empty.
+// CTA syncs are intentionally sparse:
+//   S_arb: arbitrary valid-block handoff.
+//   S1   : one-time mbarrier initialization before the persistent scheduler.
+//   S5   : partial-O rows only; normal Q/K/V/O handoff uses mbarriers.
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -63,6 +50,85 @@ __device__ inline void wait_mbar_parity(uint32_t maddr, uint32_t parity) {
 
 __device__ inline void wait_mbar_parity(uint64_t* mbar, uint32_t parity) {
   wait_mbar_parity(mbar_smem_addr(mbar), parity);
+}
+
+__device__ __forceinline__ uint64_t* hstu_ws_stage_mbar(
+    uint64_t* stage0,
+    uint64_t* stage1,
+    int stage) {
+  return stage ? stage1 : stage0;
+}
+
+__device__ __forceinline__ void hstu_ws_wait_empty_stage(
+    uint64_t* empty0,
+    uint64_t* empty1,
+    int& parity0,
+    int& parity1,
+    int stage) {
+  uint64_t* mbar = hstu_ws_stage_mbar(empty0, empty1, stage);
+  int& parity = stage ? parity1 : parity0;
+  wait_mbar_parity(mbar, static_cast<uint32_t>(parity));
+  parity ^= 1;
+}
+
+template <bool UseSingleKVStage>
+__device__ __forceinline__ void hstu_ws_advance_kv_stage(int& stage) {
+  if constexpr (!UseSingleKVStage) {
+    stage ^= 1;
+  }
+}
+
+template <int kHeadDim, typename OutElement, typename TensorO>
+__device__ __forceinline__ void hstu_ws_store_o_stmatrix(
+    char* smem_o,
+    TensorO& rO,
+    int tidx_math) {
+  static_assert(sizeof(OutElement) == 2, "stmatrix.m8n8.b16 requires 2-byte elements");
+
+  auto rO_u32 = recast<uint32_t>(rO);
+  const int lane        = tidx_math & 31;
+  const int lq          = lane >> 2;
+  const int lqt         = lane & 3;
+  const int warp_m      = tidx_math >> 5;
+  const int addr_row    = ((lq & 1) << 2) | lqt;
+  const int mat_in_lane = lq >> 1;
+
+  const uint32_t smem_base = static_cast<uint32_t>(__cvta_generic_to_shared(smem_o));
+  constexpr uint32_t row_bytes = kHeadDim * (uint32_t)sizeof(OutElement);
+
+  CUTE_UNROLL
+  for (int m_grp = 0; m_grp < 2; ++m_grp) {
+    const uint32_t m_bytes =
+        (uint32_t)(warp_m * 16 + m_grp * 8 + addr_row) * row_bytes;
+
+    CUTE_UNROLL
+    for (int n_grp = 0; n_grp < 4; ++n_grp) {
+      const uint32_t stsm_addr = smem_base
+          + m_bytes
+          + (uint32_t)(n_grp * 32 + mat_in_lane * 8) * (uint32_t)sizeof(OutElement);
+
+      const uint32_t rb0 = rO_u32[2 * (n_grp     ) + m_grp];
+      const uint32_t rb1 = rO_u32[2 * (n_grp +  4) + m_grp];
+      const uint32_t rb2 = rO_u32[2 * (n_grp +  8) + m_grp];
+      const uint32_t rb3 = rO_u32[2 * (n_grp + 12) + m_grp];
+
+      asm volatile(
+          "stmatrix.sync.aligned.x4.m8n8.shared.b16 [%0], {%1, %2, %3, %4};\n"
+          : : "r"(stsm_addr), "r"(rb0), "r"(rb1), "r"(rb2), "r"(rb3) : "memory");
+    }
+  }
+}
+
+template <int kBlockM, int kHeadDim, int kNMathThreads, typename OutElement>
+__device__ __forceinline__ void hstu_ws_zero_oob_o_rows(
+    char* smem_o,
+    int valid_rows,
+    int tidx_math) {
+  const int oob_elems = (kBlockM - valid_rows) * kHeadDim;
+  OutElement* sO_raw = reinterpret_cast<OutElement*>(smem_o) + valid_rows * kHeadDim;
+  for (int i = tidx_math; i < oob_elems; i += kNMathThreads) {
+    sO_raw[i] = OutElement(0);
+  }
 }
 
 __device__ __forceinline__ void cp_async_cg_16B(
@@ -187,6 +253,14 @@ __device__ __forceinline__ void hstu_ws_run_static_schedule(
       for (int pair_slot = 0; pair_slot < tiles_this_pair; ++pair_slot) {
         const int tile = pair_slot == 0 ? tile_pair : paired_tile;
         run_tile(hstu_ws_decode_tile(tile, num_m_block, num_heads, head_shared_rab));
+        if constexpr (Sync_between_tiles) {
+          const bool has_more_pair_slots = pair_slot + 1 < tiles_this_pair;
+          const bool has_more_grid_stride_pairs =
+              tile_pair + int(gridDim.x) < total_tile_pairs;
+          if (has_more_pair_slots || has_more_grid_stride_pairs) {
+            __syncthreads();
+          }
+        }
       }
     }
   } else if constexpr (Use_full_persistent) {
@@ -202,31 +276,9 @@ __device__ __forceinline__ void hstu_ws_run_static_schedule(
   }
 }
 
-// Rearrange GEMM1 C-fragment (acc_s_packed[16]) to GEMM2 A-fragment (tCrP[16]) layout
-// using warp shuffle only — no SMEM staging, no bar.sync required.
-//
-// With AtomLayout <_8,_1,_1> (1 N-warp), each warp holds all 128 N-values of P in its
-// own registers after GEMM1. No cross-warp communication is needed: the entire D→A
-// rearrangement is intra-warp, performed by SHFL.IDX within each 4-thread quad.
-//
-// QMMA.SF.16832 coordinate mappings (SPA ISA):
-//   C-fragment: acc_s_packed[nr] = N-atom nr, bytes {mr=0,i=0},{mr=0,i=1},{mr=1,i=0},{mr=1,i=1}
-//     where N_base(nr) = (nr%4)*32 + (nr/4)*8  (from PermMmaTileN strides (1,32,8))
-//     and   col = N_base(nr) + (lane&3)*2 + i
-//   A-fragment: tCrP[4*kb + 2*c + mr] at row=8*mr+(lane>>2), col=32*kb+16*c+(lane&3)*4+{0..3}
-//
-// For each (kb,c), the 4 K-values needed by one thread span two consecutive C-fragment
-// atoms: atom_lo covers col[0..1] (from src_lane0) and atom_hi covers col[2..3] (from src_lane1).
-//   src_lane0 = (lane & ~3u) | ((lane&1u) << 1)  — lower pair of the quad
-//   src_lane1 = src_lane0 + 1                     — upper pair of the quad
-// kAtomLut[kb][c][h]: C-fragment atom index for K-half h (h = (lane&3)>>1).
-//   kAtomLut[kb][c][h] = kb + 4*(2*c + h)
-// Byte assembly:
-//   mr=0 (row=quad):   __byte_perm(a, b, 0x5410) = {a.b0,a.b1,b.b0,b.b1}
-//   mr=1 (row=8+quad): __byte_perm(a, b, 0x7632) = {a.b2,a.b3,b.b2,b.b3}
-//
-// Cost: 4 kb × 2 c × 4 SHFL + 2 __byte_perm = 32 SHFL + 16 BYTE_PERM per thread.
-// Savings: eliminates 2 × bar.sync (256-thread) + 16KB SMEM write + LDSM load-back.
+// Rearrange GEMM1 C-fragment to GEMM2 A-fragment in registers.
+// AtomLayout <8,1,1> keeps each warp's N-values local, so this is intra-warp
+// shuffle/byte-permute only and avoids SMEM staging plus two CTA barriers.
 __device__ __forceinline__ void permute_acc_s_packed_to_tCrP(
     uint32_t* __restrict__ tCrP,
     const uint32_t* __restrict__ acc_s_packed) {
@@ -263,20 +315,19 @@ __device__ __forceinline__ void permute_acc_s_packed_to_tCrP(
 
 template <
     typename Kernel_traits,
-    bool Use_full_persistent = false,
-    bool Use_paired_persistent = false,
+    bool Use_full_persistent,
+    bool Use_paired_persistent,
     typename Params>
 inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
-    const Params& params,
-    const int bidb_arg,
-    const int bidh_arg,
-    int m_block_arg) {
+    const Params& params) {
 
   static_assert(Kernel_traits::Is_fp8, "Phase 6 WS: FP8 path only");
   static_assert(
       !(Use_full_persistent && Use_paired_persistent),
       "Only one FP8 WS persistent scheduler can be enabled");
-  constexpr bool Use_persistent = Use_full_persistent || Use_paired_persistent;
+  static_assert(
+      Use_full_persistent || Use_paired_persistent,
+      "FP8 WS now always uses a persistent scheduler");
 
   using BS1 = hstu::SM120QmmaBuilder<
       Kernel_traits::kBlockM, Kernel_traits::kBlockN, 4>;
@@ -411,10 +462,8 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     int o_ready_wait_parity0 = 0;
     int rab_empty_wait_parity0 = 0;
     int kv_load_stage = 0;
-    if constexpr (Use_persistent) {
-      init_ws_mbarriers();
-      __syncthreads();  // One-time S1 for persistent: WS mbarriers initialized before scheduler loop.
-    }
+    init_ws_mbarriers();
+    __syncthreads();  // One-time S1: WS mbarriers initialized before scheduler loop.
 
     auto run_load_tile = [&](const int bidb, const int bidh, int m_block) {
       const HstuBlockInfo<Kernel_traits, Params> binfo(params, bidb);
@@ -486,12 +535,8 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         n_block_min = 0;
       }
 
-      // Early exit 2 (after Is_arbitrary): non-persistent paths still consume the per-tile S1.
       if (((Is_causal || Is_local || Is_arbitrary) && n_block_max <= n_block_min) ||
           m_block * kBlockM >= actual_seqlen_q) {
-        if constexpr (!Use_persistent) {
-          __syncthreads();  // S1
-        }
         return;
       }
 
@@ -530,11 +575,6 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
           smem_sfa_ptr + 2 * kBlockM + 2 * kBlockN,
           smem_sfa_ptr + 2 * kBlockM + 3 * kBlockN
       };
-
-      if constexpr (!Use_persistent) {
-        init_ws_mbarriers();
-        __syncthreads();  // S1: WS mbarriers visible to all warps.
-      }
 
       // TMA tensor setup for K, V^T, SFB, SFV (load warps only).
       const int bidh_kv = bidh / params.h_h_k_ratio;
@@ -796,31 +836,30 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
                ++masking_step_load, --n_valid) {
             const int nb = Is_arbitrary ? int(sValidBlockIds[n_valid]) : n_valid;
 
-            uint64_t* k_empty_mbar_ptr = kv_load_stage ? k_empty_mbar_ptr1 : k_empty_mbar_ptr0;
-            int& k_empty_wait_parity = kv_load_stage ? k_empty_wait_parity1 : k_empty_wait_parity0;
-            wait_mbar_parity(k_empty_mbar_ptr, (uint32_t)k_empty_wait_parity);
-            k_empty_wait_parity ^= 1;
+            hstu_ws_wait_empty_stage(
+                k_empty_mbar_ptr0, k_empty_mbar_ptr1,
+                k_empty_wait_parity0, k_empty_wait_parity1,
+                kv_load_stage);
 
             load_paged_tma_or_target_k(
-                nb, kv_load_stage, kv_load_stage ? k_ready_mbar_ptr1 : k_ready_mbar_ptr0);
+                nb, kv_load_stage,
+                hstu_ws_stage_mbar(k_ready_mbar_ptr0, k_ready_mbar_ptr1, kv_load_stage));
             load_rab_tma(nb);
 
             if (is_jump && masking_step_load == n_masking_steps - 1)
               n_valid = std::min(n_valid, n_block_history);
 
-            if constexpr (!Kernel_traits::kUseSingleKVStage) {
-              kv_load_stage ^= 1;
-            }
+            hstu_ws_advance_kv_stage<Kernel_traits::kUseSingleKVStage>(kv_load_stage);
           }
         } else {
           for (int n_valid = n_block_max - 1, masking_step_load = 0; n_valid >= n_block_min;
                ++masking_step_load, --n_valid) {
             const int nb = Is_arbitrary ? int(sValidBlockIds[n_valid]) : n_valid;
 
-            uint64_t* k_empty_mbar_ptr = kv_load_stage ? k_empty_mbar_ptr1 : k_empty_mbar_ptr0;
-            int& k_empty_wait_parity = kv_load_stage ? k_empty_wait_parity1 : k_empty_wait_parity0;
-            wait_mbar_parity(k_empty_mbar_ptr, (uint32_t)k_empty_wait_parity);
-            k_empty_wait_parity ^= 1;
+            hstu_ws_wait_empty_stage(
+                k_empty_mbar_ptr0, k_empty_mbar_ptr1,
+                k_empty_wait_parity0, k_empty_wait_parity1,
+                kv_load_stage);
 
             if (tidx == kNMathThreads + 32) {
               const int nb_abs = binfo.sum_s_k / kBlockN + nb;
@@ -839,9 +878,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
             if (is_jump && masking_step_load == n_masking_steps - 1)
               n_valid = std::min(n_valid, n_block_history);
 
-            if constexpr (!Kernel_traits::kUseSingleKVStage) {
-              kv_load_stage ^= 1;
-            }
+            hstu_ws_advance_kv_stage<Kernel_traits::kUseSingleKVStage>(kv_load_stage);
           }
         }
       }
@@ -958,30 +995,29 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
                ++masking_step_load, --n_valid) {
             const int nb = Is_arbitrary ? int(sValidBlockIds[n_valid]) : n_valid;
 
-            uint64_t* v_empty_mbar_ptr = kv_load_stage ? v_empty_mbar_ptr1 : v_empty_mbar_ptr0;
-            int& v_empty_wait_parity = kv_load_stage ? v_empty_wait_parity1 : v_empty_wait_parity0;
-            wait_mbar_parity(v_empty_mbar_ptr, (uint32_t)v_empty_wait_parity);
-            v_empty_wait_parity ^= 1;
+            hstu_ws_wait_empty_stage(
+                v_empty_mbar_ptr0, v_empty_mbar_ptr1,
+                v_empty_wait_parity0, v_empty_wait_parity1,
+                kv_load_stage);
 
             load_paged_tma_or_target_v(
-                nb, kv_load_stage, kv_load_stage ? v_ready_mbar_ptr1 : v_ready_mbar_ptr0);
+                nb, kv_load_stage,
+                hstu_ws_stage_mbar(v_ready_mbar_ptr0, v_ready_mbar_ptr1, kv_load_stage));
 
             if (is_jump && masking_step_load == n_masking_steps - 1)
               n_valid = std::min(n_valid, n_block_history);
 
-            if constexpr (!Kernel_traits::kUseSingleKVStage) {
-              kv_load_stage ^= 1;
-            }
+            hstu_ws_advance_kv_stage<Kernel_traits::kUseSingleKVStage>(kv_load_stage);
           }
         } else {
           for (int n_valid = n_block_max - 1, masking_step_load = 0; n_valid >= n_block_min;
                ++masking_step_load, --n_valid) {
             const int nb = Is_arbitrary ? int(sValidBlockIds[n_valid]) : n_valid;
 
-            uint64_t* v_empty_mbar_ptr = kv_load_stage ? v_empty_mbar_ptr1 : v_empty_mbar_ptr0;
-            int& v_empty_wait_parity = kv_load_stage ? v_empty_wait_parity1 : v_empty_wait_parity0;
-            wait_mbar_parity(v_empty_mbar_ptr, (uint32_t)v_empty_wait_parity);
-            v_empty_wait_parity ^= 1;
+            hstu_ws_wait_empty_stage(
+                v_empty_mbar_ptr0, v_empty_mbar_ptr1,
+                v_empty_wait_parity0, v_empty_wait_parity1,
+                kv_load_stage);
 
             if (tidx == kNMathThreads + 64) {
               const int nb_abs = binfo.sum_s_k / kBlockN + nb;
@@ -999,9 +1035,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
             if (is_jump && masking_step_load == n_masking_steps - 1)
               n_valid = std::min(n_valid, n_block_history);
 
-            if constexpr (!Kernel_traits::kUseSingleKVStage) {
-              kv_load_stage ^= 1;
-            }
+            hstu_ws_advance_kv_stage<Kernel_traits::kUseSingleKVStage>(kv_load_stage);
           }
         }
       }
@@ -1040,7 +1074,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     };
 
     // Load and math branches run the same static scheduler; no dynamic tile queue.
-    constexpr bool kSyncBetweenTiles = Use_full_persistent && Has_rab;
+    constexpr bool kSyncBetweenTiles = Has_rab;
     const bool head_shared_rab = Has_rab && params.h_rab == 1 && params.h > 1;
     hstu_ws_run_static_schedule<
         Use_full_persistent,
@@ -1085,9 +1119,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     int rab_ready_wait_parity0 = 0;
     int math_stage  = 0;
 
-    if constexpr (Use_persistent) {
-      __syncthreads();  // One-time S1: load warp has initialized K/V mbarriers.
-    }
+    __syncthreads();  // One-time S1: load warp has initialized WS mbarriers.
 
     auto run_math_tile = [&](const int bidb, const int bidh, int m_block) {
       const HstuBlockInfo<Kernel_traits, Params> binfo(params, bidb);
@@ -1225,8 +1257,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         n_block_min = 0;
       }
 
-      // Early exit 2 (after Is_arbitrary): math warps write zeros; non-persistent paths still
-      // consume the per-tile S1.
+      // Early exit 2 (after Is_arbitrary): math warps write zeros.
       if (((Is_causal || Is_local || Is_arbitrary) && n_block_max <= n_block_min) ||
           m_block * kBlockM >= actual_seqlen_q) {
         using OutElement = typename Kernel_traits::OutputType;
@@ -1244,9 +1275,6 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         Tensor tOcO = gmem_thr_copy_O.partition_D(cO_zr);
         flash::copy<false, false, false>(gmem_tiled_copy_O, tOrO, tOgO, tOcO,
             actual_seqlen_q_padded - m_block * kBlockM);
-        if constexpr (!Use_persistent) {
-          __syncthreads();  // S1
-        }
         return;
       }
 
@@ -1461,10 +1489,6 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
           }
         }
       };
-
-      if constexpr (!Use_persistent) {
-        __syncthreads();  // S1: tma_mbar0/1 and math_mbar0/1 visible to all warps.
-      }
 
       FP8Elem* q_persist_base = reinterpret_cast<FP8Elem*>(
           reinterpret_cast<char*>(smem_) + Kernel_traits::kSmemWsQPersistOffset);
@@ -1795,56 +1819,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
               smem_base32 + (uint32_t)kSmemMbar0Offset + 96u,
               (uint32_t)o_empty_wait_parity);
           o_empty_wait_parity ^= 1;
-          Tensor sO_flat = make_tensor(
-              make_smem_ptr(reinterpret_cast<OutElement*>(smem_o)),
-              Layout<Shape<Int<kBlockM>, Int<kHeadDim>>, Stride<Int<kHeadDim>, _1>>{});
-          {
-          // stmatrix.sync.aligned.x4.m8n8.shared.b16: 8 warp-cooperative stores replace 32 STS.32.
-          //
-          // Layout invariants this asm relies on:
-          //   AtomLayout <_8,_1,_1>  -> 8 math warps all in M direction, warp covers rows [warp_m*16, warp_m*16+15]
-          //   PermMmaTileN <_8,_4,_4>:<_1,_32,_8>  -> N_sorted[j] = 32*(j%4) + 8*(j/4) for j=0..15
-          //   C-atom SM80_16x8_Row  -> rO_u32[2*j + m_grp] covers (M=warp_m*16+m_grp*8+lq, N=N_sorted[j]+lqt*2)
-          //   OutElement is 2-byte (BF16); sO_flat row-stride = kHeadDim * sizeof(OutElement) = 256 bytes.
-          static_assert(sizeof(OutElement) == 2, "stmatrix.m8n8.b16 requires 2-byte elements");
-
-          auto rO_u32 = recast<uint32_t>(rO);
-
-          const int lane        = tidx_math & 31;
-          const int lq          = lane >> 2;   // lane-quad (0..7): selects data row within 8x8 matrix
-          const int lqt         = lane & 3;    // lane-quad-thread (0..3): selects data col-group
-          const int warp_m      = tidx_math >> 5;  // M-warp index (0..7)
-          const int addr_row    = ((lq & 1) << 2) | lqt;  // STSM address-row within matrix (0..7)
-          const int mat_in_lane = lq >> 1;                 // which of 4 matrices this thread addresses
-
-          const uint32_t smem_base  = static_cast<uint32_t>(__cvta_generic_to_shared(smem_o));
-          constexpr uint32_t row_bytes = kHeadDim * (uint32_t)sizeof(OutElement);  // 256
-
-          CUTE_UNROLL
-          for (int m_grp = 0; m_grp < 2; ++m_grp) {
-            const uint32_t m_bytes = (uint32_t)(warp_m * 16 + m_grp * 8 + addr_row) * row_bytes;
-
-            CUTE_UNROLL
-            for (int n_grp = 0; n_grp < 4; ++n_grp) {
-              // This thread addresses row addr_row of matrix mat_in_lane,
-              // starting at N-column (n_grp*32 + mat_in_lane*8).
-              uint32_t stsm_addr = smem_base
-                  + m_bytes
-                  + (uint32_t)(n_grp * 32 + mat_in_lane * 8) * (uint32_t)sizeof(OutElement);
-
-              // Data: rb_k carries the uint32 whose N_sorted position is n_grp*32 + k*8.
-              // N_sorted[n_grp + k*4] = 32*(n_grp+k*4)%4 + 8*(n_grp+k*4)/4 = 32*n_grp + 8*k.
-              uint32_t rb0 = rO_u32[2 * (n_grp     ) + m_grp];
-              uint32_t rb1 = rO_u32[2 * (n_grp +  4) + m_grp];
-              uint32_t rb2 = rO_u32[2 * (n_grp +  8) + m_grp];
-              uint32_t rb3 = rO_u32[2 * (n_grp + 12) + m_grp];
-
-              asm volatile(
-                  "stmatrix.sync.aligned.x4.m8n8.shared.b16 [%0], {%1, %2, %3, %4};\n"
-                  : : "r"(stsm_addr), "r"(rb0), "r"(rb1), "r"(rb2), "r"(rb3) : "memory");
-            }
-          }
-          }
+          hstu_ws_store_o_stmatrix<kHeadDim, OutElement>(smem_o, rO, tidx_math);
 
           // For partial tiles (last tile of a varlen sequence): zero SMEM rows [valid_rows, kBlockM)
           // so TMA bulk store does not write garbage to GMEM beyond actual_seqlen_q.
@@ -1854,10 +1829,8 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
             // Full tiles skip this: o_ready is initialized with count=8, so the O-store warp
             // cannot proceed until each math warp has arrived after its own STSM stores.
             asm volatile("bar.sync 1, 256;\n" : : : "memory");
-            const int oob_elems = (kBlockM - valid_rows) * kHeadDim;
-            OutElement* sO_raw = reinterpret_cast<OutElement*>(smem_o) + valid_rows * kHeadDim;
-            for (int i = tidx_math; i < oob_elems; i += kNMathThreads)
-              sO_raw[i] = OutElement(0);
+            hstu_ws_zero_oob_o_rows<kBlockM, kHeadDim, kNMathThreads, OutElement>(
+                smem_o, valid_rows, tidx_math);
             asm volatile("bar.sync 1, 256;\n" : : : "memory");  // OOB zeros visible before TMA.
           }
 
@@ -2041,32 +2014,6 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         if constexpr (!(Has_rab && kUseRabSkipMasked)) {
           consume_rab_bs(acc_s, nb, false);
         }
-        if (params.debug_gemm1_only) {
-          if constexpr (Has_rab && kUseRabSkipMasked) {
-            consume_rab_bs(acc_s, nb, false);
-          }
-          for (int i = 0; i < size(acc_s); ++i) acc_o(i) += acc_s(i);
-          {
-            const int cur_parity = math_stage ? tma_parity1 : tma_parity0;
-            uint32_t vaddr =
-                smem_base32 + (uint32_t)kSmemMbar0Offset + 16u + (uint32_t)(math_stage * 8);
-            wait_mbar_parity(vaddr, (uint32_t)cur_parity);
-          }
-          if (math_stage) { tma_parity1 ^= 1; } else { tma_parity0 ^= 1; }
-          asm volatile("" ::: "memory");
-          if ((tidx_math & 31) == 0) {
-            uint32_t v_empty_addr =
-                smem_base32 + (uint32_t)kSmemMbar0Offset + 48u + (uint32_t)(math_stage * 8);
-            arrive_mbar(v_empty_addr);
-          }
-          if (is_jump && masking_step == n_masking_steps - 1)
-            n_valid_ref = std::min(n_valid_ref, n_block_history);
-          if constexpr (!Kernel_traits::kUseSingleKVStage) {
-            math_stage ^= 1;
-          }
-          return n_valid_ref;
-        }
-
         // Masking (Opt C: compile-time specialized).  For RAB, apply the mask
         // first on masked tiles so add_rab_bs can skip -inf entries without
         // recomputing the mask predicate on the math critical path.
@@ -2098,22 +2045,9 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         for (int i = 0; i < size(acc_s); ++i) acc_s(i) *= params.alpha;
         fast_silu(acc_s);
 
-        // ── P pre-conversion: F32 → packed FP8 ───────────────────────────────
-        // Problem: during the P-write loop below, both acc_s (64 F32 = 64 regs)
-        // and acc_o (64 F32 = 64 regs) must be live, and the SW128 swizzle address
-        // LOP3 computation needs ~20 temp regs.  These overlap with acc_o's lower
-        // register range (R4–R23), causing the compiler to spill acc_o (10×STL.64 +
-        // 10×LDL.LU.64 = 20 local-memory accesses per loop iteration).
-        //
-        // Fix: pre-convert acc_s (64 F32) → acc_s_packed (16 uint32, 4 FP8/reg)
-        // BEFORE the bar.sync + P-write loop.  After this block acc_s is dead
-        // (last read is here), so its 64 registers are freed and available to the
-        // LOP3 address computation, eliminating the acc_o spill.
-        //
-        // kAccSElems = 64 for BM128/BN128 and 32 for BM128/BN64 at 256 math threads.
-        // Packing order matches the flat C-fragment order of thr_mma_g1.partition_C(...).
-        // Under AtomLayout <_8,_1,_1>, the old select<1,2,0,3>-based regrouping is not a
-        // valid (M,N) mapping; use acc_s(flat) directly to preserve C-fragment order.
+        // Pre-convert P to packed FP8 before the P-write address calculation.
+        // This ends acc_s's live range early and avoids spilling acc_o.
+        // Flat C-fragment order must be preserved for AtomLayout <8,1,1>.
         constexpr int kAccSElems = kBlockM * kBlockN / kNMathThreads;
         static_assert(kAccSElems % 4 == 0, "kAccSElems must be a multiple of 4");
         uint32_t acc_s_packed[kAccSElems / 4];
@@ -2436,7 +2370,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         }
       }
 
-      // Complex/full paths and debug_gemm1_only keep the old post-loop epilogue fallback.
+      // Some paths still use the post-loop epilogue when in-mainloop store did not run.
       if constexpr (kStoreOInMainloop) {
         if (!o_epilogue_done) {
           store_o_epilogue();
@@ -2447,7 +2381,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     };
 
     // Same scheduler as the load branch.
-    constexpr bool kSyncBetweenTiles = Use_full_persistent && Has_rab;
+    constexpr bool kSyncBetweenTiles = Has_rab;
     const bool head_shared_rab = Has_rab && params.h_rab == 1 && params.h > 1;
     hstu_ws_run_static_schedule<
         Use_full_persistent,
@@ -2485,9 +2419,5 @@ hstu_fwd_kernel_sm120_fp8_ws_tma(
   hstu_compute_attn_1rowblock_sm120_fp8_ws<
       Kernel_traits,
       Use_full_persistent,
-      Use_paired_persistent>(
-      params,
-      0,
-      0,
-      0);
+      Use_paired_persistent>(params);
 }
