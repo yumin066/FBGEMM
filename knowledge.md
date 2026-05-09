@@ -6,6 +6,11 @@
 
 ## Phase 24 FP8 paged KV 性能结论
 
+- Phase 34 FP8 WS benchmark-driven 优化结论：
+  - `D=256, seq=2048, bs=1, h=4` 的 low-TFLOPS case 中，`causal+RAB/DRAB` 低于 no-RAB 的主要原因仍是 RAB 额外流量和 RAB SMEM/TMA/mbarrier 固定开销；NCU 显示 `causal none -> causal RAB` duration 约 `106.9us -> 162.4us`，DRAM throughput `3.77% -> 9.37%`，L2 hit `86.5% -> 67.2%`。
+  - 对所有 D256 causal/local RAB 都禁用 RAB SMEM 会伤害大 batch/head case，不应保留。只对小工作量 `D=256 pure causal RAB/DRAB` 且 `params.b * params.h <= 4` 跳过 RAB TMA/SMEM、走 direct-global RAB add，能小幅提升 `bs=1,h=4` causal+RAB/DRAB，且不影响 local 和大 batch/head。
+  - 重新让 `D=256 non-paged pure causal no-RAB` 走 paired persistent scheduler 不划算：`bs=1,h=4` 和 `bs=8` pure causal 回退，只有部分 `h=16` 小 batch 提升。当前 D256 non-paged pure causal 继续保持普通 3D grid/runtime mask。
+
 - 初版 SM120 FP8 paged KV causal/target 走 per-tile grid `(num_m_block,h,b)`，在 `BS=4,SEQ=2048,H=16,D=128` 上 grid 为 `1024`、waves/SM `5.45`，NCU duration `467.1us`，local spilling requests `261632`。主要 regression 不是数学路径，而是没有进入 persistent scheduler，且 paged K/V 手动 LDG+STS gather 造成 scoreboard/spill。
 - 将 paged causal/target 接入 paired persistent scheduler 后，同 case grid 降为 `188`、waves/SM `1`，duration 降到 `350.4us`，local spilling requests 降到 `30928`。
 - 将 paged K/V tile copy 从同步 `LDG+STS` 改为 warp 内 `cp.async.cg.shared.global` 16B copy 后，同 case duration 降到 `200.2us`，local spilling requests 为 `0`；同轮 non-paged FP8 为 `169.6us`。

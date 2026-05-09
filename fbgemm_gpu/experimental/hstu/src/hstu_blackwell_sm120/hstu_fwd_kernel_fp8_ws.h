@@ -282,6 +282,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     constexpr int  kNFunc       = Kernel_traits::kNFunc;
     constexpr bool Is_local     = Kernel_traits::Is_local;
     constexpr bool Has_rab      = Kernel_traits::Has_rab;
+    constexpr bool Use_rab_smem = Kernel_traits::kUseRabSmem;
     constexpr bool Paged_KV     = Kernel_traits::Paged_KV;
     constexpr int  kBlockM      = Kernel_traits::kBlockM;
     constexpr int  kBlockN      = Kernel_traits::kBlockN;
@@ -337,7 +338,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" : : "r"(or1), "r"(8));
         asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" : : "r"(oe0), "r"(1));
         asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" : : "r"(oe1), "r"(1));
-        if constexpr (Has_rab) {
+        if constexpr (Use_rab_smem) {
           asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" : : "r"(rr0), "r"(1));
           asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" : : "r"(re0), "r"(8));
         }
@@ -347,7 +348,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
           arrive_mbar(ve0);
           arrive_mbar(ve1);
           arrive_mbar(qe);
-          if constexpr (Has_rab) {
+          if constexpr (Use_rab_smem) {
             arrive_mbar(re0);
           }
         }
@@ -565,9 +566,15 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       auto tRabsRab_d = group_modes<0, 3>(tma_slice_Rab.partition_D(sRab_tma));
 
       auto use_rab_smem_for_nb = [&](int nb) {
-        if constexpr (!Has_rab) {
+        if constexpr (!Use_rab_smem) {
           return false;
         } else {
+          if constexpr (kHeadDim > 128 &&
+              Is_causal && !Is_target && !Is_context && !Is_local && !Is_arbitrary) {
+            if (params.b * params.h <= 4) {
+              return false;
+            }
+          }
           bool aligned = (actual_seqlen_offset % kBlockM) == 0;
           if constexpr (Paged_KV && Is_target) {
             if (nb >= n_block_paged && last_page_offset != 0) {
@@ -1037,6 +1044,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     constexpr int  kNFunc       = Kernel_traits::kNFunc;
     constexpr bool Is_local     = Kernel_traits::Is_local;
     constexpr bool Has_rab      = Kernel_traits::Has_rab;
+    constexpr bool Use_rab_smem = Kernel_traits::kUseRabSmem;
     constexpr bool Paged_KV     = Kernel_traits::Paged_KV;
     constexpr int  kBlockM      = Kernel_traits::kBlockM;
     constexpr int  kBlockN      = Kernel_traits::kBlockN;
@@ -1609,9 +1617,15 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       };
 
       auto use_rab_smem_for_nb = [&](int nb) {
-        if constexpr (!Has_rab) {
+        if constexpr (!Use_rab_smem) {
           return false;
         } else {
+          if constexpr (kHeadDim > 128 &&
+              Is_causal && !Is_target && !Is_context && !Is_local && !Is_arbitrary) {
+            if (params.b * params.h <= 4) {
+              return false;
+            }
+          }
           bool aligned = (actual_seqlen_offset % kBlockM) == 0;
           if constexpr (Paged_KV && Is_target) {
             if (nb >= n_block_paged && last_page_offset != 0) {

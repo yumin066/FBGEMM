@@ -4,6 +4,8 @@
 
 ## 当前状态
 
+Phase 34 当前目标：持续分析 FP8 WS benchmark，按锁频 kernel-only TFLOPS 自动挑出低效 case，优先处理 `seq>=2048`、非小 launch-overhead 主导的组合。第一轮已完成 `bs=1/8,seq=2048,h=4/16,d=256` focused benchmark、NCU profile 和一个小工作量 causal+RAB 优化。保留改动：`D=256 pure causal RAB/DRAB` 且 `params.b * params.h <= 4` 时，aligned RAB tile 不走 K-warp RAB TMA/SMEM，改用 direct-global RAB add；`local/context/target/arbitrary` 和大 batch/head causal 保持 RAB TMA/SMEM。下一步继续从同频全量 benchmark 中挑低 TFLOPS case，按 profile 证据逐个优化。
+
 Phase 33 当前目标：并行推进两条性能问题。BF16 CuTe DSL 的目标是 GPU kernel-only 性能接近当前 BF16 C++，验收线为代表 aligned D128 full/causal 至少达到 C++ 的 95%；wrapper-call 端到端开销单独记录，不和 kernel-only 混算。FP8 WS 的目标聚焦 `seq=2048,h=4,d=256`：解释并降低 RAB/DRAB 带来的 TFLOPS 下降，解释各 mask 的 valid-pairs 与调度差异，分析 D256 causal 只有 full 约一半 TFLOPS 的原因，并对比 benchmark `596` 与 `173` 的 D128 full/causal regression。
 
 Phase 32 当前目标：参考现有 CuTe DSL 路径实现 SM120 BF16 prototype，并与当前 SM120 C++ BF16 路径做性能对比。已确认 SM100 DSL `tcgen05` BF16 MMA 不能直接用于 SM120：CUTLASS DSL 4.5 的 `tcgen05.MmaF16BF16Op` 只接受 `sm_100a/sm_101a/sm_103a`，`sm_120a` 会在 JIT 阶段报 arch 不支持；强制按 `sm_100a` 编译后也会在 SM120 上报 `cudaErrorNoKernelImageForDevice`。因此 Phase 32 prototype 改用 Ampere-style warp-level `mma.sync` CuTe DSL，与当前 SM120 C++ BF16 的 “SM80 mma.sync on SM120” 模型一致。当前 SM120 CuTe DSL BF16 已补齐 D32/D64/D128/D256 × full、causal、local、context+causal、target+causal、context+target+causal、arbitrary × none/RAB/DRAB；覆盖 dense full-batch、compact varlen、`alpha=1.0/0.1`。BF16 paged KV 以 wrapper-side materialization 接入，先还原成 dense K/V 后复用同一个 DSL kernel。最新结论：早期 CUDA-event benchmark 的 8%~12% ratio 主要是把 Python/CuTe DSL wrapper 的 descriptor/from_dlpack/launch 开销计入了 event 区间，不代表 GPU kernel 本身；nsys GPU kernel summary 显示对齐 8-warps、fast_silu 和 in-kernel scaling 后，`bs=1,seq=1024,H=4,D=128,full` DSL kernel 为 `40.0us`，当前 C++ BF16 为 `35.1us`，约 `87.7%`。
@@ -39,6 +41,34 @@ Phase 25 的 SM120 forward headDim256 已完成第一阶段支持。FP8 hdim256 
 - Phase 27 non-paged RAB/DRAB WS 当前版已接入：D=128/D=256 full、pure causal、context+causal、target+causal、local、arbitrary non-paged RAB/DRAB 走 WS TMA，correctness 通过。`bs=2,seq=1024,h=4,d=256` kernel-only latency 相比 fallback：full `0.0693ms vs 0.1111ms`，local `0.0583ms vs 0.0825ms`，context `0.1264ms vs 0.2118ms`，target `0.0798ms vs 0.1246ms`；arbitrary WS 与 fallback 基本持平，用于统一路径。
 - `bench_hstu_attn_sm120.py` 已扩展为默认覆盖 `full/causal/local/context/target/arbitrary` × `none/rab/drab`，每个逻辑 case 同时输出 BF16、non-paged FP8、paged FP8。三列独立计时，BF16 unsupported 不再阻塞 FP8/paged 结果；可用 `--columns fp8 paged` 只跑目标列。TFLOPS 按 `generate_input` 产生的实际 valid attention pairs 计算，避免 causal/local/context/target 被 full FLOPs 高估。
 - repo 自带 `hstu_test.py` 已纳入当前 correctness 目标；Phase 31 最新全文件日志 `1test_results/phase31_final_hstu_test.log` 为 `3 passed, 1 skipped`。其中 `HSTU8Test::test_sm120_fp8_blockscale_matrix` 已扩展到 D=32/D=64/D=128/D=256、seq=99/128/256、full/causal/local/context/target/arbitrary、none/RAB/DRAB、non-paged/paged。后续 HSTU CUDA/CuTe 改动必须保持该 pytest 入口通过。
+
+## Phase 34：FP8 WS benchmark-driven 持续优化
+
+目标：
+
+- 按锁频 kernel-only benchmark 自动挑出 TFLOPS 明显偏低的 FP8 WS case，优先看 `seq>=2048` 且不是纯 launch overhead 主导的组合。
+- 每个候选 case 先做 NCU/profile 判断瓶颈，再做局部实现实验；只保留 correctness 通过、无明显性能回退、且锁频 benchmark 有收益的改动。
+- 对不保留的实验记录原因，避免反复尝试同一方向。
+
+本轮证据：
+
+- 基线 focused benchmark：`2benchmark_results/637_gpu2407MHz_phase34_fp8_ws_d256_s2048_h4_focus.log`。`bs=1,seq=2048,h=4,d=256` 中，full no-RAB 约 `196.4 TFLOPS`，causal no-RAB 约 `100.2 TFLOPS`，causal+RAB/DRAB 约 `67.8/67.9 TFLOPS`，local+RAB/DRAB 约 `79.5/78.8 TFLOPS`，arbitrary+RAB/DRAB 约 `71.7/72.3 TFLOPS`。
+- NCU profile：`3profile_results/637_phase34_fp8_d256_s2048_h4_causal_none_ncu.*`、`causal_rab_ncu.*`、`arbitrary_none_ncu.*`、`arbitrary_rab_ncu.*`。D256 causal+RAB 相比 no-RAB duration 约 `106.9us -> 162.4us`，DRAM throughput `3.77% -> 9.37%`，L2 hit `86.5% -> 67.2%`，并有约 `38KB` local spill request；arbitrary+RAB duration 约 `104.0us -> 118.3us`，DRAM throughput `2.85% -> 13.07%`。结论是 RAB traffic 仍是主要增量，小量 spill 是次要风险。
+- 实验 1：对所有 D256 causal/local RAB 禁用 RAB SMEM、回到 direct-global RAB add，可让 `bs=1,h=4` causal/local 小 case 提升，但 `bs=8,h=16` causal/local 大幅回退，因此不保留。
+- 实验 2：只在 `D=256 pure causal RAB/DRAB` 且 `params.b * params.h <= 4` 时跳过 RAB SMEM/TMA，保留。恢复确认 benchmark `2benchmark_results/643_gpu2407MHz_phase34_restore_probe.log` 显示 `bs=1,seq=2048,h=4,d=256 causal+RAB/DRAB` 为 `69.1/69.3 TFLOPS`，相对基线约 `+1.9%/+2.1%`；`local+RAB/DRAB` 保持约 `79.4/79.0 TFLOPS`，大 batch/head causal/local 没有实验 1 的回退。
+- 实验 3：尝试让 `D=256 non-paged pure causal no-RAB` 重新走 paired persistent scheduler，不保留。probe `2benchmark_results/642_gpu2407MHz_phase34_d256_pure_causal_persistent_probe.log` 显示 `bs=1,h=4` pure causal 从约 `100 TFLOPS` 降到 `86.6 TFLOPS`，`bs=8` 也回退；只有 `bs=1,h=16` 提升，不满足保留条件。
+
+验证：
+
+- 构建：`1test_results/651_phase34_restore_after_persistent_reject_build.log`。
+- correctness：`1test_results/652_phase34_d256_small_causal_rab_direct_final_hstu_test.log` 为 `3 passed, 1 skipped`；`1test_results/653_phase34_d256_small_causal_rab_direct_final_sweep.log` 通过；`1test_results/655_phase34_d256_small_causal_rab_direct_final_examples_retry.log` 为 `300/300 passed`。第一次 examples `654` 有一个 D128 causal 随机阈值边界失败，内部日志显示 HSTU max diff 低于 PyTorch max diff，重跑通过。
+- 性能：主要同频日志为 `2benchmark_results/641_gpu2407MHz_phase34_d256_s2048_small_causal_rab_direct_focus.log` 和 `643`；paired persistent rejected 日志为 `642`。
+- Resource：`cuobjdump --dump-resource-usage` 显示 D256 non-paged pure causal+RAB 仍为 `REG:168 STACK:16 LOCAL:0`，paged pure causal+RAB 为 `REG:168 STACK:0 LOCAL:0`；与既有 D256 RAB resource 状态一致，未新增 specialization。
+
+下一步：
+
+- 继续从大矩阵 benchmark 中按 TFLOPS 排序，优先 profile `arbitrary+RAB/DRAB`、paged target+RAB/DRAB 以及 D128 causal regression。
+- RAB dense per-head full 达不到 no-RAB `95%` 的结论仍成立；后续优化应围绕减少 RAB 字节量、复用、或压缩语义，而不是继续在 full dense per-head BF16 RAB 上追不现实目标。
 
 ## Phase 33：BF16 CuTe DSL 与 FP8 WS 性能优化
 

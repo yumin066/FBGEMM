@@ -474,11 +474,12 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
   // hdim256 arbitrary needs ValidBlockIds SMEM; two KV stages would exceed SM120's
   // 101376B opt-in limit.  RAB-in-SMEM also needs a 128x64 BF16 tile; for D256
   // RAB and D128 arbitrary+RAB we release one KV stage to stay under the limit.
+  static constexpr bool kUseRabSmem = Has_rab_;
   static constexpr bool kUseSingleKVStage =
       (Is_arbitrary_ && kHeadDim_ > 128) ||
-      (Has_rab_ && (kHeadDim_ > 128 || (Is_arbitrary_ && kHeadDim_ == 128)));
+      (kUseRabSmem && (kHeadDim_ > 128 || (Is_arbitrary_ && kHeadDim_ == 128)));
   static constexpr int kSmemWsKVStages = kUseSingleKVStage ? 1 : 2;
-  static constexpr int kSmemWsRabStages = Has_rab_ ? 1 : 0;
+  static constexpr int kSmemWsRabStages = kUseRabSmem ? 1 : 0;
   static constexpr int kSmemWsRabLayoutStages = 1;
 
   // Producer/consumer mbarriers: ready barriers model cnt=1, empty barriers model cnt=0.
@@ -490,8 +491,8 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
   //   q_empty: Q/SFA consumed into registers
   //   o_ready[0]: O SMEM ready for TMA store
   //   o_empty[0]: independent O SMEM buffer is free for math epilogue writes
-  // Each barrier is 8 bytes.  RAB adds one ready/empty pair.
-  static constexpr int kSmemMbarSize = Has_rab_ ? 128 : 112;
+  // Each barrier is 8 bytes.  RAB-in-SMEM adds one ready/empty pair.
+  static constexpr int kSmemMbarSize = kUseRabSmem ? 128 : 112;
   // kSmemWsKVStages × (K + Vt).
   static constexpr int kSmemWsKVTotalBytes = 2 * kSmemWsKVStages * kSmemKVBytes;
 
@@ -525,7 +526,7 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
   static constexpr int kSmemWsAfterO = kSmemWsOOffset + kSmemWsOBytes;
   static constexpr int kSmemWsRabOffset = kSmemWsAfterO;
   static constexpr int kSmemWsRabBytes =
-      Has_rab_ ? kBlockM_ * kBlockN_ * (int)sizeof(cutlass::bfloat16_t) : 0;
+      kUseRabSmem ? kBlockM_ * kBlockN_ * (int)sizeof(cutlass::bfloat16_t) : 0;
   static constexpr int kSmemWsAfterRab = kSmemWsRabOffset + kSmemWsRabBytes;
   // WS data region padded to 128B; SF (TMA targets) starts at this offset from smem_.
   static constexpr int kSmemWsDataSizePadded = ((kSmemWsAfterRab + 127) / 128) * 128;
@@ -546,6 +547,6 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
       "kNMathWarps * 16 must equal kBlockM (8 warps × 16 rows = 128)");
   static_assert(kNThreads == (kNMathWarps + kNLoadWarps) * 32,
       "kNThreads == (kNMathWarps + kNLoadWarps) * 32");  // 384
-  static_assert(kSmemMbarSize == (Has_rab_ ? 128 : 112),
-      "kSmemMbarSize must be 112 without RAB or 128 with RAB");
+  static_assert(kSmemMbarSize == (kUseRabSmem ? 128 : 112),
+      "kSmemMbarSize must be 112 without RAB SMEM or 128 with RAB SMEM");
 };
