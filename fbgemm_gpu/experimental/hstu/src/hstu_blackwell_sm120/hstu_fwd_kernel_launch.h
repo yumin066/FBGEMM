@@ -4,6 +4,7 @@
 #include <cuda_fp8.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <type_traits>
 
@@ -226,21 +227,59 @@ void run_hstu_fwd_sm120_fp8_ws_tma_impl(Hstu_fwd_params& params, cudaStream_t st
       !Is_arbitrary &&
       (!Is_target || Paged_KV) &&
       (kHeadDim <= 128 || (Paged_KV && !Has_rab));
-  static constexpr bool Use_full_persistent = !Use_paired_persistent;
-  static_assert(Use_full_persistent || Use_paired_persistent);
+  static constexpr bool Use_full_persistent =
+      !Is_causal && !Is_target && !Is_context && !Is_local && !Is_arbitrary;
+  static constexpr bool Use_persistent = Use_full_persistent || Use_paired_persistent;
   const int persistent_work_units = Use_paired_persistent ? total_tile_pairs : total_tiles;
   int device = 0;
   int sm_count = 0;
-  C10_CUDA_CHECK(cudaGetDevice(&device));
-  C10_CUDA_CHECK(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
-  dim3 grid(std::min(persistent_work_units, sm_count));
+  if constexpr (Use_persistent) {
+    C10_CUDA_CHECK(cudaGetDevice(&device));
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
+  }
+  dim3 grid = Use_persistent
+      ? dim3(std::min(persistent_work_units, sm_count))
+      : (Has_rab && params.h_rab == 1 && params.h > 1
+          ? dim3(params.h, num_m_block, params.b)
+          : dim3(num_m_block, params.h, params.b));
+  static constexpr bool Can_use_target_group_size_1 =
+      kHeadDim > 128 &&
+      Is_causal &&
+      Is_target &&
+      !Is_context &&
+      !Is_local &&
+      !Is_arbitrary &&
+      !Has_rab &&
+      !Paged_KV;
 
   auto launch_tma_kernel = [&](auto& tma_params) {
     using TmaParamsT = std::decay_t<decltype(tma_params)>;
-    auto kernel = &flash::hstu_fwd_kernel_sm120_fp8_ws_tma<Kernel_traits, TmaParamsT>;
+    if constexpr (Can_use_target_group_size_1) {
+      if (params.target_group_size == 1) {
+        auto kernel =
+            &flash::hstu_fwd_kernel_sm120_fp8_ws_tma<Kernel_traits, TmaParamsT, true>;
+        if (smem_size >= 48 * 1024) {
+          static std::atomic<bool> smem_attr_set_g1{false};
+          if (!smem_attr_set_g1.load(std::memory_order_acquire)) {
+            C10_CUDA_CHECK(cudaFuncSetAttribute(
+                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            smem_attr_set_g1.store(true, std::memory_order_release);
+          }
+        }
+        kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(tma_params);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        return;
+      }
+    }
+    auto kernel =
+        &flash::hstu_fwd_kernel_sm120_fp8_ws_tma<Kernel_traits, TmaParamsT, false>;
     if (smem_size >= 48 * 1024) {
-      C10_CUDA_CHECK(cudaFuncSetAttribute(
-          kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      static std::atomic<bool> smem_attr_set{false};
+      if (!smem_attr_set.load(std::memory_order_acquire)) {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        smem_attr_set.store(true, std::memory_order_release);
+      }
     }
     kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(tma_params);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
