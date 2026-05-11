@@ -366,6 +366,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     int v_empty_wait_parity1 = 0;
     int q_empty_wait_parity = 0;
     int o_ready_wait_parity0 = 0;
+    int o_empty_load_wait_parity0 = 0;
     int rab_empty_wait_parity0 = 0;
     int kv_load_stage = 0;
     if constexpr (Use_persistent) {
@@ -643,6 +644,13 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
           const int m_abs = binfo.sum_s_q / kBlockM + m_block;
           cute::copy(params.tma_q.with(*q_ready_mbar_ptr),   tQgQ_tma(_, _, _, m_abs),     tQsQ_d);
           cute::copy(params.tma_sfa.with(*q_ready_mbar_ptr), tSFAgSFA_tma(_, _, _, m_abs), tSFAsSFA_d);
+        }
+      }
+
+      if constexpr (Kernel_traits::kUseAliasedOBuffer) {
+        if (is_k_load_warp || is_v_load_warp) {
+          wait_mbar_parity(o_empty_mbar_ptr0, (uint32_t)o_empty_load_wait_parity0);
+          o_empty_load_wait_parity0 ^= 1;
         }
       }
 
@@ -968,7 +976,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       }
 
       if (is_o_store_warp) {
-        if constexpr (Kernel_traits::kUseIndependentOBuffer) {
+        if constexpr (Kernel_traits::kUseTmaOStore) {
         // Math warps own compute/softmax and write O to independent SMEM; O-store waits
         // for o_ready[0], then releases o_empty[0] after the TMA store completes.
         wait_mbar_parity(o_ready_mbar_ptr0, (uint32_t)o_ready_wait_parity0);
@@ -976,15 +984,13 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         if (tidx == kNMathThreads + 96) {
           asm volatile("fence.proxy.async.shared::cta;\n" : : : "memory");
           static_assert(
-              Kernel_traits::kSmemWsOBytes >= kBlockM * kHeadDim * (int)sizeof(OutElement),
-              "Independent O SMEM buffer is too small.");
-          char* smem_o = reinterpret_cast<char*>(smem_) + Kernel_traits::kSmemWsOOffset;
-          using SmemLayoutO_TMA_t = cute::Layout<
-              cute::Shape<cute::Int<kBlockM>, cute::Int<kHeadDim>>,
-              cute::Stride<cute::Int<kHeadDim>, cute::_1>>;
+              Kernel_traits::kSmemWsOStoreBytes >= kBlockM * kHeadDim * (int)sizeof(OutElement),
+              "O SMEM buffer is too small.");
+          char* smem_o = reinterpret_cast<char*>(smem_) +
+              (Kernel_traits::kUseAliasedOBuffer ? 0 : Kernel_traits::kSmemWsOOffset);
           Tensor sO_tma = make_tensor(
               make_smem_ptr(reinterpret_cast<OutElement*>(smem_o)),
-              SmemLayoutO_TMA_t{});
+              typename Kernel_traits::SmemLayoutWsO_TMA{});
           auto mO_tma   = params.tma_o.get_tma_tensor(make_shape(params.total_q, params.d, params.h));
           auto gO_head  = mO_tma(_, _, bidh);
           auto gO_tiles = local_tile(gO_head, Shape<Int<kBlockM>, Int<kHeadDim>>{}, make_coord(_, _));
@@ -1755,7 +1761,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         Tensor rO = make_tensor_like<OutElement>(acc_o);
         flash::convert_type_safe(acc_o, rO);
 
-        if constexpr (!Kernel_traits::kUseIndependentOBuffer) {
+        if constexpr (!Kernel_traits::kUseTmaOStore) {
           Tensor cO_id = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDimGemm2>>{});
           Tensor tOcO = thr_mma_g2.partition_C(cO_id);
           OutElement* gO_ptr = reinterpret_cast<OutElement*>(params.o_ptr)
@@ -1773,64 +1779,84 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
           }
         } else {
           static_assert(
-              Kernel_traits::kSmemWsOBytes >= kBlockM * kHeadDim * (int)sizeof(OutElement),
-              "Independent O SMEM buffer is too small.");
-          char* smem_o = reinterpret_cast<char*>(smem_) + Kernel_traits::kSmemWsOOffset;
+              Kernel_traits::kSmemWsOStoreBytes >= kBlockM * kHeadDim * (int)sizeof(OutElement),
+              "O SMEM buffer is too small.");
+          if constexpr (Kernel_traits::kUseAliasedOBuffer) {
+            // The aliased D256 path writes O over the KV staging region.  All math
+            // warps must finish consuming V before any warp starts STSM into it.
+            asm volatile("bar.sync 1, 256;\n" : : : "memory");
+          }
+          char* smem_o = reinterpret_cast<char*>(smem_) +
+              (Kernel_traits::kUseAliasedOBuffer ? 0 : Kernel_traits::kSmemWsOOffset);
 
-          // Wait until the independent O buffer is no longer owned by the previous TMA store.
+          // Wait until the O buffer is no longer owned by the previous TMA store.
           wait_mbar_parity(
               smem_base32 + (uint32_t)kSmemMbar0Offset + 96u,
               (uint32_t)o_empty_wait_parity);
           o_empty_wait_parity ^= 1;
-          Tensor sO_flat = make_tensor(
+          Tensor sO_tma = make_tensor(
               make_smem_ptr(reinterpret_cast<OutElement*>(smem_o)),
-              Layout<Shape<Int<kBlockM>, Int<kHeadDim>>, Stride<Int<kHeadDim>, _1>>{});
+              typename Kernel_traits::SmemLayoutWsO_TMA{});
+          auto sO_swz = as_position_independent_swizzle_tensor(sO_tma);
           {
-          // stmatrix.sync.aligned.x4.m8n8.shared.b16: 8 warp-cooperative stores replace 32 STS.32.
-          //
-          // Layout invariants this asm relies on:
-          //   AtomLayout <_8,_1,_1>  -> 8 math warps all in M direction, warp covers rows [warp_m*16, warp_m*16+15]
-          //   PermMmaTileN <_8,_4,_4>:<_1,_32,_8>  -> N_sorted[j] = 32*(j%4) + 8*(j/4) for j=0..15
-          //   C-atom SM80_16x8_Row  -> rO_u32[2*j + m_grp] covers (M=warp_m*16+m_grp*8+lq, N=N_sorted[j]+lqt*2)
-          //   OutElement is 2-byte (BF16); sO_flat row-stride = kHeadDim * sizeof(OutElement) = 256 bytes.
-          static_assert(sizeof(OutElement) == 2, "stmatrix.m8n8.b16 requires 2-byte elements");
+            // STSM writes the same swizzled SMEM layout consumed by O TMA store.
+            static_assert(sizeof(OutElement) == 2, "stmatrix.m8n8.b16 requires 2-byte elements");
+            static_assert(kHeadDim <= 256, "O STSM path currently supports D32/D64/D128/D256");
 
-          auto rO_u32 = recast<uint32_t>(rO);
+            auto rO_u32 = recast<uint32_t>(rO);
+            constexpr int kOStsmNGroups = kHeadDim / 32;
 
-          const int lane        = tidx_math & 31;
-          const int lq          = lane >> 2;   // lane-quad (0..7): selects data row within 8x8 matrix
-          const int lqt         = lane & 3;    // lane-quad-thread (0..3): selects data col-group
-          const int warp_m      = tidx_math >> 5;  // M-warp index (0..7)
-          const int addr_row    = ((lq & 1) << 2) | lqt;  // STSM address-row within matrix (0..7)
-          const int mat_in_lane = lq >> 1;                 // which of 4 matrices this thread addresses
-
-          const uint32_t smem_base  = static_cast<uint32_t>(__cvta_generic_to_shared(smem_o));
-          constexpr uint32_t row_bytes = kHeadDim * (uint32_t)sizeof(OutElement);  // 256
-
-          CUTE_UNROLL
-          for (int m_grp = 0; m_grp < 2; ++m_grp) {
-            const uint32_t m_bytes = (uint32_t)(warp_m * 16 + m_grp * 8 + addr_row) * row_bytes;
+            const int lane        = tidx_math & 31;
+            const int lq          = lane >> 2;   // lane-quad (0..7): selects data row within 8x8 matrix
+            const int lqt         = lane & 3;    // lane-quad-thread (0..3): selects data col-group
+            const int warp_m      = tidx_math >> 5;  // M-warp index (0..7)
+            const int addr_row    = ((lq & 1) << 2) | lqt;  // STSM address-row within matrix (0..7)
+            const int mat_in_lane = lq >> 1;                 // which of 4 matrices this thread addresses
 
             CUTE_UNROLL
-            for (int n_grp = 0; n_grp < 4; ++n_grp) {
-              // This thread addresses row addr_row of matrix mat_in_lane,
-              // starting at N-column (n_grp*32 + mat_in_lane*8).
-              uint32_t stsm_addr = smem_base
-                  + m_bytes
-                  + (uint32_t)(n_grp * 32 + mat_in_lane * 8) * (uint32_t)sizeof(OutElement);
+            for (int m_grp = 0; m_grp < 2; ++m_grp) {
+              const int row = warp_m * 16 + m_grp * 8 + addr_row;
 
-              // Data: rb_k carries the uint32 whose N_sorted position is n_grp*32 + k*8.
-              // N_sorted[n_grp + k*4] = 32*(n_grp+k*4)%4 + 8*(n_grp+k*4)/4 = 32*n_grp + 8*k.
-              uint32_t rb0 = rO_u32[2 * (n_grp     ) + m_grp];
-              uint32_t rb1 = rO_u32[2 * (n_grp +  4) + m_grp];
-              uint32_t rb2 = rO_u32[2 * (n_grp +  8) + m_grp];
-              uint32_t rb3 = rO_u32[2 * (n_grp + 12) + m_grp];
+              CUTE_UNROLL
+              for (int n_grp = 0; n_grp < kOStsmNGroups; ++n_grp) {
+                // This thread addresses row addr_row of matrix mat_in_lane,
+                // starting at N-column (n_grp*32 + mat_in_lane*8).
+                const int col = n_grp * 32 + mat_in_lane * 8;
+                uint32_t stsm_addr = cute::cast_smem_ptr_to_uint(&sO_swz(row, col));
 
-              asm volatile(
-                  "stmatrix.sync.aligned.x4.m8n8.shared.b16 [%0], {%1, %2, %3, %4};\n"
-                  : : "r"(stsm_addr), "r"(rb0), "r"(rb1), "r"(rb2), "r"(rb3) : "memory");
+                int j0, j1, j2, j3;
+                if constexpr (kHeadDimGemm2 == 64) {
+                  // BS2 D32/D64 uses linear 64-wide N atom order: 0,8,16,...,56.
+                  j0 = 4 * n_grp + 0;
+                  j1 = 4 * n_grp + 1;
+                  j2 = 4 * n_grp + 2;
+                  j3 = 4 * n_grp + 3;
+                } else if constexpr (kHeadDimGemm2 == 128) {
+                  // BS2 D128 uses PermMmaTileN <_8,_4,_4>:<_1,_32,_8>.
+                  j0 = n_grp;
+                  j1 = n_grp + kOStsmNGroups;
+                  j2 = n_grp + 2 * kOStsmNGroups;
+                  j3 = n_grp + 3 * kOStsmNGroups;
+                } else {
+                  // D256 is two D128 slabs in C-fragment order.
+                  const int slab = n_grp >> 2;
+                  const int grp = n_grp & 3;
+                  const int base = slab * 16 + grp;
+                  j0 = base;
+                  j1 = base + 4;
+                  j2 = base + 8;
+                  j3 = base + 12;
+                }
+                uint32_t rb0 = rO_u32[2 * j0 + m_grp];
+                uint32_t rb1 = rO_u32[2 * j1 + m_grp];
+                uint32_t rb2 = rO_u32[2 * j2 + m_grp];
+                uint32_t rb3 = rO_u32[2 * j3 + m_grp];
+
+                asm volatile(
+                    "stmatrix.sync.aligned.x4.m8n8.shared.b16 [%0], {%1, %2, %3, %4};\n"
+                    : : "r"(stsm_addr), "r"(rb0), "r"(rb1), "r"(rb2), "r"(rb3) : "memory");
+              }
             }
-          }
           }
 
           // For partial tiles (last tile of a varlen sequence): zero SMEM rows [valid_rows, kBlockM)
@@ -1842,9 +1868,12 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
             // cannot proceed until each math warp has arrived after its own STSM stores.
             asm volatile("bar.sync 1, 256;\n" : : : "memory");
             const int oob_elems = (kBlockM - valid_rows) * kHeadDim;
-            OutElement* sO_raw = reinterpret_cast<OutElement*>(smem_o) + valid_rows * kHeadDim;
-            for (int i = tidx_math; i < oob_elems; i += kNMathThreads)
-              sO_raw[i] = OutElement(0);
+            for (int i = tidx_math; i < oob_elems; i += kNMathThreads) {
+              const int row_offset = i / kHeadDim;
+              const int row = valid_rows + row_offset;
+              const int col = i - row_offset * kHeadDim;
+              sO_swz(row, col) = OutElement(0);
+            }
             asm volatile("bar.sync 1, 256;\n" : : : "memory");  // OOB zeros visible before TMA.
           }
 

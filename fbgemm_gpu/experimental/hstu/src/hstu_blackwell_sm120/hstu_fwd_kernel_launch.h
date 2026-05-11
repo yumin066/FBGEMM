@@ -169,8 +169,7 @@ void run_hstu_fwd_sm120_fp8_ws_tma_impl(Hstu_fwd_params& params, cudaStream_t st
       cute::_1{});
 
   using OutElement = typename Kernel_traits::OutputType;
-  using SmemLayoutO_TMA_t = cute::Layout<cute::Shape<cute::Int<kBlockM>, cute::Int<kHeadDim>>,
-                                         cute::Stride<cute::Int<kHeadDim>, cute::_1>>;
+  using SmemLayoutO_TMA_t = typename Kernel_traits::SmemLayoutWsO_TMA;
   auto tensor_O_full = cute::make_tensor(
       cute::make_gmem_ptr(static_cast<OutElement*>(params.o_ptr)),
       cute::make_layout(

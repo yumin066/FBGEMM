@@ -417,6 +417,41 @@ struct Hstu_fwd_kernel_traits_sm120_fp8 {
       Layout<Shape<_1, Int<kGmemElemsPerLoadO>>>{}));
 };
 
+template <int kHeadDim_, int kBlockM_, typename OutType_>
+struct Hstu_sm120_ws_o_tma_layout {
+  using type = Layout<
+      Shape<Int<kBlockM_>, Int<kHeadDim_>>,
+      Stride<Int<kHeadDim_>, _1>>;
+};
+
+template <int kBlockM_, typename OutType_>
+struct Hstu_sm120_ws_o_tma_layout<32, kBlockM_, OutType_> {
+  using type = decltype(tile_to_shape(
+      GMMA::Layout_K_SW32_Atom<OutType_>{},
+      Shape<Int<kBlockM_>, Int<32>>{}));
+};
+
+template <int kBlockM_, typename OutType_>
+struct Hstu_sm120_ws_o_tma_layout<64, kBlockM_, OutType_> {
+  using type = decltype(tile_to_shape(
+      GMMA::Layout_K_SW64_Atom<OutType_>{},
+      Shape<Int<kBlockM_>, Int<64>>{}));
+};
+
+template <int kBlockM_, typename OutType_>
+struct Hstu_sm120_ws_o_tma_layout<128, kBlockM_, OutType_> {
+  using type = decltype(tile_to_shape(
+      GMMA::Layout_K_SW128_Atom<OutType_>{},
+      Shape<Int<kBlockM_>, Int<128>>{}));
+};
+
+template <int kBlockM_, typename OutType_>
+struct Hstu_sm120_ws_o_tma_layout<256, kBlockM_, OutType_> {
+  using type = decltype(tile_to_shape(
+      GMMA::Layout_K_SW128_Atom<OutType_>{},
+      Shape<Int<kBlockM_>, Int<256>>{}));
+};
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Warp-specialized FP8 kernel traits.
 // Extends the common FP8 metadata with dedicated load/store warps and 8 math warps.
@@ -517,11 +552,22 @@ struct Hstu_fwd_kernel_traits_sm120_fp8_ws
   static constexpr int kSmemWsQPersistOffset = ((kSmemWsFuncEnd + 2047) / 2048) * 2048;
   static constexpr int kSmemWsAfterQPersist = kSmemWsQPersistOffset + kSmemQPersistBytes;
   static constexpr int kSmemWsAfterQPersistPadded = ((kSmemWsAfterQPersist + 127) / 128) * 128;
-  static constexpr bool kUseIndependentOBuffer = kHeadDim_ == 128;
+  using SmemLayoutWsO_TMA =
+      typename Hstu_sm120_ws_o_tma_layout<kHeadDim_, kBlockM_, out_type>::type;
+  static constexpr int kSmemWsOStoreBytes =
+      (int)size(SmemLayoutWsO_TMA{}) * (int)sizeof(out_type);
+  // D32/D64/D128 can afford a dedicated swizzled O buffer. D256 no-RAB keeps
+  // two KV stages, whose combined 64KB region can be safely reused after math
+  // consumes all K/V tiles and before the next tile's K/V loads.
+  static constexpr bool kUseIndependentOBuffer = kHeadDim_ <= 128;
+  static constexpr bool kUseAliasedOBuffer =
+      kHeadDim_ > 128 && !kUseSingleKVStage;
+  static constexpr bool kUseTmaOStore =
+      kUseIndependentOBuffer || kUseAliasedOBuffer;
   static constexpr int kSmemWsOOffset = kSmemWsAfterQPersistPadded;
   static constexpr int kSmemWsOBytes =
       kUseIndependentOBuffer
-          ? kBlockM_ * kHeadDim_ * (int)sizeof(out_type)
+          ? kSmemWsOStoreBytes
           : 0;
   static constexpr int kSmemWsAfterO = kSmemWsOOffset + kSmemWsOBytes;
   static constexpr int kSmemWsRabOffset = kSmemWsAfterO;
