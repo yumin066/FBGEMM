@@ -274,7 +274,6 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     const bool is_q_load_warp = load_warp_id == 0;
     const bool is_k_load_warp = load_warp_id == 1;
     const bool is_v_load_warp = load_warp_id == 2;
-    const bool is_o_store_warp = load_warp_id == 3;
 
     constexpr bool Is_causal    = Kernel_traits::Is_causal;
     constexpr bool Is_target    = Kernel_traits::Is_target;
@@ -374,7 +373,12 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       __syncthreads();  // One-time S1 for persistent: WS mbarriers initialized before scheduler loop.
     }
 
-    auto run_load_tile = [&](const int bidb, const int bidh, int m_block) {
+    auto run_load_tile = [&](auto load_role, const int bidb, const int bidh, int m_block) {
+      constexpr int LoadRole = decltype(load_role)::value;
+      constexpr bool IsQLoadRole = LoadRole == 0;
+      constexpr bool IsKLoadRole = LoadRole == 1;
+      constexpr bool IsVLoadRole = LoadRole == 2;
+      constexpr bool IsOStoreRole = LoadRole == 3;
       const HstuBlockInfo<Kernel_traits, Params> binfo(params, bidb);
       // Early exit 1: before any sync — both branches exit simultaneously.
       if (m_block * kBlockM >= binfo.actual_seqlen_q_padded) return;
@@ -614,7 +618,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
       // feed the double-buffered N loop. O-store warp owns the final TMA store.  Q and O do
       // not get extra buffers.  Producer/consumer mbarriers replace the old tile-end load
       // rendezvous: load warps wait empty, math waits ready, and O-store waits O ready.
-      if (is_q_load_warp) {
+      if constexpr (IsQLoadRole) {
         wait_mbar_parity(q_empty_mbar_ptr, (uint32_t)q_empty_wait_parity);
         q_empty_wait_parity ^= 1;
         if (tidx == kNMathThreads) {
@@ -647,14 +651,12 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         }
       }
 
-      if constexpr (Kernel_traits::kUseAliasedOBuffer) {
-        if (is_k_load_warp || is_v_load_warp) {
-          wait_mbar_parity(o_empty_mbar_ptr0, (uint32_t)o_empty_load_wait_parity0);
-          o_empty_load_wait_parity0 ^= 1;
-        }
+      if constexpr (Kernel_traits::kUseAliasedOBuffer && (IsKLoadRole || IsVLoadRole)) {
+        wait_mbar_parity(o_empty_mbar_ptr0, (uint32_t)o_empty_load_wait_parity0);
+        o_empty_load_wait_parity0 ^= 1;
       }
 
-      if (is_k_load_warp) {
+      if constexpr (IsKLoadRole) {
         if constexpr (Paged_KV) {
           auto copy_paged_or_target_k = [&](int nb, int stage) {
             FP8Elem* dst = stage ? sK_base[1] : sK_base[0];
@@ -815,7 +817,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         }
       }
 
-      if (is_v_load_warp) {
+      if constexpr (IsVLoadRole) {
         if constexpr (Paged_KV) {
           auto copy_paged_or_target_v = [&](int nb, int stage) {
             FP8Elem* dst = stage ? sVt_base[1] : sVt_base[0];
@@ -975,7 +977,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         }
       }
 
-      if (is_o_store_warp) {
+      if constexpr (IsOStoreRole) {
         if constexpr (Kernel_traits::kUseTmaOStore) {
         // Math warps own compute/softmax and write O to independent SMEM; O-store waits
         // for o_ready[0], then releases o_empty[0] after the TMA store completes.
@@ -1011,34 +1013,46 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
     // scheduler and decode the same tile ids locally.  There is no dynamic work
     // queue, atomic counter, or shared tile-id sync on this path.
     const bool head_shared_rab = Has_rab && params.h_rab == 1 && params.h > 1;
-    if constexpr (Use_paired_persistent) {
-      const int num_m_block_persistent = (params.seqlen_q + kBlockM - 1) / kBlockM;
-      const int total_tiles_persistent = num_m_block_persistent * params.h * params.b;
-      const int total_tile_pairs_persistent = (total_tiles_persistent + 1) / 2;
-      #pragma unroll 1
-      for (int tile_pair = int(blockIdx.x); tile_pair < total_tile_pairs_persistent; tile_pair += int(gridDim.x)) {
-        const int paired_tile = total_tiles_persistent - 1 - tile_pair;
-        const int tiles_this_pair = paired_tile == tile_pair ? 1 : 2;
-
+    auto run_load_scheduler = [&](auto load_role) {
+      if constexpr (Use_paired_persistent) {
+        const int num_m_block_persistent = (params.seqlen_q + kBlockM - 1) / kBlockM;
+        const int total_tiles_persistent = num_m_block_persistent * params.h * params.b;
+        const int total_tile_pairs_persistent = (total_tiles_persistent + 1) / 2;
         #pragma unroll 1
-        for (int pair_slot = 0; pair_slot < tiles_this_pair; ++pair_slot) {
-          const int tile = pair_slot == 0 ? tile_pair : paired_tile;
+        for (int tile_pair = int(blockIdx.x); tile_pair < total_tile_pairs_persistent; tile_pair += int(gridDim.x)) {
+          const int paired_tile = total_tiles_persistent - 1 - tile_pair;
+          const int tiles_this_pair = paired_tile == tile_pair ? 1 : 2;
+
+          #pragma unroll 1
+          for (int pair_slot = 0; pair_slot < tiles_this_pair; ++pair_slot) {
+            const int tile = pair_slot == 0 ? tile_pair : paired_tile;
+            const HstuWsTileCoord coord =
+                hstu_ws_decode_tile(tile, num_m_block_persistent, params.h, head_shared_rab);
+            run_load_tile(load_role, coord.bidb, coord.bidh, coord.m_block);
+          }
+        }
+      } else if constexpr (Use_full_persistent) {
+        const int num_m_block_persistent = (params.seqlen_q + kBlockM - 1) / kBlockM;
+        const int total_tiles_persistent = num_m_block_persistent * params.h * params.b;
+        #pragma unroll 1
+        for (int tile = int(blockIdx.x); tile < total_tiles_persistent; tile += int(gridDim.x)) {
           const HstuWsTileCoord coord =
               hstu_ws_decode_tile(tile, num_m_block_persistent, params.h, head_shared_rab);
-          run_load_tile(coord.bidb, coord.bidh, coord.m_block);
+          run_load_tile(load_role, coord.bidb, coord.bidh, coord.m_block);
         }
+      } else {
+        run_load_tile(load_role, bidb_arg, bidh_arg, m_block_arg);
       }
-    } else if constexpr (Use_full_persistent) {
-      const int num_m_block_persistent = (params.seqlen_q + kBlockM - 1) / kBlockM;
-      const int total_tiles_persistent = num_m_block_persistent * params.h * params.b;
-      #pragma unroll 1
-      for (int tile = int(blockIdx.x); tile < total_tiles_persistent; tile += int(gridDim.x)) {
-        const HstuWsTileCoord coord =
-            hstu_ws_decode_tile(tile, num_m_block_persistent, params.h, head_shared_rab);
-        run_load_tile(coord.bidb, coord.bidh, coord.m_block);
-      }
+    };
+
+    if (is_q_load_warp) {
+      run_load_scheduler(std::integral_constant<int, 0>{});
+    } else if (is_k_load_warp) {
+      run_load_scheduler(std::integral_constant<int, 1>{});
+    } else if (is_v_load_warp) {
+      run_load_scheduler(std::integral_constant<int, 2>{});
     } else {
-      run_load_tile(bidb_arg, bidh_arg, m_block_arg);
+      run_load_scheduler(std::integral_constant<int, 3>{});
     }
     // Load warp path exits here.  Active load warp has also completed O TMA-store.
 
