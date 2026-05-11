@@ -49,15 +49,24 @@ __device__ __forceinline__ void arrive_expect_tx_mbar(
   arrive_expect_tx_mbar(mbar_smem_addr(mbar), expected_tx_bytes);
 }
 
-// Spin-wait helper: blocks until the expected mbarrier phase completes.
+// Fast path with one non-suspending probe; long waits then use try_wait so the
+// warp can yield while TMA or another producer completes the phase.
 __device__ inline void wait_mbar_parity(uint32_t maddr, uint32_t parity) {
   uint32_t done = 0;
+  asm volatile(
+      "{.reg .pred p;\n"
+      "mbarrier.test_wait.parity.shared::cta.b64 p, [%1], %2;\n"
+      "selp.u32 %0, 1, 0, p;}\n"
+      : "=r"(done) : "r"(maddr), "r"(parity) : "memory");
+  if (done) return;
+
+  constexpr uint32_t kTryWaitSuspendHint = 0x989680u;
   do {
     asm volatile(
         "{.reg .pred p;\n"
-        "mbarrier.test_wait.parity.shared::cta.b64 p, [%1], %2;\n"
+        "mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2, %3;\n"
         "selp.u32 %0, 1, 0, p;}\n"
-        : "=r"(done) : "r"(maddr), "r"(parity));
+        : "=r"(done) : "r"(maddr), "r"(parity), "r"(kTryWaitSuspendHint) : "memory");
   } while (!done);
 }
 
