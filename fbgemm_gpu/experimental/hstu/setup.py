@@ -375,6 +375,12 @@ if "10.0" in arch_list:
 packages.append("hstu.hstu_blackwell_rtx")
 package_dir["hstu.hstu_blackwell_rtx"] = "src/hstu_blackwell_rtx"
 
+if "12.0" in arch_list:
+    packages.append("hstu.hstu_blackwell_sm120_cudatile_fp8_ws")
+    package_dir["hstu.hstu_blackwell_sm120_cudatile_fp8_ws"] = "src/hstu_blackwell_sm120_cudatile_fp8_ws"
+    packages.append("hstu.hstu_blackwell_sm120_cudatile_bf16")
+    package_dir["hstu.hstu_blackwell_sm120_cudatile_bf16"] = "src/hstu_blackwell_sm120_cudatile_bf16"
+
 setup(
     name=PACKAGE_NAME,
     version="0.1.0" + '+cu' + str(bare_metal_version),
