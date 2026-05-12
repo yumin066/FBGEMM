@@ -8,6 +8,7 @@
 # Usage:
 #   ./launch_smart_hstu.sh --chip gb202 --trace /path/to/cuda.tgz
 #   ./launch_smart_hstu.sh --chip gb202  # uses traces/hstu_latest_cuda.tgz
+#   ./launch_smart_hstu.sh --chip gb202 --headdim 128  # for old traces without hdim in path
 #   ./launch_smart_hstu.sh --chip gb202 --node <healthy-computelab-node>
 set -euo pipefail
 
@@ -18,6 +19,7 @@ FLOW_SMART="${FLOW_SMART:-/home/scratch.svc_compute_arch/release/flow.smart/late
 CONFIG="${PERFSIM_DIR}/config.smart.yml"
 CHIP="${CHIP:-gb202}"
 TRACE="${PERFSIM_DIR}/traces/hstu_latest_cuda.tgz"
+HEADDIM="${HEADDIM:-}"
 USE_SMART2=1
 export PATH="${PERFSIM_DIR}/tools:${PATH}"
 
@@ -55,8 +57,23 @@ fi
 
 COMMIT=$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || echo "unknown")
 TIMESTAMP=$(date +"%Y%m%d_%H%M")
-OUT_DIR="${PERFSIM_DIR}/results/hstu_trace_${CHIP}_${COMMIT}_${TIMESTAMP}"
+OUT_DIR=""
 NODE_ARGS=()
+
+resolve_path() {
+    local path="$1"
+    readlink -f "${path}" 2>/dev/null || realpath "${path}" 2>/dev/null || echo "${path}"
+}
+
+infer_headdim_from_trace() {
+    local path="$1"
+    if [[ "${path}" =~ hdim([0-9]+) ]]; then
+        echo "${BASH_REMATCH[1]}"
+    elif [[ "${path}" =~ (^|[/_])d([0-9]+)([/_]|$) ]]; then
+        echo "${BASH_REMATCH[2]}"
+    fi
+    return 0
+}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -64,6 +81,7 @@ while [[ $# -gt 0 ]]; do
         --dir)  OUT_DIR="$2"; shift 2 ;;
         --config) CONFIG="$2"; shift 2 ;;
         --trace) TRACE="$2"; shift 2 ;;
+        --headdim|--head-dim|--head_dim) HEADDIM="$2"; shift 2 ;;
         --node) NODE_ARGS+=(-node "$2"); shift 2 ;;
         --no-use-smart2) USE_SMART2=0; shift ;;
         *) echo "Unknown arg: $1" >&2; exit 1 ;;
@@ -77,10 +95,25 @@ if [[ ! -f "${TRACE}" ]]; then
     exit 1
 fi
 
+TRACE_RESOLVED="$(resolve_path "${TRACE}")"
+if [[ -z "${HEADDIM}" ]]; then
+    HEADDIM="$(infer_headdim_from_trace "${TRACE_RESOLVED}")"
+fi
+if [[ -z "${HEADDIM}" ]]; then
+    HEADDIM="unknown"
+    echo "WARNING: cannot infer HEADDIM from trace path; pass --headdim <N> for old traces." >&2
+fi
+
+if [[ -z "${OUT_DIR}" ]]; then
+    OUT_DIR="${PERFSIM_DIR}/results/hstu_trace_${CHIP}_hdim${HEADDIM}_${COMMIT}_${TIMESTAMP}"
+fi
+
 echo "Submitting Smart from pre-collected HSTU CUDA trace"
 echo "  flow.smart : ${FLOW_SMART}"
 echo "  Chip       : ${CHIP}"
+echo "  HeadDim    : ${HEADDIM}"
 echo "  Trace      : ${TRACE}"
+echo "  Trace(real): ${TRACE_RESOLVED}"
 echo "  Config     : ${CONFIG}"
 echo "  Out        : ${OUT_DIR}"
 if [[ "${#NODE_ARGS[@]}" -gt 0 ]]; then

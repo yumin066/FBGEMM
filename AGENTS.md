@@ -218,6 +218,15 @@ PYTHONUSERBASE=/home/scratch.minyu_gpu/project/.cache/pip-user python /home/scra
 
 `bench_hstu_attn_sm120.py` 默认覆盖 `full/causal/local/context/target/arbitrary` × `none/rab/drab`，并对每个逻辑 case 输出 BF16、non-paged FP8、paged FP8 三列。可用 `--mask-configs`、`--bias-configs` 和 `--columns bf16 fp8 paged` 做子集筛选；`--rab-heads shared` 用于 head-shared RAB (`h_rab=1`) 同频对比，默认 `per-head`；旧 `--full-only` / `--causal-only` 仍保留为 alias。BF16、FP8、paged 三列独立计时，BF16 unsupported 不应阻塞 FP8/paged 结果。TFLOPS 按实际 valid attention pairs 计算，不再按 full 矩阵统一估算。
 
+跨节点 / 跨架构 benchmark：
+
+- 目标是对比 SM120 FP8 kernel 与 H100 FP8/BF16 kernel；SM120 host 上运行 Codex，SM120 与 H100 节点共享文件系统。
+- SM120 侧：在本机仓库根目录通过 `./docker_computelab.sh` 进入容器后运行全量 benchmark。
+- H100 侧：先在 SM120 host 上执行 `squeue -u minyu` 查看当前 Slurm 分配到的 H100 节点，再 `ssh <h100-node>` 登录该节点；登录后进入同一个共享仓库目录，通过 `./docker_computelab.sh` 进入容器并运行 H100 全量 benchmark。
+- H100 编译产物必须隔离，不能覆盖 SM120 编译结果。优先使用 `bench_cross_arch.sh` 的 per-arch build prefix：SM120 写入 `.build/sm12x/`，H100 写入 `.build/sm9x/`；若手动编译 H100，必须显式设置 H100 专用 `PYTHONUSERBASE`，例如 `.build/sm9x`，并使用 `HSTU_ARCH_LIST="9.0"`，同时显式启用 `HSTU_DISABLE_HDIM64=FALSE HSTU_DISABLE_HDIM256=FALSE`。
+- SM120/H100 benchmark 日志统一放到共享仓库的 `6cross_bench_results/`；文件名应包含 GPU slug、commit 和时间戳。需要汇总时使用 `fbgemm_gpu/experimental/hstu/benchmark/compare_cross_arch.py` 或等价解析脚本，输出共同 case 的 latency/TFLOPS 比值。
+- 跨节点 benchmark 也必须锁频；若 H100/SM120 任一侧无法锁频，日志和结论必须明确标注 `unlocked`，不能作为严格性能回归结论。
+
 profile：
 
 ```bash

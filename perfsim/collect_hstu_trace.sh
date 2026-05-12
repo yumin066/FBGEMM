@@ -54,7 +54,7 @@ strip_ld_path_entry() {
 BS=1
 SEQ=1024
 HEADS=1
-HEADDIM=128
+HEADDIM=256
 CAUSAL_FLAG=""
 FRANGE="3:3"      # 4th invocation (skip 3 init/warmup launches), 0-indexed
 ITERS=6           # total invocations (must be > frange end)
@@ -77,7 +77,7 @@ done
 MASK_TAG=$( [[ -n "${CAUSAL_FLAG}" ]] && echo "causal" || echo "full" )
 COMMIT=$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || echo "unknown")
 TIMESTAMP=$(date +"%Y%m%d_%H%M")
-OUT_DIR="${PERFSIM_DIR}/traces/hstu_sm120_fp8_bs${BS}_seq${SEQ}_h${HEADS}_${MASK_TAG}_${COMMIT}_${TIMESTAMP}"
+OUT_DIR="${PERFSIM_DIR}/traces/hstu_sm120_fp8_bs${BS}_seq${SEQ}_h${HEADS}_hdim${HEADDIM}_${MASK_TAG}_${COMMIT}_${TIMESTAMP}"
 mkdir -p "${OUT_DIR}"
 echo "Output dir : ${OUT_DIR}"
 
@@ -119,11 +119,14 @@ if [[ -z "${TRACE}" ]]; then
     exit 1
 fi
 
+LATEST_TRACE="${PERFSIM_DIR}/traces/hstu_latest_hdim${HEADDIM}_cuda.tgz"
+ln -sfn "${TRACE}" "${LATEST_TRACE}"
 ln -sfn "${TRACE}" "${PERFSIM_DIR}/traces/hstu_latest_cuda.tgz"
 
 echo ""
 echo "Trace collected → ${TRACE}"
-echo "Latest symlink → ${PERFSIM_DIR}/traces/hstu_latest_cuda.tgz"
+echo "Latest symlink → ${LATEST_TRACE}"
+echo "Compat symlink → ${PERFSIM_DIR}/traces/hstu_latest_cuda.tgz"
 echo ""
 echo "Next step: on a login node (sc-xterm / computelab-frontend), run:"
 echo "  ${PERFSIM_DIR}/launch_smart_hstu.sh --chip gb202 --trace ${TRACE}"

@@ -73,13 +73,16 @@ if [[ "${BUILD}" -eq 1 ]]; then
             ;;
         9)
             HSTU_ARCH_LIST="9.0" \
+            HSTU_DISABLE_HDIM32=FALSE \
+            HSTU_DISABLE_HDIM64=FALSE \
+            HSTU_DISABLE_HDIM256=FALSE \
                 pip install --no-build-isolation --user . -q
             ;;
         12)
             HSTU_ARCH_LIST="12.0" \
-            HSTU_DISABLE_HDIM32=TRUE \
-            HSTU_DISABLE_HDIM64=TRUE \
-            HSTU_DISABLE_HDIM256=TRUE \
+            HSTU_DISABLE_HDIM32=FALSE \
+            HSTU_DISABLE_HDIM64=FALSE \
+            HSTU_DISABLE_HDIM256=FALSE \
                 pip install --no-build-isolation --user . -q
             ;;
         10|11)

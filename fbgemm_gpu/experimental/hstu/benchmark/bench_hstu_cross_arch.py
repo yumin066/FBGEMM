@@ -8,7 +8,7 @@ quantization overhead) across SM80 (Ampere), SM90 (Hopper), and SM120
 
 Supported dtypes per architecture:
   SM80  — BF16
-  SM90  — BF16
+  SM90  — BF16, FP8 block-scale (quant_mode=2)
   SM120 — BF16, FP8 block-scale (quant_mode=2)
 
 SM100 (Blackwell GB) uses a Python implementation with no stable torch.ops
@@ -50,6 +50,7 @@ if _arch_pysite and os.path.isdir(_arch_pysite) and _arch_pysite not in sys.path
 try:
     from hstu.cuda_hstu_attention import (
         pack_descale_to_e8m0x4_int32,
+        get_bm_and_bn_block_size_fwd,
         quantize_for_block_scale_qk_along_d,
         quantize_for_block_scale_v_along_n,
     )
@@ -87,7 +88,7 @@ class BenchConfig:
 
     def label(self) -> str:
         mask = "causal" if self.causal else "full"
-        return f"bs={self.batch_size} seq={self.seqlen} h={self.nheads} {mask}"
+        return f"bs={self.batch_size} seq={self.seqlen} h={self.nheads} d={self.headdim} {mask}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -114,10 +115,11 @@ def make_fp8_inputs_sm120(cfg: BenchConfig, q_bf16, k_bf16, v_bf16):
     Quantize BF16 Q/K/V to FP8 block-scale format required by SM120 quant_mode=2.
 
     Q/K: block-scale along D (headdim), granularity=128.
-    V  : block-scale along N (sequence), block_size=128.
+    V  : block-scale along N (sequence), using the same BN as the runtime kernel.
     SF tensors are packed to e8m0×4 int32 as expected by the kernel.
     """
     cu = _cu_seqlens(cfg.batch_size, cfg.seqlen)
+    _, bn = get_bm_and_bn_block_size_fwd(None, cfg.headdim)
     # Clamp to FP8 representable range before quantization
     q_in = q_bf16.to(torch.float8_e4m3fn).to(torch.bfloat16)
     k_in = k_bf16.to(torch.float8_e4m3fn).to(torch.bfloat16)
@@ -128,12 +130,12 @@ def make_fp8_inputs_sm120(cfg: BenchConfig, q_bf16, k_bf16, v_bf16):
     k_fp8, k_dsc, cu_kv_blk = quantize_for_block_scale_qk_along_d(
         k_in, cu, fp8_type=torch.float8_e4m3fn)
     v_fp8, v_dsc, cu_v_blk  = quantize_for_block_scale_v_along_n(
-        v_in, cu, block_size=128, fp8_type=torch.float8_e4m3fn)
+        v_in, cu, block_size=bn, fp8_type=torch.float8_e4m3fn)
 
     sf_q = pack_descale_to_e8m0x4_int32(q_dsc)
     sf_k = pack_descale_to_e8m0x4_int32(k_dsc)
-    # SFV is tiled: each scale covers kBlockN=128 tokens, repeat to match token count
-    sf_v = pack_descale_to_e8m0x4_int32(v_dsc).repeat_interleave(128, dim=1)
+    # SFV is tiled: each scale covers BN tokens, repeat to match token count.
+    sf_v = pack_descale_to_e8m0x4_int32(v_dsc).repeat_interleave(bn, dim=1)
 
     return (q_fp8, k_fp8, v_fp8,
             sf_q, sf_k, sf_v,
@@ -200,6 +202,30 @@ def run_sm120_bf16(q, k, v, cu, cfg: BenchConfig):
     return out
 
 
+def run_sm90_fp8(fp8_inputs, cfg: BenchConfig):
+    (q_fp8, k_fp8, v_fp8,
+     _sf_q, _sf_k, _sf_v,
+     q_dsc, k_dsc, v_dsc,
+     cu, cu_q_blk, cu_kv_blk, _cu_v_blk) = fp8_inputs
+    wl, wr = cfg.window()
+    out, _ = torch.ops.fbgemm.hstu_varlen_fwd_90(
+        q_fp8, k_fp8, v_fp8,
+        cu, cu,
+        None, None,
+        cfg.seqlen, cfg.seqlen, cfg.seqlen,
+        None, None, 1,
+        wl, wr,
+        1.0,
+        None, None,
+        2,                            # quant_mode=2 → FP8 block-scale
+        0,                            # output_dtype: 0=BF16
+        None, None,                   # vt, cu_seqlens_vt_descale
+        q_dsc, k_dsc, v_dsc, None,
+        cu_q_blk, cu_kv_blk,
+    )
+    return out
+
+
 def run_sm120_fp8(fp8_inputs, cfg: BenchConfig):
     (q_fp8, k_fp8, v_fp8,
      sf_q, sf_k, sf_v,
@@ -255,6 +281,11 @@ _BF16_RUNNERS = {
     12: run_sm120_bf16,
 }
 
+_FP8_RUNNERS = {
+    9:  run_sm90_fp8,
+    12: run_sm120_fp8,
+}
+
 
 def bench_config(cfg: BenchConfig, sm_major: int, gpu_name: str = "") -> Dict:
     result: Dict = {"config": cfg.label(), "gpu_name": gpu_name, "flops": cfg.flops()}
@@ -272,11 +303,14 @@ def bench_config(cfg: BenchConfig, sm_major: int, gpu_name: str = "") -> Dict:
         except Exception as exc:
             result["bf16_error"] = str(exc)
 
-    # FP8 block-scale kernel — SM120 only
-    if sm_major == 12:
+    # FP8 block-scale kernel
+    fp8_runner = _FP8_RUNNERS.get(sm_major)
+    if fp8_runner is not None:
         try:
+            if sm_major == 9 and cfg.headdim not in (64, 128, 256):
+                raise RuntimeError(f"SM90 FP8 supports headdim 64/128/256, got {cfg.headdim}")
             fp8_inputs = make_fp8_inputs_sm120(cfg, q, k, v)
-            avg_ms, _ = time_kernel(lambda: run_sm120_fp8(fp8_inputs, cfg))
+            avg_ms, _ = time_kernel(lambda: fp8_runner(fp8_inputs, cfg))
             result["fp8_ms"]     = avg_ms
             result["fp8_tflops"] = cfg.flops() / (avg_ms * 1e-3) / 1e12
             if "bf16_tflops" in result:
@@ -303,8 +337,8 @@ def _fmt(result: Dict, ms_key: str, tf_key: str) -> Tuple[str, str]:
 
 
 def print_results(results: List[Dict], sm_major: int, gpu_name: str) -> None:
-    has_fp8 = sm_major == 12
-    w = 80 if not has_fp8 else 100
+    has_fp8 = sm_major in _FP8_RUNNERS
+    w = 90 if not has_fp8 else 112
     print(f"\n{'=' * w}")
     print(f"  HSTU Attention — Kernel-Only Benchmark")
     print(f"  GPU : {gpu_name}  (SM{sm_major}x)   "
@@ -312,16 +346,16 @@ def print_results(results: List[Dict], sm_major: int, gpu_name: str) -> None:
     print(f"{'=' * w}")
 
     if has_fp8:
-        header = (f"{'Config':<40} {'BF16 ms':>8} {'BF16 TF/s':>10}"
+        header = (f"{'Config':<48} {'BF16 ms':>8} {'BF16 TF/s':>10}"
                   f" {'FP8 ms':>7} {'FP8 TF/s':>9} {'Speedup':>8}")
     else:
-        header = f"{'Config':<40} {'BF16 ms':>8} {'BF16 TF/s':>10}"
+        header = f"{'Config':<48} {'BF16 ms':>8} {'BF16 TF/s':>10}"
     print(header)
     print("-" * (len(header) + 2))
 
     for r in results:
         bf16_ms, bf16_tf = _fmt(r, "bf16_ms", "bf16_tflops")
-        row = f"{r['config']:<40} {bf16_ms:>8} {bf16_tf:>10}"
+        row = f"{r['config']:<48} {bf16_ms:>8} {bf16_tf:>10}"
         if has_fp8:
             fp8_ms, fp8_tf = _fmt(r, "fp8_ms", "fp8_tflops")
             spd = (f"{r['speedup_pct']:>+7.1f}%" if "speedup_pct" in r
@@ -367,6 +401,9 @@ def main() -> None:
     parser.add_argument("--heads",       nargs="+", type=int,
                         default=[8],        metavar="H")
     parser.add_argument("--headdim",     type=int,  default=128, metavar="D")
+    parser.add_argument("--headdims",    nargs="+", type=int,
+                        default=None,       metavar="D",
+                        help="Run multiple head dimensions; overrides --headdim")
     parser.add_argument("--causal",      action="store_true",
                         help="Run causal-mask configs only")
     parser.add_argument("--full",        action="store_true",
@@ -399,8 +436,10 @@ def main() -> None:
         sys.exit(f"ERROR: Unsupported SM major version {sm_major}. "
                  f"Expected 8 (Ampere), 9 (Hopper), or 12 (Blackwell RTX Pro).")
 
-    if sm_major == 12 and args.headdim not in (64, 128):
-        sys.exit(f"ERROR: SM120 kernel only supports headdim 64 or 128, got {args.headdim}.")
+    headdims = args.headdims if args.headdims is not None else [args.headdim]
+    bad_headdims = [d for d in headdims if d not in (32, 64, 128, 256)]
+    if bad_headdims:
+        sys.exit(f"ERROR: Unsupported headdim values {bad_headdims}; expected 32/64/128/256.")
 
     # Build mask list: default = both
     mask_flags: List[bool] = []
@@ -412,10 +451,11 @@ def main() -> None:
         mask_flags = [False, True]   # full first, then causal
 
     configs = [
-        BenchConfig(b, s, h, args.headdim, causal)
+        BenchConfig(b, s, h, d, causal)
         for b     in args.batch_sizes
         for s     in args.seqlens
         for h     in args.heads
+        for d     in headdims
         for causal in mask_flags
     ]
 
