@@ -385,10 +385,6 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
   int n_valid_block_max = Is_arbitrary ? *sn_valid_block_max - 1 : 0;
   int n_block = !Is_arbitrary ? n_block_max - 1 : sValidBlockIds[n_valid_block_max];
   int buffer_stage = 0;
-  // Runtime GEMM1 bypass: set HSTU_DEBUG_GEMM1_ONLY=1 to skip GEMM2
-  // and output raw Q×K^T tiles (summed over n_blocks) instead.
-  const bool kGemm1Bypass = params.debug_gemm1_only;
-
   if constexpr (Has_rab) {
     copy_if_g2s_rab(n_block, buffer_stage);
   }
@@ -542,19 +538,17 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
       flash::cp_async_wait<0>();
       __syncthreads();
 
-      // async load V (skipped when GEMM1 bypass is enabled)
-      if (!kGemm1Bypass) {
-        auto tVsV_stage = tVsV(_, _, _, buffer_stage);
-        if (masking_step > 0) {
-          flash::copy<true>(gmem_tiled_copy_QKV,
-              tVgV(_, _, _, n_block), tVsV_stage, tKVcKV);
-        } else {
-          flash::copy<false, true>(gmem_tiled_copy_QKV,
-              tVgV(_, _, _, n_block), tVsV_stage, tKVcKV,
-              actual_seqlen_k - n_block * kBlockN);
-        }
-        cute::cp_async_fence();
+      // async load V
+      auto tVsV_stage = tVsV(_, _, _, buffer_stage);
+      if (masking_step > 0) {
+        flash::copy<true>(gmem_tiled_copy_QKV,
+            tVgV(_, _, _, n_block), tVsV_stage, tKVcKV);
+      } else {
+        flash::copy<false, true>(gmem_tiled_copy_QKV,
+            tVgV(_, _, _, n_block), tVsV_stage, tKVcKV,
+            actual_seqlen_k - n_block * kBlockN);
       }
+      cute::cp_async_fence();
 
       // GEMM1: Q × K^T
       if constexpr (Has_rab) {
@@ -579,43 +573,6 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120(
           acc_s, tSrQ, tSrK, tSsQ, tSsK(_, _, _, buffer_stage),
           tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
           smem_thr_copy_Q, smem_thr_copy_K);
-
-      if (kGemm1Bypass) {
-        // Stage-A: bypass right after GEMM1.
-        Tensor acc_s_view = make_tensor(
-            acc_s.data(),
-            group<1, 3>(group<0, 2>(select<1, 2, 0, 3>(flatten(acc_s.layout())))));
-        Tensor acc_o_view = make_tensor(
-            acc_o.data(),
-            group<1, 3>(group<0, 2>(select<1, 2, 0, 3>(flatten(acc_o.layout())))));
-#pragma unroll
-        for (int r = 0; r < size<0>(acc_o_view); ++r) {
-#pragma unroll
-          for (int c = 0; c < size<1>(acc_o_view); ++c) {
-            if (c < size<1>(acc_s_view)) {
-              acc_o_view(r, c) += acc_s_view(r, c);
-            }
-          }
-        }
-        flash::cp_async_wait<0>();
-        __syncthreads();
-        // Keep K pipeline moving so seq>=128 iterates across distinct n_blocks.
-        if (n_valid_block > n_block_min) {
-          int n_block_next = n_block - 1;
-          if constexpr (Is_arbitrary) {
-            n_block_next = sValidBlockIds[n_valid_block - 1];
-          }
-          if (is_jump && masking_step == n_masking_steps - 1)
-            n_block_next = std::min(n_block, n_block_history) - 1;
-          if (n_block_next >= n_block_min) {
-            auto tKsK_stage_next = tKsK(_, _, _, buffer_stage);
-            flash::copy<true>(gmem_tiled_copy_QKV,
-                tKgK(_, _, _, n_block_next), tKsK_stage_next, tKVcKV);
-            cute::cp_async_fence();
-          }
-        }
-        return;
-      }
 
       if (Is_arbitrary || Is_local || is_masking) {
         apply_mask(acc_s, n_block);

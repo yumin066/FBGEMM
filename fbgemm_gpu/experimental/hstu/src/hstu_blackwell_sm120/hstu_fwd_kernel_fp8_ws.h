@@ -2080,32 +2080,6 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         if constexpr (!(Has_rab && kUseRabSkipMasked)) {
           consume_rab_bs(acc_s, nb, false);
         }
-        if (params.debug_gemm1_only) {
-          if constexpr (Has_rab && kUseRabSkipMasked) {
-            consume_rab_bs(acc_s, nb, false);
-          }
-          for (int i = 0; i < size(acc_s); ++i) acc_o(i) += acc_s(i);
-          {
-            const int cur_parity = math_stage ? tma_parity1 : tma_parity0;
-            uint32_t vaddr =
-                smem_base32 + (uint32_t)kSmemMbar0Offset + 16u + (uint32_t)(math_stage * 8);
-            wait_mbar_parity(vaddr, (uint32_t)cur_parity);
-          }
-          if (math_stage) { tma_parity1 ^= 1; } else { tma_parity0 ^= 1; }
-          asm volatile("" ::: "memory");
-          if ((tidx_math & 31) == 0) {
-            uint32_t v_empty_addr =
-                smem_base32 + (uint32_t)kSmemMbar0Offset + 48u + (uint32_t)(math_stage * 8);
-            arrive_mbar(v_empty_addr);
-          }
-          if (is_jump && masking_step == n_masking_steps - 1)
-            n_valid_ref = std::min(n_valid_ref, n_block_history);
-          if constexpr (!Kernel_traits::kUseSingleKVStage) {
-            math_stage ^= 1;
-          }
-          return n_valid_ref;
-        }
-
         // Masking (Opt C: compile-time specialized).  For RAB, apply the mask
         // first on masked tiles so add_rab_bs can skip -inf entries without
         // recomputing the mask predicate on the math critical path.
@@ -2475,7 +2449,7 @@ inline __device__ void hstu_compute_attn_1rowblock_sm120_fp8_ws(
         }
       }
 
-      // Complex/full paths and debug_gemm1_only keep the old post-loop epilogue fallback.
+      // Complex/full paths keep the post-loop epilogue fallback.
       if constexpr (kStoreOInMainloop) {
         if (!o_epilogue_done) {
           store_o_epilogue();

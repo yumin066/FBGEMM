@@ -217,15 +217,6 @@ void set_params_fprop_sm120(
     params->exp_b_pbuf_in_sk = 0;
   }
 
-  // BF16 debug GEMM1-only bypass switch:
-  // export HSTU_DEBUG_GEMM1_ONLY=1 to output raw GEMM1 scores instead of GEMM2 result.
-  // The SM120 FP8 WS path no longer uses this debug bypass.
-  if (const char* g1only = std::getenv("HSTU_DEBUG_GEMM1_ONLY")) {
-    params->debug_gemm1_only = std::atoi(g1only) != 0;
-  } else {
-    params->debug_gemm1_only = false;
-  }
-
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

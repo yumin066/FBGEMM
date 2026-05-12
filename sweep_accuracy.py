@@ -39,13 +39,11 @@ SWEEP_SEQS = [128, 256, 512]
 # Users can still override from shell when explicitly needed.
 os.environ.setdefault("HSTU_EXP_A_SYNC_K", "0")
 os.environ.setdefault("HSTU_EXP_B_PBUF_IN_SK", "0")
-os.environ.setdefault("HSTU_DEBUG_GEMM1_ONLY", "0")
 
 EXP_A = os.getenv("HSTU_EXP_A_SYNC_K", "0")
 EXP_B = os.getenv("HSTU_EXP_B_PBUF_IN_SK", "0")
-GEMM1_ONLY = os.getenv("HSTU_DEBUG_GEMM1_ONLY", "0") == "1"
 RUN_PAGED_KV_SWEEP = os.getenv("HSTU_SKIP_PAGED_KV_SWEEP", "0") != "1"
-print(f"[sweep config] HSTU_EXP_A_SYNC_K={EXP_A} HSTU_EXP_B_PBUF_IN_SK={EXP_B} HSTU_DEBUG_GEMM1_ONLY={int(GEMM1_ONLY)}")
+print(f"[sweep config] HSTU_EXP_A_SYNC_K={EXP_A} HSTU_EXP_B_PBUF_IN_SK={EXP_B}")
 
 def run_attn(q, k, v, cu_seqlens, max_seqlen, num_targets, scaling_seqlen, quant_mode,
              q_descale=None, k_descale=None, v_descale=None,
@@ -576,31 +574,21 @@ def compute_full_paged_kv_metrics(batch_size, heads, seqlen, dim=128, dtype=torc
         raise AssertionError(f"full paged KV fp8_gt_cos={cos:.6f} < 0.995")
     return cos, max_err, mean_err, rel_l2, last_page_lens.detach().cpu().tolist()
 
-if GEMM1_ONLY:
-    print("[mode] GEMM1 bypass: output = sum(Q×K^T tiles) / scaling_seqlen, GEMM2 skipped")
+print(
+    f"{'D':>4} {'H':>4} {'SEQ':>6} | "
+    f"{'bf16_fp8_cos':>12} {'max_err':>10} {'mean_err':>10} | "
+    f"{'||bf16||':>10} {'||fp8||':>10} {'rel_l2':>10} | "
+    f"{'bf16_gt_cos':>11} {'bf16_gt_max':>12} {'bf16_gt_mean':>12} | "
+    f"{'fp8_gt_cos':>10} {'fp8_gt_max':>11} {'fp8_gt_mean':>11} | "
+    f"{'paged_c_cos':>12} {'paged_c_max':>12} {'paged_c_mean':>13} | "
+    f"{'paged_f_cos':>12} {'paged_f_max':>12} {'paged_f_mean':>13}"
+)
+print("-" * 256)
+if RUN_PAGED_KV_SWEEP:
     print(
-        f"{'D':>4} {'H':>4} {'SEQ':>6} | "
-        f"{'bf16_fp8_cos':>12} {'max_err':>10} {'mean_err':>10} | "
-        f"{'||bf16||':>10} {'||fp8||':>10} {'rel_l2':>10} | "
-        f"{'bf16_gt_cos':>11} {'bf16_gt_max':>12} {'fp8_gt_cos':>11} {'fp8_gt_max':>11}"
+        "[paged kv] paged_f mirrors every non-paged full sweep row; "
+        "appended columns compare against dequantized FP8/e8m0 references"
     )
-    print("-" * 130)
-else:
-    print(
-        f"{'D':>4} {'H':>4} {'SEQ':>6} | "
-        f"{'bf16_fp8_cos':>12} {'max_err':>10} {'mean_err':>10} | "
-        f"{'||bf16||':>10} {'||fp8||':>10} {'rel_l2':>10} | "
-        f"{'bf16_gt_cos':>11} {'bf16_gt_max':>12} {'bf16_gt_mean':>12} | "
-        f"{'fp8_gt_cos':>10} {'fp8_gt_max':>11} {'fp8_gt_mean':>11} | "
-        f"{'paged_c_cos':>12} {'paged_c_max':>12} {'paged_c_mean':>13} | "
-        f"{'paged_f_cos':>12} {'paged_f_max':>12} {'paged_f_mean':>13}"
-    )
-    print("-" * 256)
-    if RUN_PAGED_KV_SWEEP:
-        print(
-            "[paged kv] paged_f mirrors every non-paged full sweep row; "
-            "appended columns compare against dequantized FP8/e8m0 references"
-        )
 
 USE_ONES = os.getenv("HSTU_USE_ONES", "0") == "1"
 if USE_ONES:
@@ -682,85 +670,48 @@ for D in SWEEP_DIMS:
             cos_f_gt_pre, _, _ = metric_report(o_f, gt_deq_flat)
             flag = " <<<" if cos_f_gt_pre < 0.95 else ""
 
-            if GEMM1_ONLY:
-                # Python reference: accumulate Q×K^T tiles the same way the kernel does.
-                # Each tile [kBlockM × kBlockN] is summed into a [kBlockM × kHeadDim]
-                # buffer starting at column 0.  BF16 and FP8 can use different kBlockN
-                # on SM120, so build their debug references separately.
-                def gemm1_debug_reference(q_src: torch.Tensor, k_src: torch.Tensor, k_bn: int):
-                    k_bm = 128
-                    q_f = q_src.float()
-                    k_f = k_src.float()
-                    n_m = (SEQ + k_bm - 1) // k_bm
-                    n_n = (SEQ + k_bn - 1) // k_bn
-                    gt = torch.zeros(SEQ, H, D, dtype=torch.float32, device=DEVICE)
-                    for im in range(n_m):
-                        q_tile = q_f[im*k_bm:(im+1)*k_bm]
-                        for in_ in range(n_n):
-                            k_tile = k_f[in_*k_bn:(in_+1)*k_bn]
-                            s_tile = torch.einsum("mhd,nhd->mhn", q_tile, k_tile)
-                            actual_n = s_tile.shape[2]
-                            gt[im*k_bm:(im+1)*k_bm, :, :actual_n] += s_tile
-                    return (gt / SEQ).flatten()
-
-                bf16_bn = 128 if D == 128 else 64
-                gt_f = gemm1_debug_reference(
-                    q.to(torch.float8_e4m3fn), k.to(torch.float8_e4m3fn), fp8_bn)
-                if out_bf16 is not None:
-                    gt_b = gemm1_debug_reference(q, k, bf16_bn)
-                    cos_b_gt, me_b_gt, _ = metric_report(o_b, gt_b)
-                else:
-                    cos_b_gt = me_b_gt = None
-                cos_f_gt, me_f_gt, _ = metric_report(o_f, gt_f)
-                print(
-                    f"{D:>4} {H:>4} {SEQ:>6} | "
-                    f"{fmt_metric(cos, 12, 4)} {fmt_metric(me, 10, 6)} {fmt_metric(mn, 10, 6)} | "
-                    f"{fmt_metric(n_b, 10, 4)} {fmt_metric(n_f, 10, 4)} {fmt_metric(rel_l2, 10, 6)} | "
-                    f"{fmt_metric(cos_b_gt, 11, 4)} {fmt_metric(me_b_gt, 12, 6)} {cos_f_gt:>11.4f} {me_f_gt:>11.6f}{flag}"
+            gt = fullpath_ground_truth(q, k, v, ALPHA, SEQ).float().flatten()
+            if out_bf16 is not None:
+                cos_b_gt, me_b_gt, mn_b_gt = metric_report(o_b, gt)
+            else:
+                cos_b_gt = me_b_gt = mn_b_gt = None
+            # FP8 kernel vs dequantized ground truth (correct comparison)
+            cos_f_gt, me_f_gt, mn_f_gt = metric_report(o_f, gt_deq_flat)
+            if RUN_PAGED_KV_SWEEP:
+                paged_c_cos, paged_c_max, paged_c_mean, _, _ = compute_paged_kv_metrics(
+                    batch_size=BS,
+                    heads=H,
+                    new_history_len=SEQ,
+                    prev_history_len=0,
+                    target_len=0,
+                    dim=D,
+                )
+                paged_f_cos, paged_f_max, paged_f_mean, _, _ = compute_full_paged_kv_metrics(
+                    batch_size=BS,
+                    heads=H,
+                    seqlen=SEQ,
+                    dim=D,
+                )
+                paged_cols = (
+                    f" | {paged_c_cos:>12.4f} {paged_c_max:>12.6f} {paged_c_mean:>13.6f}"
+                    f" | {paged_f_cos:>12.4f} {paged_f_max:>12.6f} {paged_f_mean:>13.6f}"
                 )
             else:
-                gt = fullpath_ground_truth(q, k, v, ALPHA, SEQ).float().flatten()
-                if out_bf16 is not None:
-                    cos_b_gt, me_b_gt, mn_b_gt = metric_report(o_b, gt)
-                else:
-                    cos_b_gt = me_b_gt = mn_b_gt = None
-                # FP8 kernel vs dequantized ground truth (correct comparison)
-                cos_f_gt, me_f_gt, mn_f_gt = metric_report(o_f, gt_deq_flat)
-                if RUN_PAGED_KV_SWEEP:
-                    paged_c_cos, paged_c_max, paged_c_mean, _, _ = compute_paged_kv_metrics(
-                        batch_size=BS,
-                        heads=H,
-                        new_history_len=SEQ,
-                        prev_history_len=0,
-                        target_len=0,
-                        dim=D,
-                    )
-                    paged_f_cos, paged_f_max, paged_f_mean, _, _ = compute_full_paged_kv_metrics(
-                        batch_size=BS,
-                        heads=H,
-                        seqlen=SEQ,
-                        dim=D,
-                    )
-                    paged_cols = (
-                        f" | {paged_c_cos:>12.4f} {paged_c_max:>12.6f} {paged_c_mean:>13.6f}"
-                        f" | {paged_f_cos:>12.4f} {paged_f_max:>12.6f} {paged_f_mean:>13.6f}"
-                    )
-                else:
-                    paged_cols = (
-                        f" | {'N/A':>12} {'N/A':>12} {'N/A':>13}"
-                        f" | {'N/A':>12} {'N/A':>12} {'N/A':>13}"
-                    )
-                print(
-                    f"{D:>4} {H:>4} {SEQ:>6} | "
-                    f"{fmt_metric(cos, 12, 4)} {fmt_metric(me, 10, 6)} {fmt_metric(mn, 10, 6)} | "
-                    f"{fmt_metric(n_b, 10, 4)} {fmt_metric(n_f, 10, 4)} {fmt_metric(rel_l2, 10, 6)} | "
-                    f"{fmt_metric(cos_b_gt, 11, 4)} {fmt_metric(me_b_gt, 12, 6)} {fmt_metric(mn_b_gt, 12, 6)} | "
-                    f"{cos_f_gt:>10.4f} {me_f_gt:>11.6f} {mn_f_gt:>11.6f}{paged_cols}{flag}"
+                paged_cols = (
+                    f" | {'N/A':>12} {'N/A':>12} {'N/A':>13}"
+                    f" | {'N/A':>12} {'N/A':>12} {'N/A':>13}"
                 )
-                if bf16_error is not None:
-                    print(
-                        f"{'':>18}   [bf16 unsupported for this row: {bf16_error}]"
-                    )
+            print(
+                f"{D:>4} {H:>4} {SEQ:>6} | "
+                f"{fmt_metric(cos, 12, 4)} {fmt_metric(me, 10, 6)} {fmt_metric(mn, 10, 6)} | "
+                f"{fmt_metric(n_b, 10, 4)} {fmt_metric(n_f, 10, 4)} {fmt_metric(rel_l2, 10, 6)} | "
+                f"{fmt_metric(cos_b_gt, 11, 4)} {fmt_metric(me_b_gt, 12, 6)} {fmt_metric(mn_b_gt, 12, 6)} | "
+                f"{cos_f_gt:>10.4f} {me_f_gt:>11.6f} {mn_f_gt:>11.6f}{paged_cols}{flag}"
+            )
+            if bf16_error is not None:
+                print(
+                    f"{'':>18}   [bf16 unsupported for this row: {bf16_error}]"
+                )
         sys.stdout.flush()
 
 
@@ -792,7 +743,7 @@ def run_same_input_paged_vs_nonpaged():
                     )
 
 
-if not GEMM1_ONLY and RUN_PAGED_KV_SWEEP:
+if RUN_PAGED_KV_SWEEP:
     run_same_input_paged_vs_nonpaged()
 
 
@@ -831,11 +782,7 @@ def run_full_paged_kv_case(label, batch_size, heads, seqlen, dim=128, dtype=torc
     )
 
 
-if (
-    not GEMM1_ONLY
-    and RUN_PAGED_KV_SWEEP
-    and os.getenv("HSTU_PAGED_KV_EDGE_CASES", "0") == "1"
-):
+if RUN_PAGED_KV_SWEEP and os.getenv("HSTU_PAGED_KV_EDGE_CASES", "0") == "1":
     print("\n[paged kv edge cases] SM120 FP8 quant_mode=2")
     print(
         f"{'case':>22} | {'shape':>24} | "
