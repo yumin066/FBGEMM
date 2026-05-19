@@ -12,17 +12,37 @@ from .wrapper import TileToolchainError, hstu_fp8_d256_cudatile, require_availab
 def _make_inputs(batch: int, seqlen: int, heads: int):
     from hstu.cuda_hstu_attention import (
         pack_descale_to_e8m0x4_int32,
-        quantize_for_block_scale_qk_along_d,
-        quantize_for_block_scale_v_along_n,
+        quantize_for_block_scale,
     )
 
     q_raw = torch.randn((batch * seqlen, heads, 256), device="cuda", dtype=torch.bfloat16)
     k_raw = torch.randn_like(q_raw)
     v_raw = torch.randn_like(q_raw)
     cu = torch.arange(0, (batch + 1) * seqlen, seqlen, device="cuda", dtype=torch.int32)
-    q, q_descale, cu_q_sf = quantize_for_block_scale_qk_along_d(q_raw, cu)
-    k, k_descale, cu_k_sf = quantize_for_block_scale_qk_along_d(k_raw, cu)
-    v, v_descale, cu_v_sf = quantize_for_block_scale_v_along_n(v_raw, cu, block_size=64)
+    q, q_descale, cu_q_sf = quantize_for_block_scale(
+        q_raw,
+        cu,
+        fp8_type=torch.float8_e4m3fn,
+        scale_mode="token_dchunk",
+        d_chunk_size=128,
+        round_to_e8m0=True,
+    )
+    k, k_descale, cu_k_sf = quantize_for_block_scale(
+        k_raw,
+        cu,
+        fp8_type=torch.float8_e4m3fn,
+        scale_mode="token_dchunk",
+        d_chunk_size=128,
+        round_to_e8m0=True,
+    )
+    v, v_descale, cu_v_sf = quantize_for_block_scale(
+        v_raw,
+        cu,
+        block_size=64,
+        fp8_type=torch.float8_e4m3fn,
+        scale_mode="seq_block",
+        round_to_e8m0=True,
+    )
     sf_q = pack_descale_to_e8m0x4_int32(q_descale)
     sf_k = pack_descale_to_e8m0x4_int32(k_descale)
     sf_v = pack_descale_to_e8m0x4_int32(v_descale).repeat_interleave(64, dim=1)

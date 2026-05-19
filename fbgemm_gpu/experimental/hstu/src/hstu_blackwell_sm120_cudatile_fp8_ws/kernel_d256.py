@@ -43,11 +43,30 @@ else:
     _IMPORT_ERROR = None
 
 
-TILE_M_D256 = 64
-TILE_N_D256 = 64
+def _env_int(name: str, default: int) -> int:
+    return int(os.environ.get(name, default))
+
+
+def _env_optional_int(name: str) -> int | None:
+    value = os.environ.get(name)
+    return None if value is None or value == "" else int(value)
+
+
+DEFAULT_TILE_M_D256 = _env_int("HSTU_CUTILE_FP8_TILE_M", 32)
+DEFAULT_TILE_N_D256 = _env_int("HSTU_CUTILE_FP8_TILE_N", 64)
+TILE_M_D256 = DEFAULT_TILE_M_D256
+TILE_N_D256 = DEFAULT_TILE_N_D256
 HEAD_DIM_D256 = 256
 QK_SCALE_BLOCKS_D256 = 8
-PV_SCALE_BLOCKS_BN64 = 2
+PV_SCALE_BLOCKS_BN64 = TILE_N_D256 // 32
+KERNEL_OCCUPANCY_D256 = _env_int("HSTU_CUTILE_FP8_OCCUPANCY", 1)
+KERNEL_NUM_CTAS_D256 = _env_optional_int("HSTU_CUTILE_FP8_NUM_CTAS")
+KERNEL_WORKER_WARPS_D256 = _env_optional_int("HSTU_CUTILE_FP8_WORKER_WARPS")
+Q_LATENCY_D256 = _env_int("HSTU_CUTILE_FP8_Q_LATENCY", 4)
+K_LATENCY_D256 = _env_int("HSTU_CUTILE_FP8_K_LATENCY", 5)
+V_LATENCY_D256 = _env_int("HSTU_CUTILE_FP8_V_LATENCY", 5)
+SCALE_LATENCY_D256 = _env_int("HSTU_CUTILE_FP8_SCALE_LATENCY", 3)
+O_LATENCY_D256 = _env_int("HSTU_CUTILE_FP8_O_LATENCY", 2)
 
 
 def import_error() -> Exception | None:
@@ -56,8 +75,16 @@ def import_error() -> Exception | None:
 
 if ct is not None:
     ConstBool = ct.Constant[bool]
+    ConstInt = ct.Constant[int]
 
-    @ct.kernel(occupancy=2)
+    _KERNEL_HINTS_D256 = dict(
+        num_ctas=KERNEL_NUM_CTAS_D256,
+        occupancy=KERNEL_OCCUPANCY_D256,
+    )
+    if KERNEL_WORKER_WARPS_D256 is not None:
+        _KERNEL_HINTS_D256["num_worker_warps"] = KERNEL_WORKER_WARPS_D256
+
+    @ct.kernel(**_KERNEL_HINTS_D256)
     def hstu_fp8_d256_persistent_kernel(
         Q,
         K,
@@ -71,6 +98,8 @@ if ct is not None:
         alpha: float,
         scaling_seqlen: int,
         causal: ConstBool,
+        TILE_M: ConstInt,
+        TILE_N: ConstInt,
     ):
         """Static grid-stride persistent D256 FP8 HSTU forward.
 
@@ -89,8 +118,9 @@ if ct is not None:
         max_q = Q.shape[1]
         max_k = K.shape[1]
         num_heads = Q.shape[2]
-        num_m_blocks = ct.cdiv(max_q, TILE_M_D256)
+        num_m_blocks = ct.cdiv(max_q, TILE_M)
         total_tiles = batch_size * num_heads * num_m_blocks
+        PV_SCALE_BLOCKS = TILE_N // 32
 
         for linear_tile in range(bid, total_tiles, num_tile_blocks):
             m_block = linear_tile % num_m_blocks
@@ -105,52 +135,52 @@ if ct is not None:
             q = ct.load(
                 Q,
                 index=(batch_idx, m_block, head_idx, 0),
-                shape=(1, TILE_M_D256, 1, HEAD_DIM_D256),
+                shape=(1, TILE_M, 1, HEAD_DIM_D256),
                 padding_mode=ct.PaddingMode.ZERO,
-                latency=4,
+                latency=Q_LATENCY_D256,
                 allow_tma=True,
-            ).reshape((TILE_M_D256, HEAD_DIM_D256))
+            ).reshape((TILE_M, HEAD_DIM_D256))
             q_scale = ct.load(
                 QScale,
                 index=(batch_idx, head_idx, m_block, 0),
-                shape=(1, 1, TILE_M_D256, QK_SCALE_BLOCKS_D256),
+                shape=(1, 1, TILE_M, QK_SCALE_BLOCKS_D256),
                 padding_mode=ct.PaddingMode.ZERO,
-                latency=2,
+                latency=SCALE_LATENCY_D256,
                 allow_tma=True,
-            ).reshape((TILE_M_D256, QK_SCALE_BLOCKS_D256))
+            ).reshape((TILE_M, QK_SCALE_BLOCKS_D256))
 
-            acc_o = ct.full((TILE_M_D256, HEAD_DIM_D256), 0.0, dtype=ct.float32)
+            acc_o = ct.full((TILE_M, HEAD_DIM_D256), 0.0, dtype=ct.float32)
 
-            num_n_blocks = ct.cdiv(max_k, TILE_N_D256)
+            num_n_blocks = ct.cdiv(max_k, TILE_N)
             offs_m = (
-                m_block * TILE_M_D256 + ct.arange(TILE_M_D256, dtype=np.int32)
+                m_block * TILE_M + ct.arange(TILE_M, dtype=np.int32)
             )[:, None]
-            offs_n_base = ct.arange(TILE_N_D256, dtype=np.int32)[None, :]
+            offs_n_base = ct.arange(TILE_N, dtype=np.int32)[None, :]
 
             for n_block in range(num_n_blocks):
                 k_tile = ct.load(
                     K,
                     index=(batch_idx, n_block, head_idx, 0),
-                    shape=(1, TILE_N_D256, 1, HEAD_DIM_D256),
+                    shape=(1, TILE_N, 1, HEAD_DIM_D256),
                     padding_mode=ct.PaddingMode.ZERO,
-                    latency=5,
+                    latency=K_LATENCY_D256,
                     allow_tma=True,
-                ).reshape((TILE_N_D256, HEAD_DIM_D256))
+                ).reshape((TILE_N, HEAD_DIM_D256))
                 k_t = ct.transpose(k_tile)
                 k_scale = ct.load(
                     KScale,
                     index=(batch_idx, head_idx, n_block, 0),
-                    shape=(1, 1, TILE_N_D256, QK_SCALE_BLOCKS_D256),
+                    shape=(1, 1, TILE_N, QK_SCALE_BLOCKS_D256),
                     padding_mode=ct.PaddingMode.ZERO,
-                    latency=2,
+                    latency=SCALE_LATENCY_D256,
                     allow_tma=True,
-                ).reshape((TILE_N_D256, QK_SCALE_BLOCKS_D256))
+                ).reshape((TILE_N, QK_SCALE_BLOCKS_D256))
                 k_scale_t = ct.transpose(k_scale)
 
-                acc_s = ct.full((TILE_M_D256, TILE_N_D256), 0.0, dtype=ct.float32)
+                acc_s = ct.full((TILE_M, TILE_N), 0.0, dtype=ct.float32)
                 acc_s = ct.mma_scaled(q, q_scale, k_t, k_scale_t, acc_s)
 
-                offs_n = n_block * tile_n + offs_n_base
+                offs_n = n_block * TILE_N + offs_n_base
                 valid = (offs_m < q_len) & (offs_n < k_len)
                 if causal:
                     valid = valid & (offs_n <= (qk_offset + offs_m))
@@ -161,7 +191,7 @@ if ct is not None:
                 p = ct.where(valid, p, 0.0)
                 p_fp8 = p.astype(Q.dtype)
                 p_scale = ct.full(
-                    (tile_m, PV_SCALE_BLOCKS_BN64),
+                    (TILE_M, PV_SCALE_BLOCKS),
                     1.0,
                     dtype=QScale.dtype,
                 )
@@ -169,19 +199,19 @@ if ct is not None:
                 v = ct.load(
                     V,
                     index=(batch_idx, n_block, head_idx, 0),
-                    shape=(1, TILE_N_D256, 1, HEAD_DIM_D256),
+                    shape=(1, TILE_N, 1, HEAD_DIM_D256),
                     padding_mode=ct.PaddingMode.ZERO,
-                    latency=5,
+                    latency=V_LATENCY_D256,
                     allow_tma=True,
-                ).reshape((TILE_N_D256, HEAD_DIM_D256))
+                ).reshape((TILE_N, HEAD_DIM_D256))
                 v_scale = ct.load(
                     VScale,
                     index=(batch_idx, head_idx, n_block, 0, 0),
-                    shape=(1, 1, 1, PV_SCALE_BLOCKS_BN64, HEAD_DIM_D256),
+                    shape=(1, 1, 1, PV_SCALE_BLOCKS, HEAD_DIM_D256),
                     padding_mode=ct.PaddingMode.ZERO,
-                    latency=2,
+                    latency=SCALE_LATENCY_D256,
                     allow_tma=True,
-                ).reshape((PV_SCALE_BLOCKS_BN64, HEAD_DIM_D256))
+                ).reshape((PV_SCALE_BLOCKS, HEAD_DIM_D256))
 
                 acc_o = ct.mma_scaled(p_fp8, p_scale, v, v_scale, acc_o)
 
@@ -189,13 +219,13 @@ if ct is not None:
                 acc_o = acc_o / scaling_seqlen
 
             out_tile = acc_o.astype(Out.dtype).reshape(
-                (1, TILE_M_D256, 1, HEAD_DIM_D256)
+                (1, TILE_M, 1, HEAD_DIM_D256)
             )
             ct.store(
                 Out,
                 index=(batch_idx, m_block, head_idx, 0),
                 tile=out_tile,
-                latency=2,
+                latency=O_LATENCY_D256,
                 allow_tma=True,
             )
 

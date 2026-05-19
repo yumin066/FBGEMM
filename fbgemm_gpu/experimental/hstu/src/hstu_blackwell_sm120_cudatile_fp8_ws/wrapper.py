@@ -2,20 +2,32 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import math
 import tempfile
 from functools import cache
+from types import SimpleNamespace
 from typing import Optional
 
 import torch
 
 from . import kernel_d256
-from .kernel_d256 import TILE_M_D256, TILE_N_D256
-from .scale_layout import materialize_dense_d256_inputs
+from .scale_layout import materialize_dense_d256_inputs, materialize_v_scale_d256
+
+try:
+    from cuda.tile.tune import exhaustive_search
+except Exception as exc:  # pragma: no cover - availability path.
+    exhaustive_search = None
+    _TUNE_IMPORT_ERROR = exc
+else:
+    _TUNE_IMPORT_ERROR = None
 
 
 class TileToolchainError(RuntimeError):
     pass
+
+
+_AUTOTUNE_CACHE: dict[tuple[int, int, int, int, bool], SimpleNamespace] = {}
 
 
 def _toolchain_error() -> str | None:
@@ -29,6 +41,8 @@ def _toolchain_error() -> str | None:
         return "torch.float8_e8m0fnu is unavailable"
     if not hasattr(kernel_d256.ct, "mma_scaled"):
         return "ct.mma_scaled is unavailable; tileiras 13.3/dev support is required"
+    if exhaustive_search is None:
+        return f"cuda.tile.tune import failed: {_TUNE_IMPORT_ERROR}"
     tileiras_error = _mma_scaled_tileiras_error()
     if tileiras_error is not None:
         return tileiras_error
@@ -83,6 +97,7 @@ def hstu_fp8_d256_cudatile(
     causal: bool = False,
     scaling_seqlen: Optional[int] = None,
     stream: Optional[torch.cuda.Stream] = None,
+    autotune: bool = True,
 ) -> torch.Tensor:
     """Run the experimental cuTile D256 FP8 block-scale HSTU forward.
 
@@ -113,7 +128,7 @@ def hstu_fp8_d256_cudatile(
         sf_q_packed,
         sf_k_packed,
         sf_v_packed,
-        tile_n=TILE_N_D256,
+        tile_n=kernel_d256.DEFAULT_TILE_N_D256,
     )
     out_dense = torch.empty(
         (dense.q.shape[0], max_seqlen_q, dense.q.shape[2], 256),
@@ -124,31 +139,154 @@ def hstu_fp8_d256_cudatile(
     if scaling_seqlen is None or scaling_seqlen <= 0:
         scaling_seqlen = max_seqlen_q
 
-    total_tiles = dense.q.shape[0] * dense.q.shape[2] * math.ceil(max_seqlen_q / TILE_M_D256)
-    sms = torch.cuda.get_device_properties(q.device).multi_processor_count
-    grid = (min(total_tiles, sms), 1, 1)
     launch_stream = stream if stream is not None else torch.cuda.current_stream(q.device)
-    kernel_d256.ct.launch(
-        launch_stream,
-        grid,
-        kernel_d256.hstu_fp8_d256_persistent_kernel,
-        (
+    v_scale_cache = {kernel_d256.DEFAULT_TILE_N_D256: dense.v_scale}
+
+    def v_scale_for(tile_n: int) -> torch.Tensor:
+        cached = v_scale_cache.get(tile_n)
+        if cached is not None:
+            return cached
+        v_scale = materialize_v_scale_d256(
+            sf_v_packed,
+            cu_seqlens_k,
+            max_seqlen_k,
+            tile_n,
+        )
+        v_scale_cache[tile_n] = v_scale
+        return v_scale
+
+    if autotune:
+        cfg = _get_autotuned_config(
             dense.q,
             dense.k,
             dense.v,
             dense.q_scale,
             dense.k_scale,
-            dense.v_scale,
             dense.q_lengths,
             dense.k_lengths,
             out_dense,
             float(alpha),
             int(scaling_seqlen),
             bool(causal),
+            launch_stream,
+            v_scale_for,
+        )
+    else:
+        cfg = SimpleNamespace(
+            TILE_M=kernel_d256.DEFAULT_TILE_M_D256,
+            TILE_N=kernel_d256.DEFAULT_TILE_N_D256,
+            num_ctas=kernel_d256.KERNEL_NUM_CTAS_D256,
+            occupancy=kernel_d256.KERNEL_OCCUPANCY_D256,
+        )
+
+    total_tiles = dense.q.shape[0] * dense.q.shape[2] * math.ceil(max_seqlen_q / cfg.TILE_M)
+    sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+    grid = (min(total_tiles, sms), 1, 1)
+    tuned_kernel = kernel_d256.hstu_fp8_d256_persistent_kernel.replace_hints(
+        num_ctas=cfg.num_ctas,
+        occupancy=cfg.occupancy,
+    )
+    kernel_d256.ct.launch(
+        launch_stream,
+        grid,
+        tuned_kernel,
+        (
+            dense.q,
+            dense.k,
+            dense.v,
+            dense.q_scale,
+            dense.k_scale,
+            v_scale_for(cfg.TILE_N),
+            dense.q_lengths,
+            dense.k_lengths,
+            out_dense,
+            float(alpha),
+            int(scaling_seqlen),
+            bool(causal),
+            int(cfg.TILE_M),
+            int(cfg.TILE_N),
         ),
     )
 
     return _compact_output(out_dense, cu_seqlens_q)
+
+
+def _get_autotuned_config(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    q_lengths: torch.Tensor,
+    k_lengths: torch.Tensor,
+    out: torch.Tensor,
+    alpha: float,
+    scaling_seqlen: int,
+    causal: bool,
+    stream: torch.cuda.Stream,
+    v_scale_for,
+) -> SimpleNamespace:
+    key = (q.shape[0], q.shape[2], q.shape[1], k.shape[1], causal)
+    cached = _AUTOTUNE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    with _compiler_timeout(10):
+        result = exhaustive_search(
+            _autotune_search_space(),
+            stream,
+            grid_fn=lambda cfg: (
+                min(
+                    q.shape[0] * q.shape[2] * math.ceil(q.shape[1] / cfg.TILE_M),
+                    torch.cuda.get_device_properties(q.device).multi_processor_count,
+                ),
+                1,
+                1,
+            ),
+            kernel=kernel_d256.hstu_fp8_d256_persistent_kernel,
+            args_fn=lambda cfg: (
+                q,
+                k,
+                v,
+                q_scale,
+                k_scale,
+                v_scale_for(cfg.TILE_N),
+                q_lengths,
+                k_lengths,
+                out,
+                alpha,
+                scaling_seqlen,
+                causal,
+                cfg.TILE_M,
+                cfg.TILE_N,
+            ),
+            hints_fn=lambda cfg: {
+                "num_ctas": cfg.num_ctas,
+                "occupancy": cfg.occupancy,
+            },
+        )
+    cfg = result.best.config
+    _AUTOTUNE_CACHE[key] = cfg
+    return cfg
+
+
+def _autotune_search_space() -> list[SimpleNamespace]:
+    return [
+        SimpleNamespace(TILE_M=32, TILE_N=32, num_ctas=1, occupancy=1),
+        SimpleNamespace(TILE_M=32, TILE_N=64, num_ctas=1, occupancy=1),
+        SimpleNamespace(TILE_M=32, TILE_N=128, num_ctas=1, occupancy=1),
+        SimpleNamespace(TILE_M=64, TILE_N=32, num_ctas=1, occupancy=1),
+        SimpleNamespace(TILE_M=64, TILE_N=64, num_ctas=1, occupancy=2),
+        SimpleNamespace(TILE_M=64, TILE_N=128, num_ctas=1, occupancy=1),
+        SimpleNamespace(TILE_M=128, TILE_N=64, num_ctas=1, occupancy=1),
+        SimpleNamespace(TILE_M=128, TILE_N=128, num_ctas=1, occupancy=1),
+    ]
+
+
+def _compiler_timeout(seconds: int):
+    if hasattr(kernel_d256.ct, "compiler_timeout"):
+        return kernel_d256.ct.compiler_timeout(seconds)
+    return nullcontext()
 
 
 def _compact_output(out_dense: torch.Tensor, cu_seqlens_q: torch.Tensor) -> torch.Tensor:

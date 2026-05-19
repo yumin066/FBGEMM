@@ -152,6 +152,20 @@ def _copy_v_scale_to_dense_d256(
     return dense.contiguous()
 
 
+def materialize_v_scale_d256(
+    sf_v_packed: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_len_k: int,
+    tile_n: int,
+) -> torch.Tensor:
+    return _copy_v_scale_to_dense_d256(
+        sf_v_packed,
+        cu_seqlens_k,
+        max_len_k,
+        tile_n,
+    )
+
+
 def materialize_dense_d256_inputs(
     q: torch.Tensor,
     k: torch.Tensor,

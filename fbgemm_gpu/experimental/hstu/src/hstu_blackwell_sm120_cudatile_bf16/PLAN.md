@@ -17,17 +17,20 @@ C++/CUDA HSTU kernels.
 
 BF16 uses `ct.mma`, so the current CUDA toolkit/tileiras 13.2 environment is
 enough. It does not depend on `ct.mma_scaled` or TileIR bytecode 13.3.
+The shared Docker setup and command list is documented in
+`../hstu_blackwell_sm120_cudatile_README.md`.
 
 ## Milestones
 
 1. D256 dense full no-RAB correctness against PyTorch reference. Done.
 2. D256 dense causal no-RAB correctness against PyTorch reference. Done.
-3. Compare against the production BF16 op when the extension is built in the
+3. Wrapper-side autotune for D256 full/causal. Done.
+4. Compare against the production BF16 op when the extension is built in the
    active container.
-4. Add local/context/target/arbitrary masks.
-5. Add direct-global RAB/DRAB.
-6. Add wrapper-side dense materialization for paged KV.
-7. Backfill D128/D64/D32.
+5. Add local/context/target/arbitrary masks.
+6. Add direct-global RAB/DRAB.
+7. Add wrapper-side dense materialization for paged KV.
+8. Backfill D128/D64/D32.
 
 ## Current Results
 
@@ -45,6 +48,7 @@ Local CUDA execution with the cuTile `_cext` overlay:
 ## Validation
 
 ```bash
+./docker_cutile.sh install-nvtriton-tileiras
 ./docker_cutile.sh bootstrap-cutile
 ./docker_cutile.sh python -m hstu_blackwell_sm120_cudatile_bf16.test_d256
 ```
