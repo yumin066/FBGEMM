@@ -169,6 +169,16 @@ docker run \
   -e HSTU_DISABLE_HDIM32="FALSE" \
   -e HSTU_DISABLE_HDIM64="FALSE" \
   -e HSTU_DISABLE_HDIM256="FALSE" \
+  -e HSTU_CUTILE_FP8_TILE_M \
+  -e HSTU_CUTILE_FP8_TILE_N \
+  -e HSTU_CUTILE_FP8_OCCUPANCY \
+  -e HSTU_CUTILE_FP8_NUM_CTAS \
+  -e HSTU_CUTILE_FP8_WORKER_WARPS \
+  -e HSTU_CUTILE_FP8_Q_LATENCY \
+  -e HSTU_CUTILE_FP8_K_LATENCY \
+  -e HSTU_CUTILE_FP8_V_LATENCY \
+  -e HSTU_CUTILE_FP8_SCALE_LATENCY \
+  -e HSTU_CUTILE_FP8_O_LATENCY \
   -v /home/scratch.minyu_gpu/:/home/scratch.minyu_gpu/ \
   -v /home/scratch.trt_llm_data/:/home/scratch.trt_llm_data/ \
   -v /home/scratch.svc_compute_arch/:/home/scratch.svc_compute_arch/ \

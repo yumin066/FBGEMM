@@ -179,9 +179,11 @@ def hstu_fp8_d256_cudatile(
             occupancy=kernel_d256.KERNEL_OCCUPANCY_D256,
         )
 
-    total_tiles = dense.q.shape[0] * dense.q.shape[2] * math.ceil(max_seqlen_q / cfg.TILE_M)
+    total_tiles = dense.q.shape[0] * dense.q.shape[2] * math.ceil(
+        max_seqlen_q / cfg.TILE_M
+    )
     sms = torch.cuda.get_device_properties(q.device).multi_processor_count
-    grid = (min(total_tiles, sms), 1, 1)
+    grid = (_num_launch_ctas(total_tiles, sms, bool(causal)), 1, 1)
     tuned_kernel = kernel_d256.hstu_fp8_d256_persistent_kernel.replace_hints(
         num_ctas=cfg.num_ctas,
         occupancy=cfg.occupancy,
@@ -236,9 +238,10 @@ def _get_autotuned_config(
             _autotune_search_space(),
             stream,
             grid_fn=lambda cfg: (
-                min(
+                _num_launch_ctas(
                     q.shape[0] * q.shape[2] * math.ceil(q.shape[1] / cfg.TILE_M),
                     torch.cuda.get_device_properties(q.device).multi_processor_count,
+                    causal,
                 ),
                 1,
                 1,
@@ -281,6 +284,12 @@ def _autotune_search_space() -> list[SimpleNamespace]:
         SimpleNamespace(TILE_M=128, TILE_N=64, num_ctas=1, occupancy=1),
         SimpleNamespace(TILE_M=128, TILE_N=128, num_ctas=1, occupancy=1),
     ]
+
+
+def _num_launch_ctas(total_tiles: int, sms: int, causal: bool) -> int:
+    if causal:
+        return total_tiles
+    return min(total_tiles, sms)
 
 
 def _compiler_timeout(seconds: int):

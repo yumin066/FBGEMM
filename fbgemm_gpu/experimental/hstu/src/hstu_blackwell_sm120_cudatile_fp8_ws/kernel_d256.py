@@ -152,12 +152,17 @@ if ct is not None:
             acc_o = ct.full((TILE_M, HEAD_DIM_D256), 0.0, dtype=ct.float32)
 
             num_n_blocks = ct.cdiv(max_k, TILE_N)
+            n_block_end = num_n_blocks
+            if causal:
+                tile_q_end = min((m_block + 1) * TILE_M, q_len)
+                causal_k_end = max(qk_offset + tile_q_end, 0)
+                n_block_end = min(num_n_blocks, ct.cdiv(causal_k_end, TILE_N))
             offs_m = (
                 m_block * TILE_M + ct.arange(TILE_M, dtype=np.int32)
             )[:, None]
             offs_n_base = ct.arange(TILE_N, dtype=np.int32)[None, :]
 
-            for n_block in range(num_n_blocks):
+            for n_block in range(n_block_end):
                 k_tile = ct.load(
                     K,
                     index=(batch_idx, n_block, head_idx, 0),

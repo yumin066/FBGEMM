@@ -87,7 +87,7 @@ def main() -> None:
         * math.ceil(args.seqlen / kernel_d256.TILE_M_D256)
     )
     sms = torch.cuda.get_device_properties(q.device).multi_processor_count
-    grid = (min(total_tiles, sms), 1, 1)
+    grid = (total_tiles if args.causal else min(total_tiles, sms), 1, 1)
     stream = torch.cuda.current_stream()
 
     def run() -> None:
