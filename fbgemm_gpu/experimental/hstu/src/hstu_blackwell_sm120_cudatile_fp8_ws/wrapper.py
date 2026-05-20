@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 import math
+import os
 import tempfile
 from functools import cache
+from itertools import product
 from types import SimpleNamespace
 from typing import Optional
 
@@ -27,7 +29,7 @@ class TileToolchainError(RuntimeError):
     pass
 
 
-_AUTOTUNE_CACHE: dict[tuple[int, int, int, int, bool], SimpleNamespace] = {}
+_AUTOTUNE_CACHE: dict[tuple[int, int, int, int, bool, bool], SimpleNamespace] = {}
 
 
 def _toolchain_error() -> str | None:
@@ -35,7 +37,7 @@ def _toolchain_error() -> str | None:
         return f"cuda.tile import failed: {kernel_d256.import_error()}"
     if kernel_d256.ct is None:
         return "cuda.tile is unavailable"
-    if kernel_d256.hstu_fp8_d256_persistent_kernel is None:
+    if kernel_d256.hstu_fp8_d256_kernel is None:
         return "cuTile D256 kernel was not constructed"
     if not hasattr(torch, "float8_e8m0fnu"):
         return "torch.float8_e8m0fnu is unavailable"
@@ -140,6 +142,12 @@ def hstu_fp8_d256_cudatile(
         scaling_seqlen = max_seqlen_q
 
     launch_stream = stream if stream is not None else torch.cuda.current_stream(q.device)
+    full_tiles = (
+        not causal
+        and max_seqlen_q == max_seqlen_k
+        and bool(torch.all(dense.q_lengths == max_seqlen_q).item())
+        and bool(torch.all(dense.k_lengths == max_seqlen_k).item())
+    )
     v_scale_cache = {kernel_d256.DEFAULT_TILE_N_D256: dense.v_scale}
 
     def v_scale_for(tile_n: int) -> torch.Tensor:
@@ -168,6 +176,7 @@ def hstu_fp8_d256_cudatile(
             float(alpha),
             int(scaling_seqlen),
             bool(causal),
+            full_tiles,
             launch_stream,
             v_scale_for,
         )
@@ -184,9 +193,8 @@ def hstu_fp8_d256_cudatile(
     )
     sms = torch.cuda.get_device_properties(q.device).multi_processor_count
     grid = (_num_launch_ctas(total_tiles, sms, bool(causal)), 1, 1)
-    tuned_kernel = kernel_d256.hstu_fp8_d256_persistent_kernel.replace_hints(
-        num_ctas=cfg.num_ctas,
-        occupancy=cfg.occupancy,
+    tuned_kernel = kernel_d256.hstu_fp8_d256_kernel.replace_hints(
+        **_compiler_hints(cfg),
     )
     kernel_d256.ct.launch(
         launch_stream,
@@ -205,6 +213,7 @@ def hstu_fp8_d256_cudatile(
             float(alpha),
             int(scaling_seqlen),
             bool(causal),
+            bool(full_tiles),
             int(cfg.TILE_M),
             int(cfg.TILE_N),
         ),
@@ -225,15 +234,16 @@ def _get_autotuned_config(
     alpha: float,
     scaling_seqlen: int,
     causal: bool,
+    full_tiles: bool,
     stream: torch.cuda.Stream,
     v_scale_for,
 ) -> SimpleNamespace:
-    key = (q.shape[0], q.shape[2], q.shape[1], k.shape[1], causal)
+    key = (q.shape[0], q.shape[2], q.shape[1], k.shape[1], causal, full_tiles)
     cached = _AUTOTUNE_CACHE.get(key)
     if cached is not None:
         return cached
 
-    with _compiler_timeout(10):
+    with _compiler_timeout(_autotune_compiler_timeout_seconds()):
         result = exhaustive_search(
             _autotune_search_space(),
             stream,
@@ -246,7 +256,7 @@ def _get_autotuned_config(
                 1,
                 1,
             ),
-            kernel=kernel_d256.hstu_fp8_d256_persistent_kernel,
+            kernel=kernel_d256.hstu_fp8_d256_kernel,
             args_fn=lambda cfg: (
                 q,
                 k,
@@ -260,13 +270,14 @@ def _get_autotuned_config(
                 alpha,
                 scaling_seqlen,
                 causal,
+                full_tiles,
                 cfg.TILE_M,
                 cfg.TILE_N,
             ),
             hints_fn=lambda cfg: {
-                "num_ctas": cfg.num_ctas,
-                "occupancy": cfg.occupancy,
+                **_compiler_hints(cfg),
             },
+            quiet=_autotune_quiet(),
         )
     cfg = result.best.config
     _AUTOTUNE_CACHE[key] = cfg
@@ -275,18 +286,97 @@ def _get_autotuned_config(
 
 def _autotune_search_space() -> list[SimpleNamespace]:
     return [
-        SimpleNamespace(TILE_M=32, TILE_N=32, num_ctas=1, occupancy=1),
-        SimpleNamespace(TILE_M=32, TILE_N=64, num_ctas=1, occupancy=1),
-        SimpleNamespace(TILE_M=32, TILE_N=128, num_ctas=1, occupancy=1),
-        SimpleNamespace(TILE_M=64, TILE_N=32, num_ctas=1, occupancy=1),
-        SimpleNamespace(TILE_M=64, TILE_N=64, num_ctas=1, occupancy=2),
-        SimpleNamespace(TILE_M=64, TILE_N=128, num_ctas=1, occupancy=1),
-        SimpleNamespace(TILE_M=128, TILE_N=64, num_ctas=1, occupancy=1),
-        SimpleNamespace(TILE_M=128, TILE_N=128, num_ctas=1, occupancy=1),
+        SimpleNamespace(
+            TILE_M=tile_m,
+            TILE_N=tile_n,
+            num_ctas=num_ctas,
+            occupancy=occupancy,
+            num_worker_warps=num_worker_warps,
+        )
+        for tile_m, tile_n, num_ctas, occupancy, num_worker_warps in product(
+            _autotune_tile_m_values(),
+            _autotune_tile_n_values(),
+            _autotune_num_ctas_values(),
+            _autotune_occupancy_values(),
+            _autotune_worker_warps_values(),
+        )
     ]
 
 
+def _autotune_tile_m_values() -> tuple[int, ...]:
+    return _env_int_tuple("HSTU_CUTILE_FP8_AUTOTUNE_TILE_M", (16, 32, 64, 128, 256))
+
+
+def _autotune_tile_n_values() -> tuple[int, ...]:
+    return _env_int_tuple("HSTU_CUTILE_FP8_AUTOTUNE_TILE_N", (32, 64, 128, 256))
+
+
+def _autotune_num_ctas_values() -> tuple[int | None, ...]:
+    return _env_optional_int_tuple("HSTU_CUTILE_FP8_AUTOTUNE_NUM_CTAS", (None, 1))
+
+
+def _autotune_occupancy_values() -> tuple[int, ...]:
+    return _env_int_tuple("HSTU_CUTILE_FP8_AUTOTUNE_OCCUPANCY", (1, 2))
+
+
+def _autotune_worker_warps_values() -> tuple[int | None, ...]:
+    if not _compiler_hint_supported("num_worker_warps"):
+        return (None,)
+    return _env_optional_int_tuple("HSTU_CUTILE_FP8_AUTOTUNE_WORKER_WARPS", (None, 4, 8))
+
+
+def _compiler_hints(cfg: SimpleNamespace) -> dict[str, int]:
+    hints = {"occupancy": int(cfg.occupancy)}
+    if cfg.num_ctas is not None:
+        hints["num_ctas"] = int(cfg.num_ctas)
+    if (
+        getattr(cfg, "num_worker_warps", None) is not None
+        and _compiler_hint_supported("num_worker_warps")
+    ):
+        hints["num_worker_warps"] = int(cfg.num_worker_warps)
+    return hints
+
+
+@cache
+def _compiler_hint_supported(name: str) -> bool:
+    options = getattr(kernel_d256.hstu_fp8_d256_kernel, "_compiler_options", None)
+    return options is not None and hasattr(options, name)
+
+
+def _env_int_tuple(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return tuple(int(part) for part in value.replace(",", " ").split())
+
+
+def _env_optional_int_tuple(
+    name: str,
+    default: tuple[int | None, ...],
+) -> tuple[int | None, ...]:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    result: list[int | None] = []
+    for part in value.replace(",", " ").split():
+        if part.lower() in ("none", "null", "unset", "-"):
+            result.append(None)
+        else:
+            result.append(int(part))
+    return tuple(result)
+
+
+def _autotune_compiler_timeout_seconds() -> int:
+    return int(os.environ.get("HSTU_CUTILE_FP8_AUTOTUNE_COMPILER_TIMEOUT", "8"))
+
+
+def _autotune_quiet() -> bool:
+    return os.environ.get("HSTU_CUTILE_FP8_AUTOTUNE_VERBOSE", "0") not in ("1", "true", "TRUE")
+
+
 def _num_launch_ctas(total_tiles: int, sms: int, causal: bool) -> int:
+    if not kernel_d256.KERNEL_PERSISTENT_D256:
+        return total_tiles
     if causal:
         return total_tiles
     return min(total_tiles, sms)

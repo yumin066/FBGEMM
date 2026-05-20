@@ -81,3 +81,13 @@ autotune overhead on the first call:
 
 Both wrappers default to autotune. The selected config is cached per
 `(B, H, max_q, max_k, causal)` shape in-process.
+
+The autotune search spaces are generated programmatically instead of using the
+old fixed 8-candidate list. By default:
+
+- FP8 D256: `TILE_M=16,32,64,128,256`, `TILE_N=32,64,128,256`,
+  `num_ctas=None,1`, `occupancy=1,2`.
+- BF16 D256: the same tile/CTA/occupancy grid.
+
+The current cuTile compiler options do not support `num_worker_warps`, so that
+hint is not included unless a future toolchain exposes it.

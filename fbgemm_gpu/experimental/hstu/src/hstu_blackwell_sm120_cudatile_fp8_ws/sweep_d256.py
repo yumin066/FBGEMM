@@ -87,14 +87,20 @@ def main() -> None:
         * math.ceil(args.seqlen / kernel_d256.TILE_M_D256)
     )
     sms = torch.cuda.get_device_properties(q.device).multi_processor_count
-    grid = (total_tiles if args.causal else min(total_tiles, sms), 1, 1)
+    grid = (
+        total_tiles
+        if args.causal or not kernel_d256.KERNEL_PERSISTENT_D256
+        else min(total_tiles, sms),
+        1,
+        1,
+    )
     stream = torch.cuda.current_stream()
 
     def run() -> None:
         kernel_d256.ct.launch(
             stream,
             grid,
-            kernel_d256.hstu_fp8_d256_persistent_kernel,
+            kernel_d256.hstu_fp8_d256_kernel,
             (
                 q,
                 k,
@@ -108,6 +114,7 @@ def main() -> None:
                 1.0,
                 args.seqlen,
                 bool(args.causal),
+                not bool(args.causal),
                 kernel_d256.TILE_M_D256,
                 kernel_d256.TILE_N_D256,
             ),

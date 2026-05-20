@@ -2,6 +2,8 @@
 
 from contextlib import nullcontext
 import math
+import os
+from itertools import product
 from types import SimpleNamespace
 from typing import Optional
 
@@ -115,8 +117,7 @@ def hstu_bf16_d256_cudatile(
         dense.q.shape[0],
     )
     tuned_kernel = kernel_d256.hstu_bf16_d256_kernel.replace_hints(
-        num_ctas=cfg.num_ctas,
-        occupancy=cfg.occupancy,
+        **_compiler_hints(cfg),
     )
     kernel_d256.ct.launch(
         launch_stream,
@@ -157,10 +158,9 @@ def _get_autotuned_config(
     if cached is not None:
         return cached
 
-    search_space = _autotune_search_space()
-    with _compiler_timeout(10):
+    with _compiler_timeout(_autotune_compiler_timeout_seconds()):
         result = exhaustive_search(
-            search_space,
+            _autotune_search_space(),
             stream,
             grid_fn=lambda cfg: (
                 math.ceil(q.shape[1] / cfg.TILE_M),
@@ -181,10 +181,8 @@ def _get_autotuned_config(
                 cfg.TILE_M,
                 cfg.TILE_N,
             ),
-            hints_fn=lambda cfg: {
-                "num_ctas": cfg.num_ctas,
-                "occupancy": cfg.occupancy,
-            },
+            hints_fn=_compiler_hints,
+            quiet=_autotune_quiet(),
         )
     cfg = result.best.config
     _AUTOTUNE_CACHE[key] = cfg
@@ -193,15 +191,73 @@ def _get_autotuned_config(
 
 def _autotune_search_space() -> list[SimpleNamespace]:
     return [
-        SimpleNamespace(TILE_M=128, TILE_N=128, num_ctas=1, occupancy=1),
-        SimpleNamespace(TILE_M=128, TILE_N=64, num_ctas=1, occupancy=1),
-        SimpleNamespace(TILE_M=64, TILE_N=128, num_ctas=1, occupancy=1),
-        SimpleNamespace(TILE_M=64, TILE_N=64, num_ctas=1, occupancy=2),
-        SimpleNamespace(TILE_M=64, TILE_N=32, num_ctas=1, occupancy=2),
-        SimpleNamespace(TILE_M=32, TILE_N=128, num_ctas=1, occupancy=1),
-        SimpleNamespace(TILE_M=32, TILE_N=64, num_ctas=1, occupancy=1),
-        SimpleNamespace(TILE_M=32, TILE_N=32, num_ctas=1, occupancy=1),
+        SimpleNamespace(
+            TILE_M=tile_m,
+            TILE_N=tile_n,
+            num_ctas=num_ctas,
+            occupancy=occupancy,
+        )
+        for tile_m, tile_n, num_ctas, occupancy in product(
+            _autotune_tile_m_values(),
+            _autotune_tile_n_values(),
+            _autotune_num_ctas_values(),
+            _autotune_occupancy_values(),
+        )
     ]
+
+
+def _autotune_tile_m_values() -> tuple[int, ...]:
+    return _env_int_tuple("HSTU_CUTILE_BF16_AUTOTUNE_TILE_M", (16, 32, 64, 128, 256))
+
+
+def _autotune_tile_n_values() -> tuple[int, ...]:
+    return _env_int_tuple("HSTU_CUTILE_BF16_AUTOTUNE_TILE_N", (32, 64, 128, 256))
+
+
+def _autotune_num_ctas_values() -> tuple[int | None, ...]:
+    return _env_optional_int_tuple("HSTU_CUTILE_BF16_AUTOTUNE_NUM_CTAS", (None, 1))
+
+
+def _autotune_occupancy_values() -> tuple[int, ...]:
+    return _env_int_tuple("HSTU_CUTILE_BF16_AUTOTUNE_OCCUPANCY", (1, 2))
+
+
+def _compiler_hints(cfg: SimpleNamespace) -> dict[str, int]:
+    hints = {"occupancy": int(cfg.occupancy)}
+    if cfg.num_ctas is not None:
+        hints["num_ctas"] = int(cfg.num_ctas)
+    return hints
+
+
+def _env_int_tuple(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return tuple(int(part) for part in value.replace(",", " ").split())
+
+
+def _env_optional_int_tuple(
+    name: str,
+    default: tuple[int | None, ...],
+) -> tuple[int | None, ...]:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    result: list[int | None] = []
+    for part in value.replace(",", " ").split():
+        if part.lower() in ("none", "null", "unset", "-"):
+            result.append(None)
+        else:
+            result.append(int(part))
+    return tuple(result)
+
+
+def _autotune_compiler_timeout_seconds() -> int:
+    return int(os.environ.get("HSTU_CUTILE_BF16_AUTOTUNE_COMPILER_TIMEOUT", "8"))
+
+
+def _autotune_quiet() -> bool:
+    return os.environ.get("HSTU_CUTILE_BF16_AUTOTUNE_VERBOSE", "0") not in ("1", "true", "TRUE")
 
 
 def _compiler_timeout(seconds: int):
