@@ -29,6 +29,42 @@ try:
         quantize_for_block_scale_v_along_n,
         pack_descale_to_e8m0x4_int32,
     )
+except ImportError:
+    try:
+        from hstu.cuda_hstu_attention import (
+            quantize_for_block_scale,
+            pack_descale_to_e8m0x4_int32,
+        )
+    except ImportError as e:
+        print(f"ERROR: cannot import hstu quantization helpers: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    def quantize_for_block_scale_qk_along_d(x, seq_offsets, fp8_type=torch.float8_e4m3fn):
+        return quantize_for_block_scale(
+            x,
+            seq_offsets,
+            fp8_type=fp8_type,
+            scale_mode="token_dchunk",
+            d_chunk_size=128,
+            round_to_e8m0=True,
+        )
+
+    def quantize_for_block_scale_v_along_n(
+        x,
+        seq_offsets,
+        block_size=128,
+        fp8_type=torch.float8_e4m3fn,
+    ):
+        return quantize_for_block_scale(
+            x,
+            seq_offsets,
+            block_size=block_size,
+            fp8_type=fp8_type,
+            scale_mode="seq_block",
+            round_to_e8m0=True,
+        )
+
+try:
     import hstu  # noqa: F401 — triggers compiled .so load
 except ImportError as e:
     print(f"ERROR: cannot import hstu: {e}", file=sys.stderr)

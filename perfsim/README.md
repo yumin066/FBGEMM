@@ -11,7 +11,8 @@
 
 ## 文件说明
 
-- `collect_hstu_trace.sh`：在 GB202/SM120 机器上采集 HSTU CUDA APIC trace。
+- `collect_hstu_trace.sh`：在 GB202/SM120 机器上采集 cuTile FP8 CUDA APIC trace。
+- `collect_hstu_cpp_trace.sh`：在 GB202/SM120 机器上采集 C++ FP8 CUDA APIC trace。
 - `launch_smart_hstu.sh`：在 login node 上提交预采集 trace 给 `flow.smart`。
 - `run_hstu_kernel_once.py`：构造 HSTU FP8 输入并运行目标 kernel。
 - `run_hstu_kernel_once.sh`：给 workload yml 使用的 shell wrapper。
@@ -24,6 +25,8 @@
 
 ## 采集 CUDA APIC Trace
 
+### cuTile FP8
+
 在 GB202/SM120 compute node 的 docker/srun 环境里执行：
 
 ```bash
@@ -33,37 +36,38 @@ cd /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu
 
 默认参数：
 
-- `bs=8`
-- `seq=4096`
-- `heads=16`
-- `headdim=128`
-- causal attention
+- `bs=1`
+- `seq=2048`
+- `heads=1`
+- `headdim=256`
+- full attention
+- tile `32x64`
 - `frange=3:3`
 
 默认捕获的 kernel 名称匹配：
 
 ```text
-hstu_fwd_kernel_sm120_fp8_ws_tma
+.*hstu_fp8_d256.*
 ```
 
 采集成功后会生成类似路径：
 
 ```bash
-/home/minyu/project/shopee/fbgemm-hstu/perfsim/traces/hstu_sm120_fp8_bs8_seq4096_h16_causal_<commit>_<timestamp>/CUDA_APIC_TRACES/k0404_flash__hstu_fwd_kernel_sm120_fp8_ws_tma/cuda.tgz
+/home/minyu/project/shopee/fbgemm-hstu/perfsim/traces/cutile_fp8_32x64_bs1_seq2048_h1_full_<commit>_<timestamp>/CUDA_APIC_TRACES/<kernel>/cuda.tgz
 ```
 
 脚本还会更新：
 
 ```bash
-/home/minyu/project/shopee/fbgemm-hstu/perfsim/traces/hstu_latest_cuda.tgz
+/home/minyu/project/shopee/fbgemm-hstu/perfsim/traces/cutile_fp8_latest_32x64_cuda.tgz
 ```
 
-这个 symlink 指向最新采集到的 `cuda.tgz`。
+这个 symlink 指向最新采集到的 cuTile `cuda.tgz`。
 
 常用变体：
 
 ```bash
-./perfsim/collect_hstu_trace.sh --bs 4 --seq 2048
+./perfsim/collect_hstu_trace.sh --tile-m 32 --tile-n 64
 ```
 
 ```bash
@@ -74,13 +78,51 @@ hstu_fwd_kernel_sm120_fp8_ws_tma
 ./perfsim/collect_hstu_trace.sh --frange 2:2
 ```
 
+### C++ FP8
+
+C++ FP8 trace 使用 `docker_computelab.sh` 环境：
+
+```bash
+cd /home/scratch.minyu_gpu/project/shopee/fbgemm-hstu
+./perfsim/collect_hstu_cpp_trace.sh
+```
+
+默认参数：
+
+- `bs=1`
+- `seq=2048`
+- `heads=1`
+- `headdim=256`
+- full attention
+- `frange=3:3`
+- `iters=6`
+
+默认捕获的 kernel 名称匹配：
+
+```text
+.*hstu_fwd_kernel_.*fp8_ws_tma.*
+```
+
+采集成功后会更新：
+
+```bash
+/home/minyu/project/shopee/fbgemm-hstu/perfsim/traces/hstu_cpp_fp8_latest_cuda.tgz
+```
+
 ## 提交 Smart
 
 在 login node 上执行，不要在 compute node docker 里执行：
 
 ```bash
 cd ~/project/shopee/fbgemm-hstu
-./perfsim/launch_smart_hstu.sh --chip gb202 --trace /home/minyu/project/shopee/fbgemm-hstu/perfsim/traces/hstu_sm120_fp8_bs8_seq4096_h16_causal_<commit>_<timestamp>/CUDA_APIC_TRACES/k0404_flash__hstu_fwd_kernel_sm120_fp8_ws_tma/cuda.tgz
+./perfsim/launch_smart_hstu.sh --chip gb202 --trace perfsim/traces/cutile_fp8_latest_32x64_cuda.tgz
+```
+
+C++ FP8 trace：
+
+```bash
+cd ~/project/shopee/fbgemm-hstu
+./perfsim/launch_smart_hstu.sh --chip gb202 --trace perfsim/traces/hstu_cpp_fp8_latest_cuda.tgz
 ```
 
 如果 `perfsim/traces/hstu_latest_cuda.tgz` 已经指向你要跑的 trace，也可以直接：
@@ -135,7 +177,7 @@ https://compute-nexus.nvidia.com/workflows/runs
 
 ## CUDA APIC 版本
 
-`collect_hstu_trace.sh` 默认使用固定版本：
+两个 collect 脚本默认使用固定版本：
 
 ```bash
 /home/scratch.svc_compute_arch/release/cuda_apic/linux64/release/0.1.2026041608261776353168/cuda_apic_capture.pl
@@ -147,6 +189,7 @@ https://compute-nexus.nvidia.com/workflows/runs
 
 ```bash
 CUDA_APIC=/path/to/cuda_apic_capture.pl ./perfsim/collect_hstu_trace.sh
+CUDA_APIC=/path/to/cuda_apic_capture.pl ./perfsim/collect_hstu_cpp_trace.sh
 ```
 
 ## PyTorch VMM 设置
@@ -187,10 +230,14 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
 
 ```bash
 git add perfsim/collect_hstu_trace.sh \
+        perfsim/collect_hstu_cpp_trace.sh \
         perfsim/config.smart.yml \
         perfsim/launch_smart_hstu.sh \
         perfsim/run_hstu_kernel_once.py \
         perfsim/run_hstu_kernel_once.sh \
         perfsim/workload_hstu_sm120.yml \
-        perfsim/README.md
+        perfsim/README.md \
+        docker_computelab.sh \
+        dockerfile \
+        docker-entrypoint.sh
 ```

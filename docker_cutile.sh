@@ -6,6 +6,8 @@ NAME="${CUTILE_DOCKER_NAME:-cutile-hstu-$(id -un)-$(date +%Y%m%d-%H%M%S)}"
 REPO_ROOT="${HSTU_REPO_ROOT:-/home/scratch.minyu_gpu/project/shopee/fbgemm-hstu}"
 CUTILE_ROOT="${CUTILE_ROOT:-/home/scratch.minyu_gpu/project/shopee/cutile-python}"
 PIP_USER_BASE="${PYTHONUSERBASE:-/home/scratch.minyu_gpu/project/.cache/pip-user}"
+CUTILE_CONTAINER_HOME="${CUTILE_CONTAINER_HOME:-/home/scratch.minyu_gpu/project/.docker_home}"
+CUTILE_RUNTIME_CACHE_ROOT="${CUTILE_RUNTIME_CACHE_ROOT:-/home/scratch.minyu_gpu/project/.cache/cutile-runtime}"
 CUTILE_TILEIRAS_RC_VERSION="${CUTILE_TILEIRAS_RC_VERSION:-}"
 if [[ -n "${CUTILE_TILEIRAS_RC_VERSION}" ]]; then
   CUTILE_DEFAULT_BUILD_ROOT="/home/scratch.minyu_gpu/project/.cache/cutile-cext-dev-tileiras-${CUTILE_TILEIRAS_RC_VERSION}"
@@ -41,6 +43,16 @@ CUTILE_NIGHTLY_INDEX_URL="${CUTILE_NIGHTLY_INDEX_URL:-https://urm.nvidia.com/art
 CUTILE_PIP_SPEC="${CUTILE_PIP_SPEC:-cuda-tile}"
 CUTILE_NVTRITON_PIP_SPEC="${CUTILE_NVTRITON_PIP_SPEC:-nv-triton==9.9.99.dev20260517+git6eb9b7f2.cudatile}"
 CUTILE_TILEIRAS_RC_INDEX_URL="${CUTILE_TILEIRAS_RC_INDEX_URL:-https://urm.nvidia.com/artifactory/api/pypi/sw-gpu-cuda-installer-pypi-local/simple}"
+
+mkdir -p \
+  "${CUTILE_CONTAINER_HOME}" \
+  "${PIP_USER_BASE}" \
+  "${CUTILE_RUNTIME_CACHE_ROOT}/xdg" \
+  "${CUTILE_RUNTIME_CACHE_ROOT}/pip" \
+  "${CUTILE_RUNTIME_CACHE_ROOT}/torch" \
+  "${CUTILE_RUNTIME_CACHE_ROOT}/triton" \
+  "${CUTILE_RUNTIME_CACHE_ROOT}/cuda" \
+  "${CUTILE_RUNTIME_CACHE_ROOT}/tmp"
 
 if [[ "${CUTILE_DOCKER_PULL:-1}" == "1" ]]; then
   docker pull "${IMAGE}"
@@ -147,8 +159,14 @@ docker run \
   --name "${NAME}" \
   --user "$(id -u):$(id -g)" \
   --workdir "${REPO_ROOT}" \
-  -e HOME="/home/$(id -un)" \
+  -e HOME="${CUTILE_CONTAINER_HOME}" \
   -e PYTHONUSERBASE="${PIP_USER_BASE}" \
+  -e XDG_CACHE_HOME="${CUTILE_RUNTIME_CACHE_ROOT}/xdg" \
+  -e PIP_CACHE_DIR="${CUTILE_RUNTIME_CACHE_ROOT}/pip" \
+  -e TORCH_HOME="${CUTILE_RUNTIME_CACHE_ROOT}/torch" \
+  -e TRITON_CACHE_DIR="${CUTILE_RUNTIME_CACHE_ROOT}/triton" \
+  -e CUDA_CACHE_PATH="${CUTILE_RUNTIME_CACHE_ROOT}/cuda" \
+  -e TMPDIR="${CUTILE_RUNTIME_CACHE_ROOT}/tmp" \
   -e PATH="${CUTILE_CONTAINER_PATH}" \
   -e LD_LIBRARY_PATH="${CUTILE_CONTAINER_LD_LIBRARY_PATH}" \
   -e HSTU_REPO_ROOT="${REPO_ROOT}" \
@@ -179,6 +197,22 @@ docker run \
   -e HSTU_CUTILE_FP8_V_LATENCY \
   -e HSTU_CUTILE_FP8_SCALE_LATENCY \
   -e HSTU_CUTILE_FP8_O_LATENCY \
+  -e HSTU_CUTILE_FP8_AUTOTUNE_TILE_M \
+  -e HSTU_CUTILE_FP8_AUTOTUNE_TILE_N \
+  -e HSTU_CUTILE_FP8_AUTOTUNE_NUM_CTAS \
+  -e HSTU_CUTILE_FP8_AUTOTUNE_OCCUPANCY \
+  -e HSTU_CUTILE_FP8_AUTOTUNE_WORKER_WARPS \
+  -e HSTU_CUTILE_FP8_AUTOTUNE_COMPILER_TIMEOUT \
+  -e HSTU_CUTILE_FP8_AUTOTUNE_VERBOSE \
+  -e HSTU_CUTILE_FP8_AUTOTUNE_WARMUP_STEPS \
+  -e HSTU_CUTILE_FP8_AUTOTUNE_MIN_REPEATS \
+  -e HSTU_CUTILE_FP8_AUTOTUNE_MAX_REPEATS \
+  -e HSTU_CUTILE_BF16_AUTOTUNE_TILE_M \
+  -e HSTU_CUTILE_BF16_AUTOTUNE_TILE_N \
+  -e HSTU_CUTILE_BF16_AUTOTUNE_NUM_CTAS \
+  -e HSTU_CUTILE_BF16_AUTOTUNE_OCCUPANCY \
+  -e HSTU_CUTILE_BF16_AUTOTUNE_COMPILER_TIMEOUT \
+  -e HSTU_CUTILE_BF16_AUTOTUNE_VERBOSE \
   -v /home/scratch.minyu_gpu/:/home/scratch.minyu_gpu/ \
   -v /home/scratch.trt_llm_data/:/home/scratch.trt_llm_data/ \
   -v /home/scratch.svc_compute_arch/:/home/scratch.svc_compute_arch/ \
